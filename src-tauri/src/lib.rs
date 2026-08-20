@@ -5608,6 +5608,10 @@ fn observe_gateway_packet_path(
         return;
     }
 
+    let _transition = lock_gateway_transition(&state);
+    if generation.load(Ordering::SeqCst) != expected {
+        return;
+    }
     let was_ready = state
         .gateway_readiness
         .lock()
@@ -7239,6 +7243,11 @@ fn spawn_metrics_poller(
             break;
         }
         if let Some(metrics) = metrics {
+            let state = app.state::<RuntimeState>();
+            let _transition = lock_gateway_transition(&state);
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
             let _ = app.emit("runtime-metrics", metrics);
         }
         if generation.load(Ordering::SeqCst) != expected {
