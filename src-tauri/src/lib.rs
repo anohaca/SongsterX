@@ -5574,12 +5574,8 @@ fn guest_packet_path_progressed(
         && interface_packet_progressed(before_tun, after_tun)
 }
 
-fn observe_gateway_packet_path(app: &AppHandle) {
+fn observe_gateway_packet_path(app: &AppHandle, session: &MetricsSession) {
     let state = app.state::<RuntimeState>();
-    let settings = match load_settings(app) {
-        Ok(settings) if settings.mode == "gateway" => settings,
-        _ => return,
-    };
     let baseline = match state.gateway_packet_baseline.lock() {
         Ok(baseline) => baseline.clone(),
         Err(_) => return,
@@ -5587,9 +5583,8 @@ fn observe_gateway_packet_path(app: &AppHandle) {
     let Some(baseline) = baseline else {
         return;
     };
-    let endpoint = match gateway_guest_agent_endpoint(app, &settings) {
-        Ok(endpoint) => endpoint,
-        Err(_) => return,
+    let Some(endpoint) = session.guest_endpoint.clone() else {
+        return;
     };
     let current = match guest_agent::query_status(&endpoint, Duration::from_secs(1)) {
         Ok(status) => status.packet_stats,
@@ -7222,10 +7217,17 @@ fn spawn_metrics_poller(
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        if let Some(metrics) = fetch_metrics(&app, &session) {
+        let metrics = fetch_metrics(&app, &session);
+        if generation.load(Ordering::SeqCst) != expected {
+            break;
+        }
+        if let Some(metrics) = metrics {
             let _ = app.emit("runtime-metrics", metrics);
         }
-        observe_gateway_packet_path(&app);
+        if generation.load(Ordering::SeqCst) != expected {
+            break;
+        }
+        observe_gateway_packet_path(&app, &session);
     });
 }
 
