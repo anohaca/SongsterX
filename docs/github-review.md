@@ -29,3 +29,9 @@ This branch contains the current SongsterX source snapshot for external review.
 - system 连接进入 `observed` 后，详情页的观测时长使用 `lastSeenUs` 冻结，不再随当前时间继续增长；
 - Host Clash API 请求、响应读取或 JSON 解析失败时仍发送指标帧，携带 `hostSnapshotValid=false` 和错误说明，活动页显示 Host 观察不可用，而不会丢弃整帧 guest/system 观察结果；
 - 新增停止失败状态转换的 Rust 单元测试。
+
+本轮继续修复：
+
+- 运行启动时冻结 MetricsSession：Gateway 是否需要 Guest、Guest agent endpoint 和系统托管入口均来自本轮启动设置；metrics 轮询不再每秒读取磁盘 SongsterX.conf 来决定是否查询 Guest；
+- Gateway session 在 endpoint 不可用或查询失败时保持 guestSnapshotValid=false；Mixed session 固定为没有 Guest 数据源，不会把配置漂移误判为有效空快照；
+- 停止失败但仍持有资源时，使用冻结的 MetricsSession 重启 system sampler 和 metrics poller；彻底停止时清除 session；停止 Guest 也优先使用本轮冻结 endpoint。

@@ -61,6 +61,7 @@ pub struct RuntimeState {
     gateway_readiness: Mutex<packet_path::GatewayReadiness>,
     gateway_packet_baseline: Mutex<Option<guest_agent::GuestPacketStats>>,
     system_connections: Mutex<SystemConnectionSample>,
+    metrics_session: Mutex<Option<MetricsSession>>,
     status: Mutex<RuntimeStatus>,
     metrics_generation: Arc<AtomicU64>,
 }
@@ -77,6 +78,7 @@ impl Default for RuntimeState {
             gateway_readiness: Mutex::new(packet_path::GatewayReadiness::default()),
             gateway_packet_baseline: Mutex::new(None),
             system_connections: Mutex::new(SystemConnectionSample::default()),
+            metrics_session: Mutex::new(None),
             status: Mutex::new(RuntimeStatus::default()),
             metrics_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -6464,13 +6466,16 @@ fn start_mix_direct_transaction(
         ),
     );
     let managed_endpoints = managed_system_endpoints(&app, Some(&settings));
-    spawn_system_connection_sampler(
+    let metrics_session = metrics_session_for_runtime(&app, &settings, managed_endpoints);
+    if let Ok(mut current) = state.metrics_session.lock() {
+        *current = Some(metrics_session.clone());
+    }
+    spawn_runtime_observers(
         app.clone(),
-        Arc::clone(&metrics_generation),
+        metrics_generation,
         metrics_generation_id,
-        managed_endpoints,
+        metrics_session,
     );
-    spawn_metrics_poller(app.clone(), metrics_generation, metrics_generation_id);
     Ok(next)
 }
 
@@ -6549,7 +6554,7 @@ fn forward_output<R: std::io::Read>(app: AppHandle, output: R, fallback_level: &
     }
 }
 
-fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
+fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMetrics> {
     let mut metrics = RuntimeMetrics {
         upload_total: 0,
         download_total: 0,
@@ -6558,8 +6563,8 @@ fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
         connections: Vec::new(),
         host_snapshot_valid: false,
         host_snapshot_error: Some("Host Clash API 尚未返回连接快照".into()),
-        guest_snapshot_valid: true,
-        guest_snapshot_error: None,
+        guest_snapshot_valid: !session.guest_required,
+        guest_snapshot_error: session.guest_error.clone(),
         system_snapshot_valid: false,
         system_snapshot_error: None,
     };
@@ -6590,30 +6595,23 @@ fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
         }
     }
 
-    let settings = load_settings(app).ok();
-    if let Some(settings) = settings.as_ref() {
-        if settings.mode == "gateway" {
-            if let Ok(endpoint) = gateway_guest_agent_endpoint(app, settings) {
-                match guest_agent::query_connections(&endpoint, Duration::from_secs(1)) {
-                    Ok(guest_value) => {
-                        let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
-                        metrics.guest_snapshot_valid = true;
-                        metrics.upload_total =
-                            metrics.upload_total.saturating_add(guest.upload_total);
-                        metrics.download_total =
-                            metrics.download_total.saturating_add(guest.download_total);
-                        metrics.memory = metrics.memory.saturating_add(guest.memory);
-                        metrics.connections.extend(guest.connections);
-                        metrics.active_connections = metrics.connections.len();
-                    }
-                    Err(error) => {
-                        metrics.guest_snapshot_valid = false;
-                        metrics.guest_snapshot_error = Some(error.to_string());
-                    }
+    if session.guest_required {
+        if let Some(endpoint) = session.guest_endpoint.as_ref() {
+            match guest_agent::query_connections(&endpoint, Duration::from_secs(1)) {
+                Ok(guest_value) => {
+                    let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
+                    metrics.guest_snapshot_valid = true;
+                    metrics.upload_total = metrics.upload_total.saturating_add(guest.upload_total);
+                    metrics.download_total =
+                        metrics.download_total.saturating_add(guest.download_total);
+                    metrics.memory = metrics.memory.saturating_add(guest.memory);
+                    metrics.connections.extend(guest.connections);
+                    metrics.active_connections = metrics.connections.len();
                 }
-            } else {
-                metrics.guest_snapshot_valid = false;
-                metrics.guest_snapshot_error = Some("Gateway guest-agent 地址不可用".into());
+                Err(error) => {
+                    metrics.guest_snapshot_valid = false;
+                    metrics.guest_snapshot_error = Some(error.to_string());
+                }
             }
         }
     }
@@ -6661,6 +6659,36 @@ fn managed_system_endpoints(
         }
     }
     endpoints
+}
+
+fn metrics_session_for_runtime(
+    app: &AppHandle,
+    settings: &RuntimeSettings,
+    managed_endpoints: Vec<ManagedSystemEndpoint>,
+) -> MetricsSession {
+    if settings.mode != "gateway" {
+        return MetricsSession {
+            guest_endpoint: None,
+            guest_required: false,
+            guest_error: None,
+            managed_endpoints,
+        };
+    }
+
+    match gateway_guest_agent_endpoint(app, settings) {
+        Ok(endpoint) => MetricsSession {
+            guest_endpoint: Some(endpoint),
+            guest_required: true,
+            guest_error: None,
+            managed_endpoints,
+        },
+        Err(error) => MetricsSession {
+            guest_endpoint: None,
+            guest_required: true,
+            guest_error: Some(error),
+            managed_endpoints,
+        },
+    }
 }
 
 fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) -> RuntimeMetrics {
@@ -6846,6 +6874,14 @@ struct ManagedSystemEndpoint {
     host: String,
     port: u16,
     wildcard_host: bool,
+}
+
+#[derive(Clone)]
+struct MetricsSession {
+    guest_endpoint: Option<guest_agent::GuestAgentEndpoint>,
+    guest_required: bool,
+    guest_error: Option<String>,
+    managed_endpoints: Vec<ManagedSystemEndpoint>,
 }
 
 fn normalize_endpoint_host(value: &str) -> String {
@@ -7160,17 +7196,51 @@ fn spawn_system_connection_sampler(
     });
 }
 
-fn spawn_metrics_poller(app: AppHandle, generation: Arc<AtomicU64>, expected: u64) {
+fn spawn_runtime_observers(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    session: MetricsSession,
+) {
+    spawn_system_connection_sampler(
+        app.clone(),
+        Arc::clone(&generation),
+        expected,
+        session.managed_endpoints.clone(),
+    );
+    spawn_metrics_poller(app, generation, expected, session);
+}
+
+fn spawn_metrics_poller(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    session: MetricsSession,
+) {
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(1));
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        if let Some(metrics) = fetch_metrics(&app) {
+        if let Some(metrics) = fetch_metrics(&app, &session) {
             let _ = app.emit("runtime-metrics", metrics);
         }
         observe_gateway_packet_path(&app);
     });
+}
+
+fn restart_runtime_observers(app: &AppHandle, state: &RuntimeState) {
+    let session = state
+        .metrics_session
+        .lock()
+        .ok()
+        .and_then(|current| current.clone());
+    let Some(session) = session else {
+        return;
+    };
+    let generation = Arc::clone(&state.metrics_generation);
+    let expected = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    spawn_runtime_observers(app.clone(), generation, expected, session);
 }
 
 #[tauri::command]
@@ -7219,6 +7289,9 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                     &worker_state,
                     status_after_stop_failure(current, resources_owned, error.clone()),
                 );
+                if resources_owned {
+                    restart_runtime_observers(&worker_app, &worker_state);
+                }
                 emit_log(&worker_app, "error", error);
             }
             Err(_) => {
@@ -7241,6 +7314,9 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                     &worker_state,
                     status_after_stop_failure(current, resources_owned, error.clone()),
                 );
+                if resources_owned {
+                    restart_runtime_observers(&worker_app, &worker_state);
+                }
                 emit_log(&worker_app, "error", error);
             }
         }
@@ -7251,22 +7327,31 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
 fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
     state.metrics_generation.fetch_add(1, Ordering::SeqCst);
     let _gateway_transition = lock_gateway_transition(state);
-    let guest_endpoint = match load_settings(app) {
-        Ok(settings) if settings.mode == "gateway" => {
-            match gateway_guest_agent_endpoint(app, &settings) {
-                Ok(endpoint) => Some(endpoint),
-                Err(error) => {
-                    emit_log(
-                        app,
-                        "warn",
-                        format!("无法发送 guest-agent 停止提示：{error}"),
-                    );
-                    None
+    let guest_endpoint = state
+        .metrics_session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .as_ref()
+                .and_then(|current| current.guest_endpoint.clone())
+        })
+        .or_else(|| match load_settings(app) {
+            Ok(settings) if settings.mode == "gateway" => {
+                match gateway_guest_agent_endpoint(app, &settings) {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(error) => {
+                        emit_log(
+                            app,
+                            "warn",
+                            format!("无法发送 guest-agent 停止提示：{error}"),
+                        );
+                        None
+                    }
                 }
             }
-        }
-        _ => None,
-    };
+            _ => None,
+        });
     if let Some(endpoint) = guest_endpoint {
         let guest_app = app.clone();
         thread::spawn(move || {
@@ -7280,7 +7365,13 @@ fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), S
             }
         });
     }
-    stop_runtime_processes_locked(app, state)
+    let result = stop_runtime_processes_locked(app, state);
+    if result.is_ok() {
+        if let Ok(mut session) = state.metrics_session.lock() {
+            *session = None;
+        }
+    }
+    result
 }
 
 fn stop_runtime_processes_locked(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
