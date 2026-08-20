@@ -1,0 +1,88 @@
+{
+  "schema": "songsterx-gateway-inputs/v1",
+  "alpine": {
+    "version": "3.24.1",
+    "branch": "3.24",
+    "kernelConfig": {
+      "name": "config-6.18.35-0-virt",
+      "path": "config-6.18.35-0-virt",
+      "sha256": "5557553d228d407e8eac80ea7a1c7bf36dab558625067c9ada355032cf6a9c51"
+    },
+    "files": {
+      "vmlinuz-virt": {
+        "name": "vmlinuz-virt",
+        "sha256": "47970e0ee0478fe5c60824a89f162d5a353fa29466e5d3bddb0f9c506f1ed756"
+      },
+      "initramfs-virt": {
+        "name": "initramfs-virt",
+        "sha256": "e47d38bc88509a3db11affc09f9762f9643b026bd29441724a4729ad8e97add6"
+      },
+      "modloop-virt": {
+        "name": "modloop-virt",
+        "sha256": "f969d12c8e23b486c8df651f04a4a9767f32fee16aed385c23462c31ea6cb47b"
+      }
+    },
+    "minirootfs": {
+      "name": "alpine-minirootfs-3.24.1-aarch64.tar.gz",
+      "sha256": "f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259"
+    },
+    "apkIndex": {
+      "name": "APKINDEX.tar.gz",
+      "sha256": "7a400a3d0b6f99686de0b9c60f25453900d32a531ee37c0d88e8abfa1f32ecc9"
+    },
+    "packages": {
+      "musl-dev": {
+        "version": "1.2.6-r2",
+        "file": "musl-dev-1.2.6-r2.apk",
+        "sha256": "ca72b84f4eb3c36bbbec04d919eb10159d414c7a43413cc2253841d301fa9486"
+      },
+      "iproute2-minimal": {
+        "version": "7.0.0-r0",
+        "file": "iproute2-minimal-7.0.0-r0.apk",
+        "sha256": "5ef23a7fd11df32dae739de6f3faca463711809eeab0391c38ad268636ee0b70"
+      },
+      "libcap2": {
+        "version": "2.78-r0",
+        "file": "libcap2-2.78-r0.apk",
+        "sha256": "e13be383f18b1fcfe895361d816ff7cfd2b3c265e442bb371c4a234b29b0e4a9"
+      },
+      "libelf": {
+        "version": "0.195-r0",
+        "file": "libelf-0.195-r0.apk",
+        "sha256": "1c108314af454a885ac0b053201db57027470c4f2309412c016897e2a2bf5d0e"
+      },
+      "libmnl": {
+        "version": "1.0.5-r2",
+        "file": "libmnl-1.0.5-r2.apk",
+        "sha256": "0ca382c70f78affef3a4a28016aab25ad8c3ccf1bcdad59f3968d4536a7b2478"
+      },
+      "libnftnl": {
+        "version": "1.3.1-r0",
+        "file": "libnftnl-1.3.1-r0.apk",
+        "sha256": "8b31395671e910c294d7f0e29d3ac3c7efe9d89264db255f39aa9944dd4b6cac"
+      },
+      "libxtables": {
+        "version": "1.8.13-r0",
+        "file": "libxtables-1.8.13-r0.apk",
+        "sha256": "7535f18d9c7229178bc5e3809e5fea171033e33dfa054d88846512e1f25eefa8"
+      },
+      "iptables": {
+        "version": "1.8.13-r0",
+        "file": "iptables-1.8.13-r0.apk",
+        "sha256": "9d22aef2e74346e9d537f6dc964786ab14b35580e3ccc0e4001dc3a725e8fe77"
+      },
+      "zstd-libs": {
+        "version": "1.5.7-r2",
+        "file": "zstd-libs-1.5.7-r2.apk",
+        "sha256": "2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818"
+      }
+    }
+  },
+  "singBox": {
+    "version": "1.13.14",
+    "archive": {
+      "name": "sing-box-1.13.14-linux-arm64-musl.tar.gz",
+      "sha256": "edec18488af35a93cf8b362063146fdd7b557ef9862710ee77a1f4adb5c70118"
+    }
+  }
+}

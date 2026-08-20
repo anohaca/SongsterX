@@ -1,0 +1,120 @@
+{
+  "schema": "songsterx-module-assets/v1",
+  "source_modules_manifest": "config/modules.manifest.yaml",
+  "downloaded_at": "2026-08-15",
+  "execute_remote_code": false,
+  "assets": [
+    {
+      "kind": "script",
+      "module": "zheye",
+      "source": "https://gist.githubusercontent.com/blackmatrix7/f5f780d0f56b319b6ad9848fd080bb18/raw/zheye.min.js",
+      "local_file": "modules/remote-scripts/zheye.min.js",
+      "sha256": "41863c4c0ce5eefbdda9a5a96d7605bde70a89a9cc24ee0875f3d751aed2f757"
+    },
+    {
+      "kind": "script",
+      "module": "wloc",
+      "source": "https://raw.githubusercontent.com/Yu9191/wloc/refs/heads/main/dist/wloc.js",
+      "local_file": "modules/remote-scripts/wloc.js",
+      "sha256": "a1b361e60f0b434585260fb59c65d1ddbe3bff89ace3639f592e7d8af432b3c1"
+    },
+    {
+      "kind": "script",
+      "module": "wloc",
+      "source": "https://raw.githubusercontent.com/Yu9191/wloc/refs/heads/main/dist/wloc-settings.js",
+      "local_file": "modules/remote-scripts/wloc-settings.js",
+      "sha256": "433073eed20064ee59cafc857eb444e0bcc958290323ac7586a77093776d8f42"
+    },
+    {
+      "kind": "script",
+      "module": "jd-price2",
+      "source": "https://raw.githubusercontent.com/wf021325/qx/master/js/jd_price.js",
+      "local_file": "modules/remote-scripts/jd_price.js",
+      "sha256": "d6d03a94e85607a4355d9bc0eaed16319cf5872f79e6dc6e4d668fa6d1578ecb"
+    },
+    {
+      "kind": "script",
+      "module": "youtube-enhance",
+      "source": "https://raw.githubusercontent.com/Maasea/sgmodule/master/Script/Youtube/youtube.response.js",
+      "local_file": "modules/remote-scripts/youtube.response.js",
+      "sha256": "f98483d5f5017514f82502253c0db5ce2d4ffb7839887aa2cadc22666f5a7f12"
+    },
+    {
+      "kind": "script",
+      "module": "youtube-enhance",
+      "source": "https://raw.githubusercontent.com/Maasea/sgmodule/master/Script/Youtube/youtube.request.js",
+      "local_file": "modules/remote-scripts/youtube.request.js",
+      "sha256": "3ecca15e06e76a31720092c581180f648ef2c45e494644941ba985c878efbb26"
+    },
+    {
+      "kind": "script",
+      "module": "tieba",
+      "source": "https://raw.githubusercontent.com/app2smile/rules/master/js/tieba-json.js",
+      "local_file": "modules/remote-scripts/tieba-json.js",
+      "sha256": "91040c0d5bf906357829d8df344a3bdce00b59e6c24f255e54a2ef7a46d04c69"
+    },
+    {
+      "kind": "script",
+      "module": "tieba",
+      "source": "https://raw.githubusercontent.com/app2smile/rules/master/js/tieba-proto.js",
+      "local_file": "modules/remote-scripts/tieba-proto.js",
+      "sha256": "6015d737870b6d89c38a0181479ed715e07d11b5a2c3746f96f95e25835e8610"
+    },
+    {
+      "kind": "script",
+      "module": "bili-hd",
+      "source": "https://raw.githubusercontent.com/cihaca1/MyModule/refs/heads/main/bilibili_json.js",
+      "local_file": "modules/remote-scripts/bilibili_json.js",
+      "sha256": "56b2cc53fe7741a355a64786e6030050b2edce453de17d2f4550597a14dad5f3"
+    },
+    {
+      "kind": "script",
+      "module": "spotify",
+      "source": "https://raw.githubusercontent.com/app2smile/rules/master/js/spotify-json.js",
+      "local_file": "modules/remote-scripts/spotify-json.js",
+      "sha256": "41cf1074770cdef3948baa12ff4a8db9045d1cac888714c8b7e69909eb531bc9"
+    },
+    {
+      "kind": "script",
+      "module": "spotify",
+      "source": "https://raw.githubusercontent.com/app2smile/rules/master/js/spotify-proto.js",
+      "local_file": "modules/remote-scripts/spotify-proto.js",
+      "sha256": "2e6850e888d092905c766f0bbedc4b4afb9a712330970cc1265105d7fb4995d0"
+    },
+    {
+      "kind": "script",
+      "module": "bili-enhanced",
+      "source": "https://github.com/BiliUniverse/Enhanced/releases/download/v0.5.13/response.bundle.js",
+      "local_file": "modules/remote-scripts/bili-enhanced-response.bundle.js",
+      "sha256": "f34238dce8fc4c525a371e934382d2241a6712a366de609892c710712808f445"
+    },
+    {
+      "kind": "script",
+      "module": "bili-adblock",
+      "source": "https://github.com/BiliUniverse/ADBlock/releases/download/v0.6.24/request.bundle.js",
+      "local_file": "modules/remote-scripts/bili-adblock-request.bundle.js",
+      "sha256": "adc2f2f2e09466ab9f21f4a0e39e212a741b753279b993a773c23af81bf43ecf"
+    },
+    {
+      "kind": "script",
+      "module": "bili-adblock",
+      "source": "https://github.com/BiliUniverse/ADBlock/releases/download/v0.6.24/response.bundle.js",
+      "local_file": "modules/remote-scripts/bili-adblock-response.bundle.js",
+      "sha256": "f805f7dd5dad9f43ac67ce47b9d3ac294b5848a59b1d0ea9d504707fe406f4a1"
+    },
+    {
+      "kind": "data",
+      "module": "zheye",
+      "source": "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/blank/blank_dict.json",
+      "local_file": "modules/remote-assets/zhihu-blank_dict.json",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "kind": "rule-set",
+      "module": "tieba",
+      "source": "https://raw.githubusercontent.com/app2smile/rules/master/rule/tieba-ad.list",
+      "local_file": "modules/remote-assets/tieba-ad.list",
+      "sha256": "93599502d9498d4977f007d89511b2918afc6398dad5b8cece25057b2fbff7a3"
+    }
+  ]
+}

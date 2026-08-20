@@ -1,0 +1,16 @@
+src-tauri/resources/mitmdump
+src-tauri/resources/songsterx-gatewaykit
+src-tauri/resources/
+src-tauri/target/
+native/build/
+native/vendor/Libbox.xcframework/
+dist/
+node_modules/
+.tools/
+__pycache__/
+*.pyc
+.DS_Store
+._*
+src-tauri/guest-agent/target/
+# Never commit local profiles containing proxy credentials or MITM keys.
+docs/Default.conf

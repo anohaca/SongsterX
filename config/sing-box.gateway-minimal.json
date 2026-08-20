@@ -1,0 +1,198 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "fakeip",
+        "tag": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      },
+      {
+        "type": "local",
+        "tag": "system-dns"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": ["lan", "local"],
+        "server": "system-dns"
+      },
+      {
+        "domain": ["localhost"],
+        "server": "system-dns"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "server": "fakeip"
+      }
+    ],
+    "final": "system-dns",
+    "strategy": "prefer_ipv4",
+    "independent_cache": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": ["172.19.0.1/30"],
+      "auto_route": true,
+      "strict_route": true,
+      "route_address": [
+        "0.0.0.0/1",
+        "128.0.0.0/1"
+      ],
+      "iproute2_table_index": 2022,
+      "iproute2_rule_index": 9000,
+      "stack": "mixed",
+      "route_exclude_address": [
+        "223.86.225.0/24",
+        "192.168.88.0/24",
+        "192.168.250.0/24"
+      ]
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in-direct",
+      "listen": "127.0.0.1",
+      "listen_port": 2081
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "http",
+      "tag": "ad",
+      "server": "127.0.0.1",
+      "server_port": 3128
+    },
+    {
+      "type": "trojan",
+      "tag": "tunnel",
+      "server": "162.159.45.195",
+      "server_port": 443,
+      "password": "<TROJAN_PASSWORD>",
+      "network": "tcp",
+      "tls": {
+        "enabled": true,
+        "server_name": "speedtest.mobeni.eu.org",
+        "insecure": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/e26ae2d90dcd920b9a6609fd",
+        "headers": {
+          "Host": "speedtest.mobeni.eu.org"
+        }
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "snell-bridge",
+      "server": "127.0.0.1",
+      "server_port": 2082
+    },
+    {
+      "type": "urltest",
+      "tag": "smart",
+      "outbounds": ["tunnel", "snell-bridge"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "type": "selector",
+      "tag": "Final",
+      "outbounds": ["smart", "tunnel", "snell-bridge", "ad", "direct"],
+      "default": "smart"
+    },
+    {
+      "type": "http",
+      "tag": "mitm",
+      "server": "127.0.0.1",
+      "server_port": 8080
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "system-dns",
+    "final": "Final",
+    "rules": [
+      {
+        "inbound": ["tun-in"],
+        "action": "resolve"
+      },
+      {
+        "action": "sniff",
+        "sniffer": ["http", "tls", "quic", "dns"],
+        "timeout": "300ms"
+      },
+      {
+        "inbound": ["tun-in"],
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "inbound": ["mixed-in-direct"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "network": "tcp",
+        "port": [8000],
+        "action": "reject"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["172.64.229.216/32"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": ["api.day.app"],
+        "action": "route",
+        "outbound": "mitm"
+      },
+      {
+        "domain": [
+          "gateway.icloud.com",
+          "iosapps.itunes.apple.com"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": ["steamserver.net"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain": ["linux.do"],
+        "action": "route",
+        "outbound": "Final"
+      },
+      {
+        "domain_suffix": [
+          "v2ex.com",
+          "openai.com",
+          "chatgpt.com",
+          "googleapis.cn",
+          "nodeseek.com"
+        ],
+        "action": "route",
+        "outbound": "Final"
+      }
+    ]
+  }
+}

@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+umask 077
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+NETCTL=${SONGSTERX_NETCTL:-/usr/lib/songsterx/songsterx-gateway-net.sh}
+AGENT=${SONGSTERX_AGENT:-/usr/bin/songsterx-gateway-agent}
+STATE_DIR=${SONGSTERX_STATE_DIR:-/var/lib/songsterx}
+RUN_DIR=${SONGSTERX_RUN_DIR:-/run/songsterx}
+NETWORK_STATE="$RUN_DIR/network.state"
+NETWORK_READY="$RUN_DIR/network.ready"
+AGENT_READY="$STATE_DIR/ready"
+AUTH_TOKEN_FILE="$STATE_DIR/agent.token"
+agent_pid=
+
+log() { printf '%s\n' "songsterx-guest-init: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+state_value() {
+    key=$1
+    found=
+    count=0
+    [ -r "$NETWORK_STATE" ] || return 1
+    while IFS='=' read -r name value; do
+        if [ "$name" = "$key" ]; then found=$value; count=$((count + 1)); fi
+    done < "$NETWORK_STATE"
+    [ "$count" -eq 1 ] || return 1
+    printf '%s\n' "$found"
+}
+
+on_signal() {
+    if [ -n "$agent_pid" ]; then
+        kill "$agent_pid" >/dev/null 2>&1 || true
+        wait "$agent_pid" >/dev/null 2>&1 || true
+    fi
+    "$NETCTL" stop >/dev/null 2>&1 || true
+    rm -f "$AGENT_READY"
+    exit 143
+}
+
+cleanup() {
+    if [ -n "$agent_pid" ]; then
+        kill "$agent_pid" >/dev/null 2>&1 || true
+        wait "$agent_pid" >/dev/null 2>&1 || true
+        agent_pid=
+    fi
+    "$NETCTL" stop >/dev/null 2>&1 || true
+    rm -f "$AGENT_READY"
+}
+
+trap on_signal HUP INT TERM
+trap cleanup EXIT
+
+[ -x "$NETCTL" ] || die "network controller 不可执行：$NETCTL"
+[ -x "$AGENT" ] || die "guest-agent 不可执行：$AGENT"
+mkdir -p "$STATE_DIR" "$RUN_DIR" /proc /sys /dev /run
+
+# The custom init replaces the distribution initramfs entrypoint. Mount the
+# kernel filesystems explicitly so interface discovery and tun creation work
+# on a bare vfkit boot.
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mkdir -p /dev/net
+if [ ! -c /dev/net/tun ] && command -v mknod >/dev/null 2>&1; then
+    mknod /dev/net/tun c 10 200 2>/dev/null || true
+fi
+if [ ! -c /dev/net/tun ]; then
+    command -v modprobe >/dev/null 2>&1 && modprobe tun >/dev/null 2>&1 || true
+fi
+[ -c /dev/net/tun ] || die "Linux tun 设备不可用；kernel/initramfs 必须提供 CONFIG_TUN"
+
+if command -v modprobe >/dev/null 2>&1; then
+    # The custom init does not run Alpine's normal module auto-loader.
+    # Loading these explicitly keeps vfkit virtio and iptables-nft usable.
+    for module in virtio_net nf_tables nf_tables_inet nf_conntrack nf_nat; do
+        modprobe "$module" >/dev/null 2>&1 || true
+    done
+fi
+
+rm -f "$AGENT_READY"
+
+"$NETCTL" setup || die "guest network 初始化失败"
+[ -f "$NETWORK_READY" ] || die "network controller 未产生 network.ready"
+HOST_IP=$(state_value HOST_ADDR | sed 's#/.*##') || die "network.state 缺少 HOST_ADDR"
+AGENT_PORT=$(state_value AGENT_PORT) || die "network.state 缺少 AGENT_PORT"
+
+# Token 只来自文件，绝不从 kernel cmdline 传入。
+"$AGENT" \
+    --listen "$HOST_IP:$AGENT_PORT" \
+    --state-dir "$STATE_DIR" \
+    --auth-token-file "$AUTH_TOKEN_FILE" \
+    --readiness-file "$AGENT_READY" \
+    --network-ready-file "$NETWORK_READY" \
+    --network-control "$NETCTL" &
+agent_pid=$!
+set +e
+wait "$agent_pid"
+status=$?
+set -e
+agent_pid=
+exit "$status"

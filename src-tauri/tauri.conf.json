@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SongsterX",
+  "version": "0.1.0",
+  "identifier": "com.songsterx.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build && npm run prepare:mitmproxy && bash scripts/prepare_vmnet_helper.sh && bash scripts/prepare_vfkit_bundle.sh && bash scripts/prepare_gateway_guest_bundle.sh",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SongsterX",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
+    },
+    "resources": {
+      "../config/sing-box.mix-direct-minimal.json": "sing-box.mix-direct-minimal.json",
+      "../scripts/mitm_minimal_addon.py": "scripts/mitm_minimal_addon.py",
+      "../scripts/surge_js_runtime.py": "scripts/surge_js_runtime.py",
+      "resources/mitmdump": "mitmdump",
+      "resources/sing-box": "sing-box",
+      "resources/vmnet-helper": "vmnet-helper",
+      "resources/vfkit": "vfkit",
+      "resources/gateway-guest": "gateway-guest"
+    }
+  }
+}

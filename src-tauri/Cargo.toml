@@ -1,0 +1,27 @@
+[package]
+name = "songsterx"
+version = "0.1.0"
+default-run = "songsterx"
+description = "SongsterX cross-platform network control center"
+authors = ["SongsterX"]
+edition = "2021"
+
+[lib]
+name = "songsterx_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "songsterx-gateway-agent"
+path = "guest-agent/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+ureq = { version = "2", features = ["json"] }
+url = "2"

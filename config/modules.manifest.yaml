@@ -1,0 +1,51 @@
+schema: songsterx-module-manifest/v1
+source: Untitled-1.md
+downloaded_at: 2026-08-15
+activation: enabled_after_hash_pin_and_module_engine_review
+execute_remote_code: false
+modules:
+  - id: zheye
+    source: https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/script/zheye/zheye.sgmodule
+    local_file: modules/zheye.sgmodule
+    sha256: 8b07af40a4b50e832e72e800e65b87cc349fb79e7e10c3dc99a6692a21b8a4ec
+    sections: [Rule, Map Local, Script, MITM]
+  - id: wloc
+    source: https://raw.githubusercontent.com/Yu9191/wloc/refs/heads/main/modules/wloc.sgmodule
+    local_file: modules/wloc.sgmodule
+    sha256: 41722990cacdaf11bd1e3359cde6bc2e99f799da7ba2e069a967be1643e38d0c
+    sections: [Script, MITM]
+  - id: jd-price2
+    source: https://raw.githubusercontent.com/githubdulong/Script/master/Surge/jd_price2.sgmodule
+    local_file: modules/jd_price2.sgmodule
+    sha256: 8f548753c38aa8a47437155777f37a7c09ed87be426d05d2aa2a18a9ca00bd7d
+    sections: [Script, MITM]
+  - id: youtube-enhance
+    source: https://raw.githubusercontent.com/Maasea/sgmodule/master/YouTube.Enhance.sgmodule
+    local_file: modules/YouTube.Enhance.sgmodule
+    sha256: 9c7464733c54417da36aff09482d1287cee5ecd531ad856842912704b5b3f64d
+    sections: [Script, MITM]
+  - id: tieba
+    source: https://raw.githubusercontent.com/app2smile/rules/master/module/tieba.sgmodule
+    local_file: modules/tieba.sgmodule
+    sha256: b20d792a1f4466e97103266942176d6db4579340ba201a4fa8db91da2adfda29
+    sections: [Rule, MITM, Script]
+  - id: bili-hd
+    source: https://raw.githubusercontent.com/cihaca1/MyModule/refs/heads/main/BiliHD
+    local_file: modules/BiliHD.sgmodule
+    sha256: 6fb341d18d04e207984e69eb9f11d9e3f2e00094611df6fa6fa3bcc7919161ce
+    sections: [MITM, Script]
+  - id: spotify
+    source: https://raw.githubusercontent.com/app2smile/rules/master/module/spotify.module
+    local_file: modules/spotify.module
+    sha256: f7bd712efdffad37c547d2dd79dd6948d444bb74f95d92f6ec125f7e4c479562
+    sections: [Header Rewrite, MITM, Script]
+  - id: bili-enhanced
+    source: https://github.com/BiliUniverse/Enhanced/releases/latest/download/BiliBili.Enhanced.sgmodule
+    local_file: modules/BiliBili.Enhanced.sgmodule
+    sha256: f510220000bfe99221116038146f3af96c5f2a1f4c1f3d164c70ca3cabc02240
+    sections: [Script, MITM]
+  - id: bili-adblock
+    source: https://github.com/BiliUniverse/ADBlock/releases/latest/download/BiliBili.ADBlock.sgmodule
+    local_file: modules/BiliBili.ADBlock.sgmodule
+    sha256: c7a9b0f0cbbe9ccd79ccec58a04d26401865819763cd9372a3fe34e8fe04b310
+    sections: [URL Rewrite, Map Local, Body Rewrite, Script, MITM]

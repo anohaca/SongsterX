@@ -1,0 +1,11 @@
+vmnet-helper upstream source snapshot
+
+Project: https://github.com/nirs/vmnet-helper
+Commit: 255cb10f0472ee1da6e77ebc70cc2522c6b5dd6b
+Version: v0.13.0-5-g255cb10
+License: Apache-2.0 (see LICENSES/Apache-2.0.txt)
+
+The bundled source is limited to the Meson build inputs needed by SongsterX:
+the vmnet-helper program, its vmnet-broker client, build metadata, and the
+upstream sudoers documentation. It is used to produce the bundled arm64
+resource at src-tauri/resources/vmnet-helper.

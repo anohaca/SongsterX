@@ -1,0 +1,89 @@
+{
+  "schema": "songsterx-surge-logic-rules/v1",
+  "source": "Default.conf",
+  "activation": "disabled_until_rule_compiler_and_context_runtime",
+  "execute_remote_code": false,
+  "rules": [
+    {
+      "id": "source-ad-filter",
+      "source_text": "AND,((HOSTNAME-TYPE,DOMAIN),(OR,((SRC-IP,192.168.88.242),(SRC-IP,192.168.88.240),(SRC-IP,192.168.88.246),(SRC-IP,192.168.88.243))),(OR,((PROTOCOL,HTTPS),(PROTOCOL,HTTP))),(NOT,((OR,((DOMAIN-KEYWORD,byte,extended-matching),(DOMAIN-KEYWORD,icloud,extended-matching),(DOMAIN-KEYWORD,apple,extended-matching),(DOMAIN-KEYWORD,tiktok,extended-matching),(DOMAIN-KEYWORD,douyin,extended-matching))))),ad",
+      "logic": {
+        "all": [
+          {"match": "hostname_type", "value": "domain"},
+          {"any": [
+            {"match": "source_ip", "value": "192.168.88.242"},
+            {"match": "source_ip", "value": "192.168.88.240"},
+            {"match": "source_ip", "value": "192.168.88.246"},
+            {"match": "source_ip", "value": "192.168.88.243"}
+          ]},
+          {"any": [
+            {"match": "protocol", "value": "https"},
+            {"match": "protocol", "value": "http"}
+          ]},
+          {"not": {"any": [
+            {"match": "domain_keyword", "value": "byte", "extended_matching": true},
+            {"match": "domain_keyword", "value": "icloud", "extended_matching": true},
+            {"match": "domain_keyword", "value": "apple", "extended_matching": true},
+            {"match": "domain_keyword", "value": "tiktok", "extended_matching": true},
+            {"match": "domain_keyword", "value": "douyin", "extended_matching": true}
+          ]}}
+        ]
+      },
+      "action": {"outbound": "ad"},
+      "status": "not_implemented_in_m0",
+      "missing": ["RuleCompiler logical AND/OR/NOT", "remote-client source context", "extended-matching"]
+    },
+    {
+      "id": "source-qbittorrent-process",
+      "source_text": "PROCESS-NAME,/Applications/qbittorrent.app/Contents/MacOS/qbittorrent,DIRECT",
+      "logic": {"all": [{"match": "process_name", "value": "<QBITTORRENT_EXECUTABLE>"}]},
+      "action": {"outbound": "direct"},
+      "status": "host_only_not_gateway_m0",
+      "missing": ["Native process identity provider", "remote-client process transport"]
+    },
+    {
+      "id": "source-emby-mitm-direct",
+      "source_text": "AND,((SRC-IP,192.168.64.0/16),(DOMAIN,api.day.app),(SCRIPT,EmbyRefresh)),DIRECT",
+      "logic": {"all": [
+        {"match": "source_ip_cidr", "value": "192.168.64.0/16"},
+        {"match": "domain", "value": "api.day.app"},
+        {"match": "script_result", "value": "EmbyRefresh"}
+      ]},
+      "action": {"outbound": "direct"},
+      "status": "not_implemented_in_m0",
+      "missing": ["Surge JS runtime", "script_result matcher", "source context relay"]
+    },
+    {
+      "id": "source-geoip-cn-direct",
+      "source_text": "GEOIP,CN,DIRECT",
+      "logic": {"all": [{"match": "geoip_country", "value": "CN"}]},
+      "action": {"outbound": "direct"},
+      "status": "not_implemented_in_m0",
+      "missing": ["Pinned GeoIP database", "versioned GeoIP update and test policy"]
+    },
+    {
+      "id": "module-ruleset-tieba-ad",
+      "source_text": "RULE-SET,<LOCAL_TIEBA_AD_RULESET>,REJECT-DROP",
+      "logic": {"all": [{"match": "ruleset", "value": "modules/remote-assets/tieba-ad.list"}]},
+      "action": {"outbound": "reject"},
+      "status": "downloaded_not_activated",
+      "missing": ["Module Engine ruleset insertion", "REJECT-DROP semantic adapter"]
+    },
+    {
+      "id": "module-url-regex",
+      "source_text": "URL-REGEX,<MODULE_PATTERN>,<ACTION>",
+      "logic": {"all": [{"match": "url_regex", "value": "<MODULE_PATTERN>"}]},
+      "action": {"kind": "module_declared_action"},
+      "status": "downloaded_not_activated",
+      "missing": ["HTTP processing RuleCompiler", "first-match and body semantics"]
+    },
+    {
+      "id": "module-ip-cidr-no-resolve",
+      "source_text": "IP-CIDR,<MODULE_IP>,REJECT,no-resolve",
+      "logic": {"all": [{"match": "ip_cidr", "value": "<MODULE_IP>", "no_resolve": true}]},
+      "action": {"outbound": "reject"},
+      "status": "downloaded_not_activated",
+      "missing": ["Module Engine rule activation", "no-resolve compiler semantics"]
+    }
+  ]
+}
