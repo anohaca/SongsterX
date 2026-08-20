@@ -1227,7 +1227,9 @@ function App() {
         addLocalLog("info", "已自动保存入口设置，启动时将同时使用 Mixed 和所选网关模式。");
       }
       if (!shouldStop) setConnectionHistory([]);
-      setStatus(await invoke<RuntimeStatus>(shouldStop ? "stop_runtime" : "start_mix_direct"));
+      const next = await invoke<RuntimeStatus>(shouldStop ? "stop_runtime" : "start_mix_direct");
+      setStatus(next);
+      await waitForRuntimeState(shouldStop ? "stopped" : "running", 60_000);
     } catch (error) {
       const message = String(error);
       setSettingsMessage(message);

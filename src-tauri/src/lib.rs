@@ -5187,6 +5187,32 @@ fn status_after_stop_failure(
     current
 }
 
+fn finalize_start_failure(app: &AppHandle, state: &RuntimeState, error: String) {
+    let resources_owned = runtime_owns_resources(state);
+    mark_lifecycle_phase(
+        state,
+        if resources_owned {
+            LifecyclePhase::Running
+        } else {
+            LifecyclePhase::Stopped
+        },
+    );
+    if !resources_owned {
+        if let Ok(mut session) = state.metrics_session.lock() {
+            *session = None;
+        }
+    }
+    let current = current_status(state).unwrap_or_default();
+    update_status(
+        state,
+        status_after_stop_failure(current, resources_owned, error.clone()),
+    );
+    if resources_owned {
+        restart_runtime_observers(app, state);
+    }
+    emit_log(app, "error", error);
+}
+
 fn finalize_unexpected_runtime_exit(
     app: &AppHandle,
     state: &RuntimeState,
@@ -5903,6 +5929,7 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = sing_box_exit {
+        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
         let cleanup = stop_runtime_processes_locked(&app, &state);
         return Ok(finalize_unexpected_runtime_exit(
             &app, &state, message, cleanup,
@@ -5926,6 +5953,7 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = mitm_exit {
+        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
         let cleanup = stop_runtime_processes_locked(&app, &state);
         return Ok(finalize_unexpected_runtime_exit(
             &app, &state, message, cleanup,
@@ -5946,6 +5974,7 @@ fn get_runtime_status(
         exited
     };
     if gateway_supervisor_exit {
+        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
         let cleanup = stop_runtime_processes_locked(&app, &state);
         return Ok(finalize_unexpected_runtime_exit(
             &app,
@@ -6013,16 +6042,7 @@ fn start_mix_direct(
                     .map(|phase| *phase == LifecyclePhase::Starting)
                     .unwrap_or(false);
                 if should_report {
-                    mark_lifecycle_phase(&worker_state, LifecyclePhase::Stopped);
-                    update_status(
-                        &worker_state,
-                        RuntimeStatus {
-                            state: "error".into(),
-                            message: error.clone(),
-                            ..RuntimeStatus::default()
-                        },
-                    );
-                    emit_log(&worker_app, "error", error);
+                    finalize_start_failure(&worker_app, &worker_state, error);
                 }
             }
         }
@@ -7384,7 +7404,7 @@ fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), S
         });
     }
     let result = stop_runtime_processes_locked(app, state);
-    if result.is_ok() {
+    if result.is_ok() || !runtime_owns_resources(state) {
         if let Ok(mut session) = state.metrics_session.lock() {
             *session = None;
         }
