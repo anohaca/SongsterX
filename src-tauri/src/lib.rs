@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -258,6 +259,9 @@ struct RuntimeMetrics {
     active_connections: usize,
     memory: u64,
     connections: Vec<ConnectionInfo>,
+    host_snapshot_valid: bool,
+    guest_snapshot_valid: bool,
+    guest_snapshot_error: Option<String>,
     system_snapshot_valid: bool,
     system_snapshot_error: Option<String>,
 }
@@ -387,6 +391,8 @@ struct ConnectionInfo {
     pid: Option<u32>,
     #[serde(default)]
     state: String,
+    #[serde(rename = "systemSocketKey", skip_serializing_if = "Option::is_none")]
+    system_socket_key: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -394,6 +400,12 @@ struct SystemConnectionSample {
     connections: Vec<ConnectionInfo>,
     valid: bool,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct SystemConnectionIdentityState {
+    active_instances: HashMap<String, String>,
+    next_generation: u64,
 }
 
 fn default_tls_enabled() -> bool {
@@ -6433,10 +6445,12 @@ fn start_mix_direct_transaction(
             }
         ),
     );
+    let managed_endpoints = managed_system_endpoints(&app, Some(&settings));
     spawn_system_connection_sampler(
         app.clone(),
         Arc::clone(&metrics_generation),
         metrics_generation_id,
+        managed_endpoints,
     );
     spawn_metrics_poller(app.clone(), metrics_generation, metrics_generation_id);
     Ok(next)
@@ -6526,22 +6540,32 @@ fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
         .ok()?;
     let host_value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let mut metrics = runtime_metrics_from_clash_value(&host_value, "host");
+    metrics.host_snapshot_valid = true;
 
     let settings = load_settings(app).ok();
     if let Some(settings) = settings.as_ref() {
         if settings.mode == "gateway" {
             if let Ok(endpoint) = gateway_guest_agent_endpoint(app, settings) {
-                if let Ok(guest_value) =
-                    guest_agent::query_connections(&endpoint, Duration::from_secs(1))
-                {
-                    let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
-                    metrics.upload_total = metrics.upload_total.saturating_add(guest.upload_total);
-                    metrics.download_total =
-                        metrics.download_total.saturating_add(guest.download_total);
-                    metrics.memory = metrics.memory.saturating_add(guest.memory);
-                    metrics.connections.extend(guest.connections);
-                    metrics.active_connections = metrics.connections.len();
+                match guest_agent::query_connections(&endpoint, Duration::from_secs(1)) {
+                    Ok(guest_value) => {
+                        let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
+                        metrics.guest_snapshot_valid = true;
+                        metrics.upload_total =
+                            metrics.upload_total.saturating_add(guest.upload_total);
+                        metrics.download_total =
+                            metrics.download_total.saturating_add(guest.download_total);
+                        metrics.memory = metrics.memory.saturating_add(guest.memory);
+                        metrics.connections.extend(guest.connections);
+                        metrics.active_connections = metrics.connections.len();
+                    }
+                    Err(error) => {
+                        metrics.guest_snapshot_valid = false;
+                        metrics.guest_snapshot_error = Some(error.to_string());
+                    }
                 }
+            } else {
+                metrics.guest_snapshot_valid = false;
+                metrics.guest_snapshot_error = Some("Gateway guest-agent 地址不可用".into());
             }
         }
     }
@@ -6634,6 +6658,7 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
                         process: String::new(),
                         pid: None,
                         state: "active".into(),
+                        system_socket_key: None,
                     }
                 })
                 .collect()
@@ -6646,6 +6671,9 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
         active_connections: connections.len(),
         memory,
         connections,
+        host_snapshot_valid: runtime == "host",
+        guest_snapshot_valid: true,
+        guest_snapshot_error: None,
         system_snapshot_valid: false,
         system_snapshot_error: None,
     }
@@ -6664,7 +6692,14 @@ fn split_system_endpoint(value: &str) -> (String, String) {
         .unwrap_or_else(|| (value.to_string(), String::new()))
 }
 
-fn system_connection_id(
+fn system_connection_id(socket_key: &str, instance_generation: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(socket_key.as_bytes());
+    digest.update(instance_generation.to_be_bytes());
+    format!("system:{:x}", digest.finalize())
+}
+
+fn system_connection_socket_key(
     process: &str,
     pid: u32,
     network: &str,
@@ -6677,28 +6712,25 @@ fn system_connection_id(
     digest.update(network.as_bytes());
     digest.update(source.as_bytes());
     digest.update(destination.as_bytes());
-    format!("system:{:x}", digest.finalize())
+    format!("system-socket:{:x}", digest.finalize())
 }
 
-fn system_connection_from_lsof_line(
-    line: &str,
+fn system_connection_from_socket(
     timestamp: &str,
     process: &str,
     pid: u32,
+    socket_kind: &str,
+    socket: &str,
+    state: &str,
 ) -> Option<ConnectionInfo> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 9 || fields.first().copied() == Some("COMMAND") {
-        return None;
-    }
-    let socket_kind = fields.get(7)?.to_ascii_lowercase();
+    let socket_kind = socket_kind.to_ascii_lowercase();
     if socket_kind != "tcp" && socket_kind != "udp" {
         return None;
     }
-    let socket = fields[8..].join(" ");
     let socket_without_state = socket
         .split_once(" (")
         .map(|(value, _)| value)
-        .unwrap_or(socket.as_str());
+        .unwrap_or(socket);
     let (source, destination) = socket_without_state.split_once("->")?;
     let source = source.trim();
     let destination = destination.trim();
@@ -6709,19 +6741,21 @@ fn system_connection_from_lsof_line(
     if host.is_empty() || host == "?" || host == "*" {
         return None;
     }
-    let state = socket
-        .split_once(" (")
-        .and_then(|(_, value)| value.strip_suffix(')'))
-        .unwrap_or(if socket_kind == "udp" {
+    let state = if state.is_empty() {
+        if socket_kind == "udp" {
             "CONNECTED"
         } else {
             "UNKNOWN"
-        });
+        }
+    } else {
+        state
+    };
     if socket_kind == "tcp" && state != "ESTABLISHED" {
         return None;
     }
+    let socket_key = system_connection_socket_key(process, pid, &socket_kind, source, destination);
     Some(ConnectionInfo {
-        id: system_connection_id(process, pid, &socket_kind, source, destination),
+        id: socket_key.clone(),
         runtime: "system".into(),
         source: source.into(),
         destination: destination.into(),
@@ -6734,7 +6768,28 @@ fn system_connection_from_lsof_line(
         process: process.into(),
         pid: Some(pid),
         state: state.into(),
+        system_socket_key: Some(socket_key),
     })
+}
+
+#[cfg(test)]
+fn system_connection_from_lsof_line(
+    line: &str,
+    timestamp: &str,
+    process: &str,
+    pid: u32,
+) -> Option<ConnectionInfo> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 9 || fields.first().copied() == Some("COMMAND") {
+        return None;
+    }
+    let socket_kind = fields.get(7)?.to_ascii_lowercase();
+    let socket = fields[8..].join(" ");
+    let state = socket
+        .split_once(" (")
+        .and_then(|(_, value)| value.strip_suffix(')'))
+        .unwrap_or("");
+    system_connection_from_socket(timestamp, process, pid, &socket_kind, &socket, state)
 }
 
 #[derive(Clone)]
@@ -6753,17 +6808,29 @@ fn is_loopback_endpoint_host(value: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
+fn endpoint_host_matches(expected: &str, actual: &str) -> bool {
+    let expected = normalize_endpoint_host(expected);
+    let actual = normalize_endpoint_host(actual);
+    if expected == "localhost" {
+        return actual == "localhost" || actual == "127.0.0.1" || actual == "::1";
+    }
+    expected == actual
+}
+
 fn is_managed_local_destination(
     destination: &str,
     managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
 ) -> bool {
     let (host, port) = split_system_endpoint(destination);
     let normalized_host = normalize_endpoint_host(&host);
     managed_endpoints.iter().any(|endpoint| {
         endpoint.port == port.parse::<u16>().unwrap_or_default()
-            && ((endpoint.wildcard_host && is_loopback_endpoint_host(&normalized_host))
+            && ((endpoint.wildcard_host
+                && (is_loopback_endpoint_host(&normalized_host)
+                    || local_addresses.contains(&normalized_host)))
                 || (!endpoint.wildcard_host
-                    && normalize_endpoint_host(&endpoint.host) == normalized_host))
+                    && endpoint_host_matches(&endpoint.host, &normalized_host)))
     })
 }
 
@@ -6780,44 +6847,188 @@ fn is_managed_network_process(process: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> SystemConnectionSample {
-    let output = match Command::new("/usr/sbin/lsof")
-        .args(["-nP", "+c0", "-iTCP", "-iUDP"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            return SystemConnectionSample {
-                connections: Vec::new(),
-                valid: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+fn local_interface_addresses() -> HashSet<String> {
+    let mut addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
+    let mut ifaddrs = ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
+        return addresses;
+    }
+    let mut current = ifaddrs;
+    while !current.is_null() {
+        let interface = unsafe { &*current };
+        if !interface.ifa_addr.is_null() {
+            let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
+            let address = unsafe {
+                match family {
+                    libc::AF_INET => {
+                        let sockaddr = &*(interface.ifa_addr as *const libc::sockaddr_in);
+                        Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            sockaddr.sin_addr.s_addr,
+                        ))))
+                    }
+                    libc::AF_INET6 => {
+                        let sockaddr = &*(interface.ifa_addr as *const libc::sockaddr_in6);
+                        Some(IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr)))
+                    }
+                    _ => None,
+                }
             };
+            if let Some(address) = address {
+                addresses.insert(address.to_string().to_ascii_lowercase());
+            }
         }
-        Err(error) => {
-            return SystemConnectionSample {
-                connections: Vec::new(),
-                valid: false,
-                error: Some(error.to_string()),
-            };
-        }
+        current = unsafe { (*current).ifa_next };
+    }
+    unsafe { libc::freeifaddrs(ifaddrs) };
+    addresses
+}
+
+#[cfg(not(target_os = "macos"))]
+fn local_interface_addresses() -> HashSet<String> {
+    HashSet::from(["127.0.0.1".into(), "::1".into()])
+}
+
+#[derive(Default)]
+struct LsofFileRecord {
+    socket: Option<String>,
+    state: String,
+}
+
+fn append_lsof_file_record(
+    file: &mut LsofFileRecord,
+    process: &str,
+    pid: u32,
+    network: &str,
+    timestamp: &str,
+    managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
+    connections: &mut Vec<ConnectionInfo>,
+) {
+    let Some(socket) = file.socket.take() else {
+        file.state.clear();
+        return;
     };
+    if let Some(connection) =
+        system_connection_from_socket(timestamp, process, pid, network, &socket, &file.state)
+    {
+        if !is_managed_network_process(process)
+            && !is_managed_local_destination(
+                &connection.destination,
+                managed_endpoints,
+                local_addresses,
+            )
+        {
+            connections.push(connection);
+        }
+    }
+    file.state.clear();
+}
+
+fn parse_lsof_machine_output(
+    output: &str,
+    network: &str,
+    timestamp: &str,
+    managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
+) -> Vec<ConnectionInfo> {
+    let mut process = String::new();
+    let mut pid = 0;
+    let mut file = LsofFileRecord::default();
+    let mut connections = Vec::new();
+
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let (field, value) = line.split_at(1);
+        match field {
+            "p" => {
+                append_lsof_file_record(
+                    &mut file,
+                    &process,
+                    pid,
+                    network,
+                    timestamp,
+                    managed_endpoints,
+                    local_addresses,
+                    &mut connections,
+                );
+                process.clear();
+                process.push_str(value);
+                pid = value.parse().unwrap_or_default();
+            }
+            "c" => process = value.to_string(),
+            "f" => append_lsof_file_record(
+                &mut file,
+                &process,
+                pid,
+                network,
+                timestamp,
+                managed_endpoints,
+                local_addresses,
+                &mut connections,
+            ),
+            "n" => file.socket = Some(value.to_string()),
+            "T" if value.starts_with("ST=") => file.state = value[3..].to_string(),
+            _ => {}
+        }
+    }
+    append_lsof_file_record(
+        &mut file,
+        &process,
+        pid,
+        network,
+        timestamp,
+        managed_endpoints,
+        local_addresses,
+        &mut connections,
+    );
+    connections
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> SystemConnectionSample {
     let (timestamp, _) = now_timestamp();
-    let connections = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let process = fields.first().copied()?;
-            let pid = fields.get(1)?.parse::<u32>().ok()?;
-            if is_managed_network_process(process) {
-                return None;
+    let local_addresses = local_interface_addresses();
+    let mut connections = Vec::new();
+    for (flag, network) in [("-iTCP", "tcp"), ("-iUDP", "udp")] {
+        let output = match Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-FpcfnT", flag])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output)
+                if output.status.code() == Some(1)
+                    && output.stdout.is_empty()
+                    && output.stderr.is_empty() =>
+            {
+                continue;
             }
-            let connection = system_connection_from_lsof_line(line, &timestamp, process, pid)?;
-            if is_managed_local_destination(&connection.destination, managed_endpoints) {
-                return None;
+            Ok(output) => {
+                let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return SystemConnectionSample {
+                    connections: Vec::new(),
+                    valid: false,
+                    error: Some(if error.is_empty() {
+                        format!("lsof {network} 退出码 {:?}", output.status.code())
+                    } else {
+                        error
+                    }),
+                };
             }
-            Some(connection)
-        })
-        .collect();
+            Err(error) => {
+                return SystemConnectionSample {
+                    connections: Vec::new(),
+                    valid: false,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        connections.extend(parse_lsof_machine_output(
+            &String::from_utf8_lossy(&output.stdout),
+            network,
+            &timestamp,
+            managed_endpoints,
+            &local_addresses,
+        ));
+    }
     SystemConnectionSample {
         connections,
         valid: true,
@@ -6836,17 +7047,67 @@ fn fetch_system_connections(
     }
 }
 
-fn spawn_system_connection_sampler(app: AppHandle, generation: Arc<AtomicU64>, expected: u64) {
-    thread::spawn(move || loop {
-        if generation.load(Ordering::SeqCst) != expected {
-            break;
+fn assign_system_connection_instances(
+    mut sample: SystemConnectionSample,
+    identities: &mut SystemConnectionIdentityState,
+) -> SystemConnectionSample {
+    if !sample.valid {
+        return sample;
+    }
+    let mut next_instances = HashMap::new();
+    let mut seen_socket_keys = HashSet::new();
+    let mut connections = Vec::with_capacity(sample.connections.len());
+    for mut connection in sample.connections {
+        let Some(socket_key) = connection.system_socket_key.clone() else {
+            connections.push(connection);
+            continue;
+        };
+        if !seen_socket_keys.insert(socket_key.clone()) {
+            continue;
         }
-        let settings = load_settings(&app).ok();
-        let sample = fetch_system_connections(&managed_system_endpoints(&app, settings.as_ref()));
-        if let Ok(mut current) = app.state::<RuntimeState>().system_connections.lock() {
-            *current = sample;
+        let instance_id = identities
+            .active_instances
+            .get(&socket_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                identities.next_generation = identities.next_generation.saturating_add(1);
+                system_connection_id(&socket_key, identities.next_generation)
+            });
+        next_instances.insert(socket_key, instance_id.clone());
+        connection.id = instance_id;
+        connections.push(connection);
+    }
+    identities.active_instances = next_instances;
+    sample.connections = connections;
+    sample
+}
+
+fn spawn_system_connection_sampler(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    managed_endpoints: Vec<ManagedSystemEndpoint>,
+) {
+    thread::spawn(move || {
+        let mut identities = SystemConnectionIdentityState::default();
+        loop {
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
+            let sample = fetch_system_connections(&managed_endpoints);
+            let sample = assign_system_connection_instances(sample, &mut identities);
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
+            if let Ok(mut current) = app.state::<RuntimeState>().system_connections.lock() {
+                if generation.load(Ordering::SeqCst) == expected {
+                    *current = sample;
+                } else {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
         }
-        thread::sleep(Duration::from_secs(1));
     });
 }
 
@@ -7885,16 +8146,189 @@ mod tests {
     }
 
     #[test]
+    fn system_lsof_parser_keeps_connected_udp_and_ipv6_endpoints() {
+        let connection = system_connection_from_lsof_line(
+            "Safari 123 bq 8u IPv6 0x1 0t0 UDP [fe80::20]:53000->[2001:db8::53]:53",
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+        )
+        .expect("connected UDP socket should be recorded");
+        assert_eq!(connection.network, "udp");
+        assert_eq!(connection.source, "[fe80::20]:53000");
+        assert_eq!(connection.destination, "[2001:db8::53]:53");
+        assert_eq!(connection.host, "2001:db8::53");
+    }
+
+    #[test]
     fn system_observer_excludes_owned_listener_destinations() {
         let endpoints = vec![ManagedSystemEndpoint {
             host: "0.0.0.0".into(),
             port: 2080,
             wildcard_host: true,
         }];
-        assert!(is_managed_local_destination("127.0.0.1:2080", &endpoints));
-        assert!(is_managed_local_destination("[::1]:2080", &endpoints));
-        assert!(!is_managed_local_destination("1.2.3.4:2080", &endpoints));
-        assert!(!is_managed_local_destination("127.0.0.1:443", &endpoints));
+        let local_addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
+        assert!(is_managed_local_destination(
+            "127.0.0.1:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(is_managed_local_destination(
+            "[::1]:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "1.2.3.4:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "127.0.0.1:443",
+            &endpoints,
+            &local_addresses
+        ));
+    }
+
+    #[test]
+    fn system_observer_excludes_wildcard_listener_on_local_lan_address() {
+        let endpoints = vec![ManagedSystemEndpoint {
+            host: "0.0.0.0".into(),
+            port: 2080,
+            wildcard_host: true,
+        }];
+        let local_addresses = HashSet::from(["192.168.1.20".into(), "fe80::1".into()]);
+        assert!(is_managed_local_destination(
+            "192.168.1.20:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(is_managed_local_destination(
+            "[fe80::1]:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "192.168.1.21:2080",
+            &endpoints,
+            &local_addresses
+        ));
+    }
+
+    #[test]
+    fn system_observer_machine_lsof_parser_keeps_connected_socket_metadata() {
+        let endpoints = Vec::new();
+        let local_addresses = HashSet::new();
+        let connections = parse_lsof_machine_output(
+            "p123\ncSafari\nf8u\nn192.168.1.20:53124->1.2.3.4:443\nTST=ESTABLISHED\n",
+            "tcp",
+            "unix:1786871205.123456",
+            &endpoints,
+            &local_addresses,
+        );
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].process, "Safari");
+        assert_eq!(connections[0].pid, Some(123));
+        assert_eq!(connections[0].network, "tcp");
+        assert_eq!(
+            connections[0]
+                .system_socket_key
+                .as_deref()
+                .unwrap()
+                .starts_with("system-socket:"),
+            true
+        );
+    }
+
+    #[test]
+    fn system_connection_tuple_reappearance_gets_new_instance_id() {
+        let mut identities = SystemConnectionIdentityState::default();
+        let connection = system_connection_from_socket(
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+            "udp",
+            "192.168.1.20:53000->1.1.1.1:53",
+            "CONNECTED",
+        )
+        .unwrap();
+        let first = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection.clone()],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        let _ = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: Vec::new(),
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        );
+        let second = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn invalid_system_snapshot_does_not_clear_active_identity() {
+        let mut identities = SystemConnectionIdentityState::default();
+        let connection = system_connection_from_socket(
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+            "tcp",
+            "192.168.1.20:53000->1.1.1.1:443",
+            "ESTABLISHED",
+        )
+        .unwrap();
+        let first = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection.clone()],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        let invalid = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: Vec::new(),
+                valid: false,
+                error: Some("permission denied".into()),
+            },
+            &mut identities,
+        );
+        assert!(!invalid.valid);
+        let second = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        assert_eq!(first, second);
     }
 
     #[test]

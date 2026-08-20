@@ -244,6 +244,8 @@ type ConnectionInfo = {
   process?: string;
   pid?: number;
   state?: string;
+  systemSocketKey?: string;
+  systemId?: string;
   startUs?: number;
   lastSeen?: number;
   lastSeenUs?: number;
@@ -264,6 +266,7 @@ type RuntimeConnectionSnapshot = {
   process?: string;
   pid?: number;
   state?: string;
+  systemSocketKey?: string;
 };
 
 function parseConnectionEndpoint(value: string): { host: string; port: string } {
@@ -340,6 +343,13 @@ function sameConnectionEndpoint(left: ConnectionInfo, right: ConnectionInfo): bo
 }
 
 function findConnectionIndex(current: ConnectionInfo[], next: ConnectionInfo, excludedIndex = -1): number {
+  if (next.systemSocketKey) {
+    const systemIndex = current.findIndex((connection, index) => index !== excludedIndex
+      && connection.status !== "completed"
+      && connection.runtime === "system"
+      && connection.systemSocketKey === next.systemSocketKey);
+    if (systemIndex >= 0) return systemIndex;
+  }
   if (next.clashId) {
     const clashIndex = current.findIndex((connection, index) => index !== excludedIndex && connection.status !== "completed" && connection.runtime === next.runtime && connection.clashId === next.clashId);
     if (clashIndex >= 0) return clashIndex;
@@ -418,10 +428,12 @@ function mergeConnectionInfo(current: ConnectionInfo[], next: ConnectionInfo): C
 
 function snapshotToConnection(snapshot: RuntimeConnectionSnapshot, lastSeen: number): ConnectionInfo {
   const startUs = timestampUsFromValue(snapshot.start);
+  const isSystem = snapshot.runtime === "system";
   return {
     ...snapshot,
-    id: `clash:${snapshot.runtime}:${snapshot.id}`,
-    clashId: snapshot.id,
+    id: isSystem ? snapshot.id : `clash:${snapshot.runtime}:${snapshot.id}`,
+    clashId: isSystem ? undefined : snapshot.id,
+    systemId: isSystem ? snapshot.id : undefined,
     status: "active",
     lastSeen,
     lastSeenUs: lastSeen * 1_000,
@@ -440,7 +452,7 @@ function connectionOutboundLabel(outbound: string): string {
 }
 
 function connectionRuntimeKey(connection: ConnectionInfo): string {
-  return `${connection.runtime}:${connection.clashId ?? connection.id}`;
+  return `${connection.runtime}:${connection.clashId ?? connection.systemId ?? connection.id}`;
 }
 
 function connectionEventsFor(connection: ConnectionInfo, events: ConnectionEvent[]): ConnectionEvent[] {
@@ -514,12 +526,27 @@ function completeConnection(connection: ConnectionInfo, finishedAtUs: number): C
   };
 }
 
+function endSystemObservation(connection: ConnectionInfo, finishedAtUs: number): ConnectionInfo {
+  if (connection.runtime !== "system" || connection.status !== "active") return connection;
+  const startedAtUs = connection.startUs ?? timestampUsFromValue(connection.start);
+  return {
+    ...connection,
+    status: "observed",
+    durationMs: startedAtUs === undefined ? undefined : Math.max(0, (finishedAtUs - startedAtUs) / 1_000),
+    lastSeen: Math.floor(finishedAtUs / 1_000),
+    lastSeenUs: finishedAtUs,
+  };
+}
+
 type RuntimeMetrics = {
   uploadTotal: number;
   downloadTotal: number;
   activeConnections: number;
   memory: number;
   connections: RuntimeConnectionSnapshot[];
+  hostSnapshotValid: boolean;
+  guestSnapshotValid: boolean;
+  guestSnapshotError?: string | null;
   systemSnapshotValid: boolean;
   systemSnapshotError?: string | null;
 };
@@ -865,7 +892,7 @@ function App() {
   const [persistedSettings, setPersistedSettings] = useState<RuntimeSettings>(defaultSettings);
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
   const [connectionEvents, setConnectionEvents] = useState<ConnectionEvent[]>([]);
-  const [metrics, setMetrics] = useState<RuntimeMetrics>({ uploadTotal: 0, downloadTotal: 0, activeConnections: 0, memory: 0, connections: [], systemSnapshotValid: true, systemSnapshotError: null });
+  const [metrics, setMetrics] = useState<RuntimeMetrics>({ uploadTotal: 0, downloadTotal: 0, activeConnections: 0, memory: 0, connections: [], hostSnapshotValid: true, guestSnapshotValid: true, guestSnapshotError: null, systemSnapshotValid: true, systemSnapshotError: null });
   const [connectionHistory, setConnectionHistory] = useState<ConnectionInfo[]>([]);
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
   const [guestProxyConfig, setGuestProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
@@ -943,13 +970,17 @@ function App() {
       unlistenMetrics = await listen<RuntimeMetrics>("runtime-metrics", (event) => {
         setMetrics(event.payload);
         setConnectionHistory((current) => {
-          const lastSeen = Date.now();
-          const lastSeenUs = lastSeen * 1_000;
+          const lastSeenUs = Date.now() * 1_000;
+          const lastSeen = Math.floor(lastSeenUs / 1_000);
           const activeSnapshots = event.payload.connections.map((connection) => snapshotToConnection(connection, lastSeen));
           const merged = activeSnapshots.reduce((history, connection) => mergeConnectionInfo(history, connection), current);
           const activeIds = new Set(activeSnapshots.map((connection) => connectionRuntimeKey(connection)));
-          const systemSnapshotValid = event.payload.systemSnapshotValid !== false;
-          return merged.map((connection) => (connection.clashId || connection.runtime === "system") && !activeIds.has(connectionRuntimeKey(connection)) && (connection.runtime !== "system" || systemSnapshotValid)
+          const snapshotValid: Record<ConnectionRuntime, boolean> = {
+            host: event.payload.hostSnapshotValid !== false,
+            guest: event.payload.guestSnapshotValid !== false,
+            system: event.payload.systemSnapshotValid !== false,
+          };
+          return merged.map((connection) => (connection.clashId || connection.runtime === "system") && !activeIds.has(connectionRuntimeKey(connection)) && snapshotValid[connection.runtime]
             ? completeConnection(connection, lastSeenUs)
             : connection);
         });
@@ -985,6 +1016,15 @@ function App() {
       void refreshStatus();
     }, 250);
     return () => window.clearInterval(timer);
+  }, [status.state]);
+
+  useEffect(() => {
+    if (status.state !== "stopped") return;
+    const stoppedAtUs = Date.now() * 1_000;
+    setMetrics((current) => ({ ...current, activeConnections: 0, connections: [] }));
+    setConnectionHistory((current) => current.map((connection) => connection.runtime === "system"
+      ? endSystemObservation(connection, stoppedAtUs)
+      : completeConnection(connection, stoppedAtUs)));
   }, [status.state]);
 
   async function refreshSettings() {
@@ -1147,11 +1187,6 @@ function App() {
       }
       if (!shouldStop) setConnectionHistory([]);
       setStatus(await invoke<RuntimeStatus>(shouldStop ? "stop_runtime" : "start_mix_direct"));
-      if (shouldStop) {
-        const stoppedAt = Date.now() * 1_000;
-        setMetrics((current) => ({ ...current, activeConnections: 0, connections: [] }));
-        setConnectionHistory((current) => current.map((connection) => completeConnection(connection, stoppedAt)));
-      }
     } catch (error) {
       const message = String(error);
       setSettingsMessage(message);
@@ -1260,7 +1295,7 @@ function App() {
                 <Text className="top-bar-subtitle" size={200}>{subtitle}</Text>
               </div>
               <div className="top-bar-actions">
-                {view !== "strategy" && <><StatusBadge status={status} label={statusLabel} /><Badge appearance="outline" color={visibleGateway ? "informative" : "subtle"}>{visibleGateway ? "Mixed + 网关" : "Mixed"}</Badge></>}
+                <StatusBadge status={status} label={statusLabel} /><Badge className="mode-badge" appearance="outline" color={visibleGateway ? "informative" : "subtle"}>{visibleGateway ? "Mixed + 网关" : "Mixed"}</Badge>
                 <Button appearance="subtle" onClick={() => void refreshStatus()}>刷新</Button>
                 <Button appearance={isActive ? "secondary" : "primary"} icon={isActive ? <StopRegular /> : <PlayRegular />} disabled={busy} onClick={() => void toggleRuntime()}>
                   {busy ? "处理中…" : isActive ? "停止" : "启动"}
@@ -1269,8 +1304,8 @@ function App() {
             </header>
 
             {view === "overview" && <OverviewPage status={status} settings={settings} settingsDirty={settingsDirty} metrics={metrics} running={isActive} guestStatus={guestStatus} guestStatusError={guestStatusError} onNavigate={setView} />}
-            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
-            {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onRefresh={() => void refreshProxies()} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
+            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
+            {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "rules" && <RulesPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "modules" && <ModulesPage modules={modules} onToggleModule={toggleModule} onSetModuleArgument={setModuleArgument} onImportModule={importModules} onImportModuleUrl={importModuleUrl} />}
             {view === "config" && <div className="page-content page-stack"><ConfigViewer documents={configDocuments} error={configError} onRefresh={refreshConfigDocuments} onReload={reloadConfigDocuments} /></div>}
@@ -1462,8 +1497,8 @@ function formatConnectionTime(value: string, explicitTimestampUs?: number): stri
 }
 
 function formatConnectionDuration(connection: ConnectionInfo, nowUs: number): string {
-  if (connection.status === "observed") return "—";
   if (connection.status === "completed" && connection.durationMs === undefined) return "—";
+  if (connection.status === "observed" && connection.durationMs === undefined) return "—";
   if (connection.durationMs !== undefined) {
     return formatElapsedMs(connection.durationMs);
   }
@@ -1536,11 +1571,14 @@ function ConnectionEventRow({ event, baseUs }: { event: ConnectionEvent; baseUs?
 
 function ConnectionDataPanel({ connection, direction }: { connection: ConnectionInfo; direction: "request" | "response" }) {
   const isRequest = direction === "request";
+  const isSystem = connection.runtime === "system";
+  const payloadLabel = isSystem ? (isRequest ? "发送数据" : "接收数据") : (isRequest ? "HTTP 请求体" : "HTTP 响应体");
+  const protocol = connection.network ? connection.network.toUpperCase() : "—";
   return <div className="connection-data-panel">
-    <div className="connection-data-status"><span className="connection-data-icon">{isRequest ? "↑" : "↓"}</span><div><strong>{isRequest ? "请求数据" : "响应数据"}</strong><span>{isRequest ? "HTTP 请求体" : "HTTP 响应体"}</span></div><Badge appearance="outline" color="subtle">未捕获</Badge></div>
+    <div className="connection-data-status"><span className="connection-data-icon">{isRequest ? "↑" : "↓"}</span><div><strong>{isRequest ? "请求数据" : "响应数据"}</strong><span>{payloadLabel}</span></div><Badge appearance="outline" color="subtle">未捕获</Badge></div>
     <dl className="connection-data-grid">
       <div><dt>端点</dt><dd className="mono-cell">{isRequest ? connection.source || "—" : connectionDisplayAddress(connection)}</dd></div>
-      <div><dt>协议</dt><dd>{connection.network?.toUpperCase() || "TCP"}</dd></div>
+      <div><dt>协议</dt><dd>{protocol}</dd></div>
       <div><dt>字节数</dt><dd className="mono-cell">{formatBytes(isRequest ? connection.upload : connection.download)}</dd></div>
       <div><dt>采集状态</dt><dd>当前只记录连接元数据</dd></div>
     </dl>
@@ -1559,6 +1597,10 @@ function ConnectionDetails({ connection, events }: { connection: ConnectionInfo;
   const elapsedFromIngress = timelineBaseUs === undefined || elapsedEndUs === undefined
     ? "—"
     : formatElapsedMs(Math.max(0, (elapsedEndUs - timelineBaseUs) / 1_000));
+  const isSystem = connection.runtime === "system";
+  const timeLabel = isSystem ? "首次观测" : "入口时间";
+  const elapsedLabel = isSystem ? "观测时长" : "入口起算耗时";
+  const protocol = connection.network ? connection.network.toUpperCase() : "—";
   return <div className="connection-detail-shell">
     <div className="connection-detail-header"><div><Text className="connection-detail-title" weight="semibold">{connection.host || connectionDisplayAddress(connection)}</Text><Text className="connection-detail-subtitle" size={200}>{connectionRuntimeLabel(connection.runtime)}{connection.process ? ` · ${connection.process}${connection.pid ? ` (${connection.pid})` : ""}` : ""} · {connection.source || "未知客户端"} → {connectionDisplayAddress(connection)}</Text></div><ConnectionStatus status={connection.status} /></div>
     <dl className="activity-connection-details">
@@ -1571,9 +1613,9 @@ function ConnectionDetails({ connection, events }: { connection: ConnectionInfo;
       <div><dt>主机</dt><dd className={connection.host ? "mono-cell" : "activity-muted"}>{connection.host || "—"}</dd></div>
       <div><dt>进程 / PID</dt><dd className={connection.process ? "mono-cell" : "activity-muted"}>{connection.process ? `${connection.process}${connection.pid ? ` / ${connection.pid}` : ""}` : "—"}</dd></div>
       <div><dt>系统状态</dt><dd>{connection.state || "—"}</dd></div>
-      <div><dt>入口时间</dt><dd className={connection.start ? "mono-cell" : "activity-muted"}>{formatConnectionDateTime(connection.start, timelineBaseUs ?? connection.startUs)}</dd></div>
-      <div><dt>入口起算耗时</dt><dd className="mono-cell">{elapsedFromIngress}</dd></div>
-      <div><dt>策略 / 协议</dt><dd>{connectionOutboundLabel(connection.outbound)} · {connection.network?.toUpperCase() || "—"}</dd></div>
+      <div><dt>{timeLabel}</dt><dd className={connection.start ? "mono-cell" : "activity-muted"}>{formatConnectionDateTime(connection.start, timelineBaseUs ?? connection.startUs)}</dd></div>
+      <div><dt>{elapsedLabel}</dt><dd className="mono-cell">{elapsedFromIngress}</dd></div>
+      <div><dt>策略 / 协议</dt><dd>{connectionOutboundLabel(connection.outbound)} · {protocol}</dd></div>
     </dl>
     <TabList className="connection-detail-tabs" selectedValue={detailTab} onTabSelect={(_, data) => setDetailTab(String(data.value))} aria-label="连接详情">
       <Tab value="events">事件 <span className="connection-tab-count">{timeline.length}</span></Tab>
@@ -1590,13 +1632,13 @@ function ConnectionTraffic({ connection }: { connection: ConnectionInfo }) {
   return <div className="activity-traffic"><span className={connection.upload == null ? "activity-muted" : undefined}>↑ {formatBytes(connection.upload)}</span><span className={connection.download == null ? "activity-muted" : undefined}>↓ {formatBytes(connection.download)}</span></div>;
 }
 
-function ActivityPage({ connections, connectionEvents, running, logs, systemSnapshotValid, systemSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; systemSnapshotValid: boolean; systemSnapshotError?: string | null; onClear: () => void }) {
+function ActivityPage({ connections, connectionEvents, running, logs, guestSnapshotValid, guestSnapshotError, systemSnapshotValid, systemSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; guestSnapshotValid: boolean; guestSnapshotError?: string | null; systemSnapshotValid: boolean; systemSnapshotError?: string | null; onClear: () => void }) {
   const [connectionQuery, setConnectionQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [activityTab, setActivityTab] = useState("requests");
   const [eventQuery, setEventQuery] = useState("");
   const [eventLevel, setEventLevel] = useState("all");
-  const now = Date.now();
+  const nowUs = Date.now() * 1_000;
   const toggleConnection = (id: string) => setExpandedId((current) => current === id ? null : id);
   const filteredConnections = connections
     .slice()
@@ -1614,7 +1656,7 @@ function ActivityPage({ connections, connectionEvents, running, logs, systemSnap
       <Tab value="logs">运行日志</Tab>
     </TabList>
     {activityTab === "requests" && <Card className="panel activity-connections-panel">
-      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !systemSnapshotValid && <Text className="activity-warning-note" size={200}>系统连接观察暂时不可用，已保留上一批记录{systemSnapshotError ? `：${systemSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={!systemSnapshotValid && running ? "warning" : running ? "warning" : "subtle"}>{!systemSnapshotValid && running ? "系统观察不可用" : `${connections.length} 条记录`}</Badge></div>
+      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}{running && !systemSnapshotValid && <Text className="activity-warning-note" size={200}>系统连接观察暂时不可用，已保留上一批记录{systemSnapshotError ? `：${systemSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!guestSnapshotValid || !systemSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !guestSnapshotValid ? "Guest 观察不可用" : running && !systemSnapshotValid ? "系统观察不可用" : `${connections.length} 条记录`}</Badge></div>
       <div className="activity-toolbar"><Input contentBefore={<SearchRegular />} value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} placeholder="搜索地址、客户端、策略或 ID" /></div>
       {filteredConnections.length === 0 ? <EmptyState title={running ? "暂无请求记录" : "暂无请求历史"} description={running ? "让应用通过 Mixed 代理访问网络后，请求会显示在这里。" : "启动代理接入后，请求记录会显示在这里。"} /> : <>
         <div className="activity-table-scroll" tabIndex={0} aria-label="代理请求记录">
@@ -1628,7 +1670,7 @@ function ActivityPage({ connections, connectionEvents, running, logs, systemSnap
                 <TableCell><ConnectionStatus status={connection.status} /></TableCell>
                 <TableCell><span className={connection.outbound ? "activity-policy" : "activity-muted"}>{connectionOutboundLabel(connection.outbound)}</span></TableCell>
                 <TableCell><ConnectionTraffic connection={connection} /></TableCell>
-                <TableCell className="mono-cell">{formatConnectionDuration(connection, now)}</TableCell>
+                <TableCell className="mono-cell">{formatConnectionDuration(connection, nowUs)}</TableCell>
                 <TableCell>{connection.network ? connection.network.toUpperCase() : <span className="activity-muted">—</span>}</TableCell>
               </TableRow>
               {expandedId === connection.id && <TableRow className="activity-detail-row"><TableCell colSpan={8}><ConnectionDetails connection={connection} events={connectionEvents} /></TableCell></TableRow>}
@@ -1638,7 +1680,7 @@ function ActivityPage({ connections, connectionEvents, running, logs, systemSnap
         <div className="activity-request-mobile-list" aria-label="代理请求记录列表">{filteredConnections.map((connection) => <Fragment key={connection.id}>
           <button type="button" className="activity-request-mobile" onClick={() => toggleConnection(connection.id)} onKeyDown={(event) => { if (event.key === "Escape" && expandedId === connection.id) { event.preventDefault(); setExpandedId(null); } }} aria-expanded={expandedId === connection.id}>
             <div className="activity-mobile-primary"><ConnectionStatus status={connection.status} /><strong title={connectionDisplayAddress(connection)}>{connectionDisplayAddress(connection)}</strong></div>
-            <div className="activity-mobile-secondary"><span>{connectionRuntimeLabel(connection.runtime)}</span><span className={connection.outbound ? "activity-policy" : "activity-muted"}>{connectionOutboundLabel(connection.outbound)}</span><span>{connection.network?.toUpperCase() || "—"}</span><span>{formatConnectionDuration(connection, now)}</span></div>
+            <div className="activity-mobile-secondary"><span>{connectionRuntimeLabel(connection.runtime)}</span><span className={connection.outbound ? "activity-policy" : "activity-muted"}>{connectionOutboundLabel(connection.outbound)}</span><span>{connection.network ? connection.network.toUpperCase() : "—"}</span><span>{formatConnectionDuration(connection, nowUs)}</span></div>
             <div className="activity-mobile-secondary"><span>{formatConnectionTime(connection.start, connection.startUs)}</span><ConnectionTraffic connection={connection} /></div>
           </button>
           {expandedId === connection.id && <div className="activity-mobile-detail"><ConnectionDetails connection={connection} events={connectionEvents} /></div>}
@@ -1807,14 +1849,13 @@ function ProxyPolicyTargetBar({ mode, target, onChange }: { mode: RuntimeSetting
   </section>;
 }
 
-function StrategyPage({ config, proxies, running, policyMode, target, onTargetChange, onRefresh, onSelect, onTestDelay, onTestingChange, onSave }: {
+function StrategyPage({ config, proxies, running, policyMode, target, onTargetChange, onSelect, onTestDelay, onTestingChange, onSave }: {
   config: ProxyConfig;
   proxies: ProxyInfo[];
   running: boolean;
   policyMode: RuntimeSettings["gatewayPolicyMode"];
   target: ProxyConfigTarget;
   onTargetChange: (target: ProxyConfigTarget) => void;
-  onRefresh: () => void;
   onSelect: (group: string, name: string) => void;
   onTestDelay: (name: string) => Promise<number>;
   onTestingChange: (testing: boolean) => void;
@@ -1905,7 +1946,7 @@ function StrategyPage({ config, proxies, running, policyMode, target, onTargetCh
 
   return (
     <div className="page-content page-stack">
-      <div className="page-actions"><Text className={`save-message ${message.includes("失败") ? "error" : ""}`} size={200}>{message}</Text><Button appearance="subtle" onClick={onRefresh} disabled={saving}>刷新状态</Button></div>
+      <div className="page-actions"><Text className={`save-message ${message.includes("失败") ? "error" : ""}`} size={200}>{message}</Text></div>
       <ProxyPolicyTargetBar mode={policyMode} target={target} onChange={onTargetChange} />
 
       {selectors.length > 0 && (

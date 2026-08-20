@@ -277,13 +277,14 @@ button, input, select { font: inherit; }
 .activity-connection-table { width: 100%; min-width: 760px; table-layout: fixed; }
 .activity-connection-table .fui-TableCell, .activity-connection-table .fui-TableHeaderCell { padding: 8px 10px; font-size: 12px; }
 .activity-connection-table .fui-TableHeaderCell { white-space: nowrap; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(1), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(1) { width: 78px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(1), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(1) { width: 118px; }
 .activity-connection-table .fui-TableHeaderCell:nth-child(2), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(2) { width: auto; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(3), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(3) { width: 86px; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(4), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(4) { width: 112px; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(5), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(5) { width: 136px; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(6), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(6) { width: 72px; }
-.activity-connection-table .fui-TableHeaderCell:nth-child(7), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(7) { width: 62px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(3), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(3) { width: 90px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(4), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(4) { width: 86px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(5), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(5) { width: 112px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(6), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(6) { width: 136px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(7), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(7) { width: 80px; }
+.activity-connection-table .fui-TableHeaderCell:nth-child(8), .activity-connection-table .fui-TableRow > .fui-TableCell:nth-child(8) { width: 64px; }
 .activity-request-row { cursor: pointer; }
 .activity-request-row:focus-visible { outline: 2px solid var(--sx-brand); outline-offset: -2px; }
 .activity-request-cell { min-width: 0; }
@@ -665,6 +666,7 @@ button, input, select { font: inherit; }
 .fui-Input, .fui-Select { border-radius: 6px; }
 .fui-Input:focus-within, .fui-Select:focus-within { border-color: var(--sx-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sx-brand) 20%, transparent); }
 .fui-Badge { border-radius: 5px; }
+.mode-badge.fui-Badge { color: var(--sx-text); border-color: var(--sx-border); }
 
 /* ---------- 响应式 ---------- */
 @media (max-width: 1050px) {
