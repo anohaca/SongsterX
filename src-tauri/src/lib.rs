@@ -97,6 +97,9 @@ enum LifecyclePhase {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
     pub state: String,
+    pub healthy: bool,
+    #[serde(rename = "canStop")]
+    pub can_stop: bool,
     pub mode: String,
     pub listen: String,
     pub dns: String,
@@ -231,6 +234,8 @@ impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
             state: "stopped".into(),
+            healthy: false,
+            can_stop: false,
             mode: "mixed direct".into(),
             listen: "127.0.0.1:2080".into(),
             dns: "系统 DNS".into(),
@@ -826,6 +831,8 @@ fn lifecycle_starting_status(settings: &RuntimeSettings) -> RuntimeStatus {
     let gateway_mode = settings.mode == "gateway";
     RuntimeStatus {
         state: "starting".into(),
+        healthy: false,
+        can_stop: false,
         mode: if gateway_mode {
             "lan-gateway no-dhcp"
         } else {
@@ -5151,14 +5158,20 @@ fn spawn_sing_box_process(
     Ok(child)
 }
 
-fn stop_unowned_child(mut child: Child) -> Result<(), String> {
+fn stop_unowned_child(mut child: Child) -> Result<(), (Child, String)> {
     let kill_error = child.kill().err();
-    child.wait().map(|_| ()).map_err(|error| match kill_error {
-        Some(kill_error) => {
-            format!("终止未归属 Mixed 进程失败：{kill_error}；等待退出失败：{error}")
-        }
-        None => format!("等待未归属 Mixed 进程退出失败：{error}"),
-    })
+    match child.wait() {
+        Ok(_) => Ok(()),
+        Err(error) => Err((
+            child,
+            match kill_error {
+                Some(kill_error) => {
+                    format!("终止未归属 Mixed 进程失败：{kill_error}；等待退出失败：{error}")
+                }
+                None => format!("等待未归属 Mixed 进程退出失败：{error}"),
+            },
+        )),
+    }
 }
 
 fn set_stopped(state: &RuntimeState, message: impl Into<String>) -> RuntimeStatus {
@@ -5183,6 +5196,8 @@ fn status_after_stop_failure(
     } else {
         "error".into()
     };
+    current.healthy = false;
+    current.can_stop = resources_owned;
     current.message = message.into();
     current
 }
@@ -5207,7 +5222,12 @@ fn finalize_start_failure(app: &AppHandle, state: &RuntimeState, error: String) 
         state,
         status_after_stop_failure(current, resources_owned, error.clone()),
     );
-    if resources_owned {
+    let has_metrics_session = state
+        .metrics_session
+        .lock()
+        .map(|session| session.is_some())
+        .unwrap_or(false);
+    if resources_owned && has_metrics_session {
         restart_runtime_observers(app, state);
     }
     emit_log(app, "error", error);
@@ -5639,6 +5659,8 @@ fn observe_gateway_packet_path(
         }
         if status.mode.contains("gateway") {
             status.state = "running".into();
+            status.healthy = true;
+            status.can_stop = true;
             status.gateway_packet_path_ready = true;
             status.message = if status.module_proxy.is_some() {
                 "Mixed 入口与 Linux guest 局域网网关已启动；实体 LAN packet path 已验收；模块 MITM 已挂接".into()
@@ -6116,6 +6138,8 @@ fn start_mix_direct_transaction(
         &state,
         RuntimeStatus {
             state: "starting".into(),
+            healthy: false,
+            can_stop: false,
             mode: if gateway_mode {
                 "lan-gateway no-dhcp"
             } else {
@@ -6215,7 +6239,15 @@ fn start_mix_direct_transaction(
 
     let mut child = match (gateway_result, local_result) {
         (Some(Err(error)), Ok(child)) => {
-            let unowned_cleanup = stop_unowned_child(child).err();
+            let unowned_cleanup = match stop_unowned_child(child) {
+                Ok(()) => None,
+                Err((child, error)) => {
+                    if let Ok(mut slot) = state.child.lock() {
+                        *slot = Some(child);
+                    }
+                    Some(error)
+                }
+            };
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => match unowned_cleanup {
@@ -6307,11 +6339,21 @@ fn start_mix_direct_transaction(
     }
 
     if lifecycle_cancelled(state, lifecycle_generation) {
-        let unowned_cleanup = stop_unowned_child(child).err();
-        let _ = stop_runtime_processes_locked(&app, state);
-        return Err(match unowned_cleanup {
-            Some(error) => format!("启动已取消；{error}"),
-            None => "启动已取消".into(),
+        let unowned_cleanup = match stop_unowned_child(child) {
+            Ok(()) => None,
+            Err((child, error)) => {
+                if let Ok(mut slot) = state.child.lock() {
+                    *slot = Some(child);
+                }
+                Some(error)
+            }
+        };
+        let cleanup = stop_runtime_processes_locked(&app, state).err();
+        return Err(match (unowned_cleanup, cleanup) {
+            (Some(unowned), Some(cleanup)) => format!("启动已取消；{unowned}；回收失败：{cleanup}"),
+            (Some(unowned), None) => format!("启动已取消；{unowned}"),
+            (None, Some(cleanup)) => format!("启动已取消；回收失败：{cleanup}"),
+            (None, None) => "启动已取消".into(),
         });
     }
     *state
@@ -6325,12 +6367,29 @@ fn start_mix_direct_transaction(
                 if let Err(error) =
                     wait_for_mitmproxy(&mut mitm_child, &endpoint, &startup_cancelled)
                 {
-                    let _ = mitm_child.kill();
-                    let _ = mitm_child.wait();
+                    let unowned_cleanup = match stop_unowned_child(mitm_child) {
+                        Ok(()) => None,
+                        Err((mitm_child, error)) => {
+                            if let Ok(mut slot) = state.mitm_child.lock() {
+                                *slot = Some(mitm_child);
+                            }
+                            Some(error)
+                        }
+                    };
                     let message = format!("模块 MITM 引擎启动失败：{error}");
                     let message = match stop_runtime_processes_locked(&app, &state) {
-                        Ok(()) => message,
-                        Err(cleanup) => format!("{message}；回收失败：{cleanup}"),
+                        Ok(()) => match unowned_cleanup {
+                            Some(cleanup) => format!("{message}；模块引擎回收失败：{cleanup}"),
+                            None => message,
+                        },
+                        Err(cleanup) => {
+                            match unowned_cleanup {
+                                Some(unowned) => {
+                                    format!("{message}；模块引擎回收失败：{unowned}；回收失败：{cleanup}")
+                                }
+                                None => format!("{message}；回收失败：{cleanup}"),
+                            }
+                        }
                     };
                     update_status(
                         &state,
@@ -6344,11 +6403,23 @@ fn start_mix_direct_transaction(
                     return Err(message);
                 }
                 if lifecycle_cancelled(state, lifecycle_generation) {
-                    let cleanup = stop_unowned_child(mitm_child).err();
-                    let _ = stop_runtime_processes_locked(&app, state);
-                    return Err(match cleanup {
-                        Some(error) => format!("启动已取消；{error}"),
-                        None => "启动已取消".into(),
+                    let unowned_cleanup = match stop_unowned_child(mitm_child) {
+                        Ok(()) => None,
+                        Err((mitm_child, error)) => {
+                            if let Ok(mut slot) = state.mitm_child.lock() {
+                                *slot = Some(mitm_child);
+                            }
+                            Some(error)
+                        }
+                    };
+                    let cleanup = stop_runtime_processes_locked(&app, state).err();
+                    return Err(match (unowned_cleanup, cleanup) {
+                        (Some(unowned), Some(cleanup)) => {
+                            format!("启动已取消；{unowned}；回收失败：{cleanup}")
+                        }
+                        (Some(unowned), None) => format!("启动已取消；{unowned}"),
+                        (None, Some(cleanup)) => format!("启动已取消；回收失败：{cleanup}"),
+                        (None, None) => "启动已取消".into(),
                     });
                 }
                 let mitm_pid = mitm_child.id();
@@ -6401,6 +6472,8 @@ fn start_mix_direct_transaction(
     }
     let next = RuntimeStatus {
         state: if gateway_mode { "starting" } else { "running" }.into(),
+        healthy: !gateway_mode,
+        can_stop: true,
         mode: if gateway_mode {
             "lan-gateway no-dhcp"
         } else {
@@ -6563,7 +6636,8 @@ fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMet
         Ok(response) => match response.into_string() {
             Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
                 Ok(host_value) => {
-                    metrics = runtime_metrics_from_clash_value(&host_value, "host");
+                    let host = runtime_metrics_from_clash_value(&host_value, "host");
+                    merge_runtime_metrics_snapshot(&mut metrics, host, "host");
                     metrics.host_snapshot_valid = true;
                     metrics.host_snapshot_error = None;
                 }
@@ -6587,13 +6661,7 @@ fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMet
             match guest_agent::query_connections(&endpoint, Duration::from_secs(1)) {
                 Ok(guest_value) => {
                     let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
-                    metrics.guest_snapshot_valid = true;
-                    metrics.upload_total = metrics.upload_total.saturating_add(guest.upload_total);
-                    metrics.download_total =
-                        metrics.download_total.saturating_add(guest.download_total);
-                    metrics.memory = metrics.memory.saturating_add(guest.memory);
-                    metrics.connections.extend(guest.connections);
-                    metrics.active_connections = metrics.connections.len();
+                    merge_runtime_metrics_snapshot(&mut metrics, guest, "guest");
                 }
                 Err(error) => {
                     metrics.guest_snapshot_valid = false;
@@ -6751,6 +6819,31 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
         system_snapshot_valid: false,
         system_snapshot_error: None,
     }
+}
+
+fn merge_runtime_metrics_snapshot(
+    target: &mut RuntimeMetrics,
+    snapshot: RuntimeMetrics,
+    runtime: &str,
+) {
+    if runtime == "host" {
+        target.upload_total = snapshot.upload_total;
+        target.download_total = snapshot.download_total;
+        target.memory = snapshot.memory;
+        target.connections = snapshot.connections;
+        target.host_snapshot_valid = snapshot.host_snapshot_valid;
+        target.host_snapshot_error = snapshot.host_snapshot_error;
+    } else if runtime == "guest" {
+        target.upload_total = target.upload_total.saturating_add(snapshot.upload_total);
+        target.download_total = target
+            .download_total
+            .saturating_add(snapshot.download_total);
+        target.memory = target.memory.saturating_add(snapshot.memory);
+        target.connections.extend(snapshot.connections);
+        target.guest_snapshot_valid = snapshot.guest_snapshot_valid;
+        target.guest_snapshot_error = snapshot.guest_snapshot_error;
+    }
+    target.active_connections = target.connections.len();
 }
 
 fn split_system_endpoint(value: &str) -> (String, String) {
@@ -7298,6 +7391,8 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
     state.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
     let mut stopping = current_status(&state)?;
     stopping.state = "stopping".into();
+    stopping.healthy = false;
+    stopping.can_stop = runtime_owns_resources(&state);
     stopping.message = "正在停止运行时".into();
     update_status(&state, stopping.clone());
 
@@ -8218,6 +8313,8 @@ mod tests {
         current.pid = Some(42);
         let next = status_after_stop_failure(current, true, "child refused to exit");
         assert_eq!(next.state, "running");
+        assert!(!next.healthy);
+        assert!(next.can_stop);
         assert_eq!(next.mode, "lan-gateway no-dhcp");
         assert_eq!(next.pid, Some(42));
         assert_eq!(next.message, "child refused to exit");
@@ -8227,7 +8324,43 @@ mod tests {
     fn stop_failure_without_owned_resources_is_error() {
         let next = status_after_stop_failure(RuntimeStatus::default(), false, "teardown failed");
         assert_eq!(next.state, "error");
+        assert!(!next.healthy);
+        assert!(!next.can_stop);
         assert_eq!(next.message, "teardown failed");
+    }
+
+    #[test]
+    fn host_metrics_merge_preserves_guest_failure_state() {
+        let mut metrics = RuntimeMetrics {
+            upload_total: 0,
+            download_total: 0,
+            active_connections: 0,
+            memory: 0,
+            connections: Vec::new(),
+            host_snapshot_valid: false,
+            host_snapshot_error: Some("Host 尚未返回".into()),
+            guest_snapshot_valid: false,
+            guest_snapshot_error: Some("Guest endpoint 不可用".into()),
+            system_snapshot_valid: false,
+            system_snapshot_error: None,
+        };
+        let host = runtime_metrics_from_clash_value(
+            &serde_json::json!({"uploadTotal": 4, "downloadTotal": 8, "memory": 16, "connections": []}),
+            "host",
+        );
+
+        merge_runtime_metrics_snapshot(&mut metrics, host, "host");
+
+        assert!(metrics.host_snapshot_valid);
+        assert_eq!(metrics.host_snapshot_error, None);
+        assert!(!metrics.guest_snapshot_valid);
+        assert_eq!(
+            metrics.guest_snapshot_error.as_deref(),
+            Some("Guest endpoint 不可用")
+        );
+        assert_eq!(metrics.upload_total, 4);
+        assert_eq!(metrics.download_total, 8);
+        assert_eq!(metrics.memory, 16);
     }
 
     #[test]

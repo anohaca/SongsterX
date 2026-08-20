@@ -47,6 +47,8 @@ import { Fragment, useEffect, useId, useMemo, useRef, useState, type ReactElemen
 
 type RuntimeStatus = {
   state: "stopped" | "starting" | "running" | "stopping" | "error" | "exited";
+  healthy: boolean;
+  canStop: boolean;
   mode: string;
   listen: string;
   dns: string;
@@ -809,6 +811,8 @@ function loadAppearanceMode(): AppearanceMode {
 
 const defaultStatus: RuntimeStatus = {
   state: "stopped",
+  healthy: false,
+  canStop: false,
   mode: "mixed direct",
   listen: "127.0.0.1:2080",
   dns: "系统 DNS",
@@ -912,15 +916,15 @@ function App() {
   const [systemDark, setSystemDark] = useState(true);
   const prefersDark = appearanceMode === "dark" || (appearanceMode === "system" && systemDark);
 
-  const isRunning = status.state === "running";
-  const isActive = isRunning || status.state === "starting" || status.state === "stopping";
+  const isRunning = status.state === "running" && status.healthy;
+  const isActive = status.canStop || status.state === "starting" || status.state === "stopping";
   const settingsDirty = useMemo(
     () => JSON.stringify(settings) !== JSON.stringify(persistedSettings),
     [settings, persistedSettings],
   );
   const visibleGateway = isActive && status.mode.includes("gateway");
   const statusLabel = useMemo(() => {
-    if (status.state === "running") return "运行中";
+    if (status.state === "running") return status.healthy ? "运行中" : "异常，可停止";
     if (status.state === "starting") return "启动中";
     if (status.state === "stopping") return "停止中";
     if (status.state === "error") return "错误";
@@ -1151,6 +1155,9 @@ function App() {
     while (Date.now() < deadline) {
       const current = await invoke<RuntimeStatus>("get_runtime_status");
       setStatus(current);
+      if (expected === "running" && current.state === "running" && !current.healthy) {
+        throw new Error(current.message || "运行时启动失败，但仍有资源未回收");
+      }
       if (current.state === expected) return current;
       if (
         current.state === "error" ||
@@ -1399,7 +1406,7 @@ function NavItem({ active, label, icon, badge, onClick }: { active: boolean; lab
 }
 
 function StatusBadge({ status, label }: { status: RuntimeStatus; label: string }) {
-  const color = status.state === "running" ? "success" : status.state === "error" || status.state === "exited" ? "danger" : "subtle";
+  const color = status.state === "running" && status.healthy ? "success" : status.state === "error" || status.state === "exited" || (status.state === "running" && !status.healthy) ? "danger" : "subtle";
   return <Badge className={`status-badge status-${status.state}`} appearance="tint" color={color as "success" | "danger" | "subtle"}><span className="status-dot" />{label}</Badge>;
 }
 
@@ -1410,17 +1417,19 @@ function SectionHeading({ title, description, action }: { title: string; descrip
 function OverviewPage({ status, settings, settingsDirty, metrics, running, guestStatus, guestStatusError, onNavigate }: { status: RuntimeStatus; settings: RuntimeSettings; settingsDirty: boolean; metrics: RuntimeMetrics; running: boolean; guestStatus: GuestAgentStatus | null; guestStatusError: string; onNavigate: (view: View) => void }) {
   const [copyMessage, setCopyMessage] = useState("");
   const gatewayMode = running ? status.mode.includes("gateway") : settings.mode === "gateway";
+  const runtimeActive = status.canStop || status.state === "starting" || status.state === "stopping";
   const runtimeName = gatewayMode ? "Mixed + 局域网网关" : "Mixed 代理";
   const gatewayIp = status.vmGatewayIp || settings.gatewayIp;
   const mixedListen = running ? status.listen : `${settings.listen}:${settings.port}`;
   const gatewayDnsIp = status.vmGatewayDnsIp || (settings.dnsMode === "fakeip" ? "198.18.0.2" : settings.gatewayDnsIp);
   const gatewayState = running
     ? (gatewayMode && !status.gatewayPacketPathReady ? "等待局域网验收" : "运行中")
+    : status.state === "running" && !status.healthy ? "启动异常，可停止"
     : status.state === "error" ? "暂不可用" : settingsDirty ? "待应用" : "未启动";
   const runtimePresentation = {
     stopped: { title: `${runtimeName}已停止`, tone: "stopped" },
     starting: { title: `正在启动${runtimeName}…`, tone: "starting" },
-    running: { title: `${runtimeName}正在运行`, tone: "running" },
+    running: status.healthy ? { title: `${runtimeName}正在运行`, tone: "running" } : { title: `${runtimeName}启动异常（可停止）`, tone: "error" },
     stopping: { title: `正在停止${runtimeName}…`, tone: "starting" },
     error: { title: `${runtimeName}启动失败`, tone: "error" },
     exited: { title: `${runtimeName}已退出`, tone: "error" },
@@ -1447,7 +1456,7 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
               {mixedListen}
               {copyMessage && <span className="hero-copied">{copyMessage}</span>}
             </button>
-            <Text className="hero-message" size={200}>{running ? status.message : gatewayMode ? "vfkit 双 virtio-net、guest 网络和 guest-agent 已配置；实体 LAN 流量仍需现场验证。" : status.message}</Text>
+            <Text className="hero-message" size={200}>{runtimeActive ? status.message : gatewayMode ? "vfkit 双 virtio-net、guest 网络和 guest-agent 已配置；实体 LAN 流量仍需现场验证。" : status.message}</Text>
           </div>
         </div>
         <div className="hero-actions">
@@ -1463,7 +1472,7 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
       </section>
 
       <Card className="panel gateway-overview-panel">
-        <div className="gateway-overview-heading"><div><Text as="h2" size={400} weight="semibold">入口</Text><Text size={200}>本机 Mixed 代理始终可用；局域网网关通过 vfkit guest 接管实体 LAN 流量，二者可同时运行。</Text></div><Badge appearance="tint" color={running && (!gatewayMode || status.gatewayPacketPathReady) ? "success" : status.state === "error" ? "danger" : running ? "warning" : settingsDirty ? "warning" : "subtle"}>{gatewayState}</Badge></div>
+        <div className="gateway-overview-heading"><div><Text as="h2" size={400} weight="semibold">入口</Text><Text size={200}>本机 Mixed 代理始终可用；局域网网关通过 vfkit guest 接管实体 LAN 流量，二者可同时运行。</Text></div><Badge appearance="tint" color={running && (!gatewayMode || status.gatewayPacketPathReady) ? "success" : status.state === "error" || (status.state === "running" && !status.healthy) ? "danger" : running ? "warning" : settingsDirty ? "warning" : "subtle"}>{gatewayState}</Badge></div>
         <div className="gateway-overview-grid">
           <DefinitionRow label="本机 Mixed" value={mixedListen} mono />
           <DefinitionRow label="DNS" value={status.dns || "系统 DNS"} />
