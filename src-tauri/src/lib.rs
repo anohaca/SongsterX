@@ -5252,6 +5252,39 @@ fn status_after_stop_failure(
     current
 }
 
+fn finalize_unexpected_runtime_exit(
+    app: &AppHandle,
+    state: &RuntimeState,
+    exit_message: String,
+    cleanup_result: Result<(), String>,
+) -> RuntimeStatus {
+    state.metrics_generation.fetch_add(1, Ordering::SeqCst);
+    match cleanup_result {
+        Ok(()) => {
+            mark_lifecycle_phase(state, LifecyclePhase::Stopped);
+            set_stopped(state, exit_message)
+        }
+        Err(cleanup_error) => {
+            let resources_owned = runtime_owns_resources(state);
+            let message = format!("{exit_message}；清理失败：{cleanup_error}");
+            let phase = if resources_owned {
+                LifecyclePhase::Running
+            } else {
+                LifecyclePhase::Stopped
+            };
+            mark_lifecycle_phase(state, phase);
+            let current = current_status(state).unwrap_or_default();
+            let next = status_after_stop_failure(current, resources_owned, message.clone());
+            update_status(state, next.clone());
+            if resources_owned {
+                restart_runtime_observers(app, state);
+            }
+            emit_log(app, "error", message);
+            next
+        }
+    }
+}
+
 fn resolve_sing_box_binary(app: &AppHandle, settings: &RuntimeSettings) -> PathBuf {
     if let Ok(path) = app.path().resolve("sing-box", BaseDirectory::Resource) {
         if path.is_file() {
@@ -5927,16 +5960,10 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = sing_box_exit {
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("sing-box 退出后的 Gateway 清理失败：{error}"),
-            );
-        }
-        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, message));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app, &state, message, cleanup,
+        ));
     }
 
     let mitm_exit = {
@@ -5956,16 +5983,10 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = mitm_exit {
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("mitmdump 退出后的 Gateway 清理失败：{error}"),
-            );
-        }
-        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, message));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app, &state, message, cleanup,
+        ));
     }
 
     let gateway_supervisor_exit = {
@@ -5979,25 +6000,16 @@ fn get_runtime_status(
                 .map_err(|error| format!("检查 Gateway supervisor 失败：{error}"))?,
             None => false,
         };
-        if exited {
-            gateway_runtime.take();
-        }
         exited
     };
     if gateway_supervisor_exit {
-        if let Ok(mut readiness) = state.gateway_readiness.lock() {
-            readiness.mark_stopped();
-        }
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("vfkit Gateway supervisor 退出后的清理失败：{error}"),
-            );
-        }
-        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, "vfkit Gateway supervisor 已退出"));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app,
+            &state,
+            "vfkit Gateway supervisor 已退出".into(),
+            cleanup,
+        ));
     }
 
     state

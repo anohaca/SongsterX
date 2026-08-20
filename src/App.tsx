@@ -1144,11 +1144,30 @@ function App() {
     return invoke<number>("test_proxy_delay", { name, url: "http://www.gstatic.com/generate_204", timeoutMs: 5_000, target });
   }
 
+  async function waitForRuntimeState(expected: RuntimeStatus["state"], timeoutMs = 30_000): Promise<RuntimeStatus> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const current = await invoke<RuntimeStatus>("get_runtime_status");
+      setStatus(current);
+      if (current.state === expected) return current;
+      if (
+        current.state === "error" ||
+        (expected === "stopped" && current.state === "running") ||
+        (expected === "running" && current.state === "stopped")
+      ) {
+        throw new Error(current.message || `运行时未进入${expected}状态`);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    throw new Error(`等待运行时进入${expected}状态超时`);
+  }
+
   async function saveProxyConfig(config: ProxyConfig, target: ProxyConfigTarget = "host"): Promise<ProxyConfig> {
     const wasRunning = isActive;
     try {
       if (wasRunning) {
         setStatus(await invoke<RuntimeStatus>("stop_runtime"));
+        await waitForRuntimeState("stopped");
       }
       const command = target === "guest" ? "save_gateway_guest_proxy_config" : "save_proxy_config";
       const saved = await invoke<ProxyConfig>(command, { config });
@@ -1156,6 +1175,7 @@ function App() {
       else setProxyConfig(saved);
       if (wasRunning) {
         setStatus(await invoke<RuntimeStatus>("start_mix_direct"));
+        await waitForRuntimeState("running");
         await refreshProxies(true);
         addLocalLog("info", "代理配置已保存并重新加载运行时。");
       } else {
@@ -1165,7 +1185,12 @@ function App() {
     } catch (error) {
       if (wasRunning) {
         try {
-          setStatus(await invoke<RuntimeStatus>("start_mix_direct"));
+          const current = await invoke<RuntimeStatus>("get_runtime_status");
+          setStatus(current);
+          if (current.state === "stopped") {
+            setStatus(await invoke<RuntimeStatus>("start_mix_direct"));
+            await waitForRuntimeState("running");
+          }
         } catch (restartError) {
           addLocalLog("error", `配置保存后重新启动失败：${String(restartError)}`);
         }
