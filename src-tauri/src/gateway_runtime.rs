@@ -125,13 +125,52 @@ impl GatewayRuntimePlan {
     }
 }
 
+pub(crate) struct GatewayStartupFailure {
+    pub(crate) message: String,
+    pub(crate) residual: Option<GatewayRuntime>,
+}
+
+impl std::fmt::Debug for GatewayStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayStartupFailure")
+            .field("message", &self.message)
+            .field("has_residual", &self.residual.is_some())
+            .finish()
+    }
+}
+
+struct StartupStepFailure {
+    message: String,
+    residual: Option<(RuntimeRole, ManagedChild)>,
+}
+
+impl StartupStepFailure {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            residual: None,
+        }
+    }
+
+    fn with_child(role: RuntimeRole, mut child: ManagedChild, message: String) -> Self {
+        match child.stop_group(GATEWAY_CHILD_STOP_GRACE) {
+            Ok(()) => Self::new(message),
+            Err(error) => Self {
+                message: format!("{message}；停止 {} 失败：{error}", role.as_str()),
+                residual: Some((role, child)),
+            },
+        }
+    }
+}
+
 pub(crate) struct GatewayRuntime {
     children: Vec<(RuntimeRole, ManagedChild)>,
     artifacts: OwnedRuntimeArtifacts,
 }
 
 impl GatewayRuntime {
-    pub(crate) fn start(plan: GatewayRuntimePlan) -> Result<Self, String> {
+    pub(crate) fn start(plan: GatewayRuntimePlan) -> Result<Self, GatewayStartupFailure> {
         fn never_cancelled() -> bool {
             false
         }
@@ -142,7 +181,7 @@ impl GatewayRuntime {
     pub(crate) fn start_with_cancellation(
         plan: GatewayRuntimePlan,
         cancellation: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GatewayStartupFailure> {
         let GatewayRuntimePlan {
             mut artifacts,
             steps,
@@ -185,12 +224,50 @@ impl GatewayRuntime {
                 RuntimeRole::GuestAgent => guest_agent = Some(step),
             }
         }
-        let host_only =
-            host_only.ok_or_else(|| "Gateway runtime 缺少 host-only 启动步骤".to_string())?;
-        let bridged = bridged.ok_or_else(|| "Gateway runtime 缺少 bridged 启动步骤".to_string())?;
-        let vfkit = vfkit.ok_or_else(|| "Gateway runtime 缺少 vfkit 启动步骤".to_string())?;
-        let mut guest_agent =
-            guest_agent.ok_or_else(|| "Gateway runtime 缺少 guest-agent 启动步骤".to_string())?;
+        let host_only = match host_only {
+            Some(step) => step,
+            None => {
+                return Err(startup_error(
+                    RuntimeRole::VmnetHostOnly,
+                    "Gateway runtime 缺少 host-only 启动步骤".into(),
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
+        };
+        let bridged = match bridged {
+            Some(step) => step,
+            None => {
+                return Err(startup_error(
+                    RuntimeRole::VmnetBridged,
+                    "Gateway runtime 缺少 bridged 启动步骤".into(),
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
+        };
+        let vfkit = match vfkit {
+            Some(step) => step,
+            None => {
+                return Err(startup_error(
+                    RuntimeRole::Vfkit,
+                    "Gateway runtime 缺少 vfkit 启动步骤".into(),
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
+        };
+        let mut guest_agent = match guest_agent {
+            Some(step) => step,
+            None => {
+                return Err(startup_error(
+                    RuntimeRole::GuestAgent,
+                    "Gateway runtime 缺少 guest-agent 启动步骤".into(),
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
+        };
 
         // The two vmnet providers are independent. Start and probe them in
         // parallel, but keep vfkit behind both readiness gates because it
@@ -201,11 +278,11 @@ impl GatewayRuntime {
             (
                 host_task
                     .join()
-                    .map_err(|_| "vmnet host-only 启动线程异常退出".to_string())
+                    .map_err(|_| StartupStepFailure::new("vmnet host-only 启动线程异常退出".into()))
                     .and_then(|result| result),
                 bridged_task
                     .join()
-                    .map_err(|_| "vmnet bridged 启动线程异常退出".to_string())
+                    .map_err(|_| StartupStepFailure::new("vmnet bridged 启动线程异常退出".into()))
                     .and_then(|result| result),
             )
         });
@@ -214,7 +291,12 @@ impl GatewayRuntime {
             match result {
                 Ok((role, Some(child))) => children.push((role, child)),
                 Ok((_, None)) => helper_errors.push("vmnet helper 步骤没有产生进程".to_string()),
-                Err(error) => helper_errors.push(error),
+                Err(error) => {
+                    helper_errors.push(error.message);
+                    if let Some(child) = error.residual {
+                        children.push(child);
+                    }
+                }
             }
         }
         if cancellation() {
@@ -243,10 +325,21 @@ impl GatewayRuntime {
             ));
         }
 
-        let (vfkit_role, vfkit_child) =
-            start_step_isolated(vfkit, cancellation).map_err(|error| {
-                startup_error(RuntimeRole::Vfkit, error, &mut children, &mut artifacts)
-            })?;
+        let (vfkit_role, vfkit_child) = match start_step_isolated(vfkit, cancellation) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.message;
+                if let Some(child) = error.residual {
+                    children.push(child);
+                }
+                return Err(startup_error(
+                    RuntimeRole::Vfkit,
+                    message,
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
+        };
         if let Some(child) = vfkit_child {
             children.push((vfkit_role, child));
         }
@@ -271,7 +364,7 @@ impl GatewayRuntime {
         mut artifacts: OwnedRuntimeArtifacts,
         steps: Vec<LaunchStep>,
         cancellation: &(dyn Fn() -> bool + Sync),
-    ) -> Result<Self, String> {
+    ) -> Result<Self, GatewayStartupFailure> {
         let mut children = Vec::new();
         for mut step in steps {
             if cancellation() {
@@ -283,14 +376,17 @@ impl GatewayRuntime {
                 ));
             }
             let child_index = if let Some(command) = step.command.as_ref() {
-                let child = ManagedChild::spawn(command).map_err(|error| {
-                    startup_error(
-                        step.role,
-                        format!("启动失败：{error}"),
-                        &mut children,
-                        &mut artifacts,
-                    )
-                })?;
+                let child = match ManagedChild::spawn(command) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        return Err(startup_error(
+                            step.role,
+                            format!("启动失败：{error}"),
+                            &mut children,
+                            &mut artifacts,
+                        ));
+                    }
+                };
                 children.push((step.role, child));
                 Some(children.len() - 1)
             } else {
@@ -299,21 +395,35 @@ impl GatewayRuntime {
 
             if let Some(index) = child_index {
                 if let Some(pid_file) = step.pid_file.as_ref() {
-                    let pid = children[index].1.leader_pid().map_err(|error| {
-                        startup_error(step.role, error.to_string(), &mut children, &mut artifacts)
-                    })?;
-                    std::fs::write(pid_file, format!("{pid}\n")).map_err(|error| {
-                        startup_error(
+                    let pid = match children[index].1.leader_pid() {
+                        Ok(pid) => pid,
+                        Err(error) => {
+                            return Err(startup_error(
+                                step.role,
+                                error.to_string(),
+                                &mut children,
+                                &mut artifacts,
+                            ));
+                        }
+                    };
+                    if let Err(error) = std::fs::write(pid_file, format!("{pid}\n")) {
+                        return Err(startup_error(
                             step.role,
                             format!("写入 PID 文件失败：{error}"),
                             &mut children,
                             &mut artifacts,
-                        )
-                    })?;
+                        ));
+                    }
                 }
             }
-            wait_for_step(&mut step, child_index, &mut children, cancellation)
-                .map_err(|error| startup_error(step.role, error, &mut children, &mut artifacts))?;
+            if let Err(error) = wait_for_step(&mut step, child_index, &mut children, cancellation) {
+                return Err(startup_error(
+                    step.role,
+                    error,
+                    &mut children,
+                    &mut artifacts,
+                ));
+            }
         }
         Ok(Self {
             children,
@@ -465,36 +575,55 @@ fn wait_for_step(
 fn start_step_isolated(
     mut step: LaunchStep,
     cancellation: &(dyn Fn() -> bool + Sync),
-) -> Result<(RuntimeRole, Option<ManagedChild>), String> {
+) -> Result<(RuntimeRole, Option<ManagedChild>), StartupStepFailure> {
     let role = step.role;
     let mut child = if let Some(command) = step.command.as_ref() {
         match ManagedChild::spawn(command) {
             Ok(child) => Some(child),
-            Err(error) => return Err(format!("{} 启动失败：{error}", role.as_str())),
+            Err(error) => {
+                return Err(StartupStepFailure::new(format!(
+                    "{} 启动失败：{error}",
+                    role.as_str()
+                )));
+            }
         }
     } else {
         None
     };
 
-    if let (Some(child), Some(pid_file)) = (child.as_mut(), step.pid_file.as_ref()) {
-        let pid = match child.leader_pid() {
+    if let Some(pid_file) = step.pid_file.as_ref() {
+        let Some(pid_result) = child.as_ref().map(ManagedChild::leader_pid) else {
+            return Err(StartupStepFailure::new(format!(
+                "{} 启动步骤缺少进程",
+                role.as_str()
+            )));
+        };
+        let pid = match pid_result {
             Ok(pid) => pid,
             Err(error) => {
-                let _ = child.stop_group(GATEWAY_CHILD_STOP_GRACE);
-                return Err(format!("{} 获取 PID 失败：{error}", role.as_str()));
+                let child = child.take().expect("child exists while reading PID");
+                return Err(StartupStepFailure::with_child(
+                    role,
+                    child,
+                    format!("{} 获取 PID 失败：{error}", role.as_str()),
+                ));
             }
         };
         if let Err(error) = fs::write(pid_file, format!("{pid}\n")) {
-            let _ = child.stop_group(GATEWAY_CHILD_STOP_GRACE);
-            return Err(format!("{} 写入 PID 文件失败：{error}", role.as_str()));
+            let child = child.take().expect("child exists while writing PID");
+            return Err(StartupStepFailure::with_child(
+                role,
+                child,
+                format!("{} 写入 PID 文件失败：{error}", role.as_str()),
+            ));
         }
     }
 
     if let Err(error) = wait_for_step_single(&mut step, child.as_mut(), cancellation) {
-        if let Some(child) = child.as_mut() {
-            let _ = child.stop_group(GATEWAY_CHILD_STOP_GRACE);
-        }
-        return Err(error);
+        return match child.take() {
+            Some(child) => Err(StartupStepFailure::with_child(role, child, error)),
+            None => Err(StartupStepFailure::new(error)),
+        };
     }
     Ok((role, child))
 }
@@ -567,17 +696,33 @@ fn startup_error(
     message: String,
     children: &mut Vec<(RuntimeRole, ManagedChild)>,
     artifacts: &mut OwnedRuntimeArtifacts,
-) -> String {
+) -> GatewayStartupFailure {
     let mut cleanup_errors = Vec::new();
+    let mut survivors = Vec::new();
     while let Some((child_role, mut child)) = children.pop() {
         if let Err(error) = child.stop_group(GATEWAY_CHILD_STOP_GRACE) {
             cleanup_errors.push(format!("停止 {} 失败：{error}", child_role.as_str()));
+            survivors.push((child_role, child));
         }
     }
-    if let Err(error) = artifacts.cleanup() {
-        cleanup_errors.push(format!("清理运行文件失败：{error}"));
-    }
-    if cleanup_errors.is_empty() {
+    let residual = if survivors.is_empty() {
+        match artifacts.cleanup() {
+            Ok(()) => None,
+            Err(error) => {
+                cleanup_errors.push(format!("清理运行文件失败：{error}"));
+                Some(GatewayRuntime {
+                    children: Vec::new(),
+                    artifacts: std::mem::replace(artifacts, OwnedRuntimeArtifacts::empty()),
+                })
+            }
+        }
+    } else {
+        Some(GatewayRuntime {
+            children: survivors,
+            artifacts: std::mem::replace(artifacts, OwnedRuntimeArtifacts::empty()),
+        })
+    };
+    let message = if cleanup_errors.is_empty() {
         format!("{}：{message}", role.as_str())
     } else {
         format!(
@@ -585,7 +730,8 @@ fn startup_error(
             role.as_str(),
             cleanup_errors.join("；")
         )
-    }
+    };
+    GatewayStartupFailure { message, residual }
 }
 
 #[cfg(test)]
@@ -638,7 +784,7 @@ mod tests {
             Ok(_) => panic!("startup should time out"),
             Err(error) => error,
         };
-        assert!(error.contains("readiness 超时"));
+        assert!(error.message.contains("readiness 超时"));
         assert!(!runtime_dir.exists());
     }
 
@@ -666,7 +812,7 @@ mod tests {
             Ok(_) => panic!("startup should be cancelled"),
             Err(error) => error,
         };
-        assert_eq!(error, "vfkit：启动已取消");
+        assert_eq!(error.message, "vfkit：启动已取消");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!runtime_dir.exists());
     }
@@ -700,7 +846,7 @@ mod tests {
             Ok(_) => panic!("guest barrier should report the exited vfkit"),
             Err(error) => error,
         };
-        assert!(error.contains("vfkit 进程提前退出"));
+        assert!(error.message.contains("vfkit 进程提前退出"));
     }
 
     #[test]
@@ -718,7 +864,9 @@ mod tests {
             Ok(_) => panic!("probe should time out"),
             Err(error) => error,
         };
-        assert!(error.contains("最后一次探测：guest agent connection refused"));
+        assert!(error
+            .message
+            .contains("最后一次探测：guest agent connection refused"));
     }
 
     #[test]

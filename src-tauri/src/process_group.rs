@@ -679,6 +679,13 @@ pub(crate) struct OwnedRuntimeArtifacts {
 }
 
 impl OwnedRuntimeArtifacts {
+    pub(crate) fn empty() -> Self {
+        Self {
+            runtime_dir: PathBuf::new(),
+            files: Vec::new(),
+        }
+    }
+
     pub(crate) fn new(runtime_dir: PathBuf) -> io::Result<Self> {
         if runtime_dir.exists() {
             return Err(io::Error::new(

@@ -5239,6 +5239,7 @@ fn finalize_start_failure(
     generation: u64,
     error: String,
 ) -> bool {
+    let _gateway_transition = lock_gateway_transition(state);
     let mut phase = match state.lifecycle_phase.lock() {
         Ok(phase) => phase,
         Err(_) => return false,
@@ -5254,11 +5255,13 @@ fn finalize_start_failure(
     } else {
         LifecyclePhase::Stopped
     };
-    drop(phase);
     if !resources_owned {
         state.metrics_generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut session) = state.metrics_session.lock() {
             *session = None;
+        }
+        if let Ok(mut sample) = state.system_connections.lock() {
+            *sample = SystemConnectionSample::default();
         }
     }
     let current = current_status(state).unwrap_or_default();
@@ -5274,6 +5277,7 @@ fn finalize_start_failure(
     if resources_owned && has_metrics_session {
         restart_runtime_observers(app, state);
     }
+    drop(phase);
     emit_log(app, "error", error);
     true
 }
@@ -5529,10 +5533,11 @@ fn start_gateway_runtime_supervisor(
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
+            let message = adopt_gateway_start_failure(state, error);
             if let Ok(mut readiness) = state.gateway_readiness.lock() {
-                readiness.mark_failed(error.clone());
+                readiness.mark_failed(message.clone());
             }
-            return Err(format!("启动 vfkit Gateway supervisor 失败：{error}"));
+            return Err(format!("启动 vfkit Gateway supervisor 失败：{message}"));
         }
     };
 
@@ -5741,6 +5746,24 @@ fn runtime_failure_with_cleanup(
             }
             format!("{primary}；回收失败：{cleanup}；残留 Gateway 无法登记")
         }
+    }
+}
+
+fn adopt_gateway_start_failure(
+    state: &RuntimeState,
+    failure: gateway_runtime::GatewayStartupFailure,
+) -> String {
+    let message = failure.message;
+    let Some(runtime) = failure.residual else {
+        return message;
+    };
+    match state.gateway_runtime.lock() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(runtime);
+            format!("{message}；残留 Gateway 已登记，可再次停止")
+        }
+        Ok(_) => format!("{message}；Gateway 所有权槽已被占用，无法登记残留 runtime"),
+        Err(_) => format!("{message}；Gateway 所有权锁不可用，无法登记残留 runtime"),
     }
 }
 
@@ -6235,7 +6258,8 @@ fn start_mix_direct_transaction(
         },
     );
 
-    let managed_endpoints = managed_system_endpoints(&app, Some(&settings));
+    let managed_endpoints =
+        managed_system_endpoints(Some(&settings), module_plan_requires_mitm(&module_plan));
     let metrics_session = metrics_session_for_runtime(&app, &settings, managed_endpoints);
     if let Ok(mut current) = state.metrics_session.lock() {
         *current = Some(metrics_session.clone());
@@ -6705,8 +6729,8 @@ fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMet
 }
 
 fn managed_system_endpoints(
-    app: &AppHandle,
     settings: Option<&RuntimeSettings>,
+    module_proxy_active: bool,
 ) -> Vec<ManagedSystemEndpoint> {
     let mut endpoints = settings
         .filter(|value| !value.listen.trim().is_empty())
@@ -6725,12 +6749,6 @@ fn managed_system_endpoints(
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let module_proxy_active = app
-        .state::<RuntimeState>()
-        .status
-        .lock()
-        .map(|status| status.module_proxy.is_some())
-        .unwrap_or(false);
     if module_proxy_active {
         if let Some(settings) = settings {
             let host = module_proxy_host(settings);
