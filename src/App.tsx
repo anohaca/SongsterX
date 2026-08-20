@@ -545,6 +545,7 @@ type RuntimeMetrics = {
   memory: number;
   connections: RuntimeConnectionSnapshot[];
   hostSnapshotValid: boolean;
+  hostSnapshotError?: string | null;
   guestSnapshotValid: boolean;
   guestSnapshotError?: string | null;
   systemSnapshotValid: boolean;
@@ -892,7 +893,7 @@ function App() {
   const [persistedSettings, setPersistedSettings] = useState<RuntimeSettings>(defaultSettings);
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
   const [connectionEvents, setConnectionEvents] = useState<ConnectionEvent[]>([]);
-  const [metrics, setMetrics] = useState<RuntimeMetrics>({ uploadTotal: 0, downloadTotal: 0, activeConnections: 0, memory: 0, connections: [], hostSnapshotValid: true, guestSnapshotValid: true, guestSnapshotError: null, systemSnapshotValid: true, systemSnapshotError: null });
+  const [metrics, setMetrics] = useState<RuntimeMetrics>({ uploadTotal: 0, downloadTotal: 0, activeConnections: 0, memory: 0, connections: [], hostSnapshotValid: true, hostSnapshotError: null, guestSnapshotValid: true, guestSnapshotError: null, systemSnapshotValid: true, systemSnapshotError: null });
   const [connectionHistory, setConnectionHistory] = useState<ConnectionInfo[]>([]);
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
   const [guestProxyConfig, setGuestProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
@@ -1304,7 +1305,7 @@ function App() {
             </header>
 
             {view === "overview" && <OverviewPage status={status} settings={settings} settingsDirty={settingsDirty} metrics={metrics} running={isActive} guestStatus={guestStatus} guestStatusError={guestStatusError} onNavigate={setView} />}
-            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
+            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} hostSnapshotValid={metrics.hostSnapshotValid} hostSnapshotError={metrics.hostSnapshotError} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
             {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "rules" && <RulesPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "modules" && <ModulesPage modules={modules} onToggleModule={toggleModule} onSetModuleArgument={setModuleArgument} onImportModule={importModules} onImportModuleUrl={importModuleUrl} />}
@@ -1591,9 +1592,9 @@ function ConnectionDetails({ connection, events }: { connection: ConnectionInfo;
   const timeline = connectionEventsFor(connection, events).slice().sort((left, right) => (left.timestampUs ?? Date.parse(left.timestamp) * 1_000) - (right.timestampUs ?? Date.parse(right.timestamp) * 1_000));
   const ingressEvent = timeline.find(isIngressConnectionEvent);
   const timelineBaseUs = ingressEvent?.timestampUs ?? connection.startUs ?? timeline[0]?.timestampUs;
-  const elapsedEndUs = connection.status === "completed"
-    ? connection.lastSeenUs
-    : Date.now() * 1_000;
+  const elapsedEndUs = connection.status === "active"
+    ? Date.now() * 1_000
+    : connection.lastSeenUs;
   const elapsedFromIngress = timelineBaseUs === undefined || elapsedEndUs === undefined
     ? "—"
     : formatElapsedMs(Math.max(0, (elapsedEndUs - timelineBaseUs) / 1_000));
@@ -1632,7 +1633,7 @@ function ConnectionTraffic({ connection }: { connection: ConnectionInfo }) {
   return <div className="activity-traffic"><span className={connection.upload == null ? "activity-muted" : undefined}>↑ {formatBytes(connection.upload)}</span><span className={connection.download == null ? "activity-muted" : undefined}>↓ {formatBytes(connection.download)}</span></div>;
 }
 
-function ActivityPage({ connections, connectionEvents, running, logs, guestSnapshotValid, guestSnapshotError, systemSnapshotValid, systemSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; guestSnapshotValid: boolean; guestSnapshotError?: string | null; systemSnapshotValid: boolean; systemSnapshotError?: string | null; onClear: () => void }) {
+function ActivityPage({ connections, connectionEvents, running, logs, hostSnapshotValid, hostSnapshotError, guestSnapshotValid, guestSnapshotError, systemSnapshotValid, systemSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; hostSnapshotValid: boolean; hostSnapshotError?: string | null; guestSnapshotValid: boolean; guestSnapshotError?: string | null; systemSnapshotValid: boolean; systemSnapshotError?: string | null; onClear: () => void }) {
   const [connectionQuery, setConnectionQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [activityTab, setActivityTab] = useState("requests");
@@ -1656,7 +1657,7 @@ function ActivityPage({ connections, connectionEvents, running, logs, guestSnaps
       <Tab value="logs">运行日志</Tab>
     </TabList>
     {activityTab === "requests" && <Card className="panel activity-connections-panel">
-      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}{running && !systemSnapshotValid && <Text className="activity-warning-note" size={200}>系统连接观察暂时不可用，已保留上一批记录{systemSnapshotError ? `：${systemSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!guestSnapshotValid || !systemSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !guestSnapshotValid ? "Guest 观察不可用" : running && !systemSnapshotValid ? "系统观察不可用" : `${connections.length} 条记录`}</Badge></div>
+      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !hostSnapshotValid && <Text className="activity-warning-note" size={200}>Host 连接观察暂时不可用，已保留上一批记录{hostSnapshotError ? `：${hostSnapshotError}` : ""}。</Text>}{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}{running && !systemSnapshotValid && <Text className="activity-warning-note" size={200}>系统连接观察暂时不可用，已保留上一批记录{systemSnapshotError ? `：${systemSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!hostSnapshotValid || !guestSnapshotValid || !systemSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !hostSnapshotValid ? "Host 观察不可用" : running && !guestSnapshotValid ? "Guest 观察不可用" : running && !systemSnapshotValid ? "系统观察不可用" : `${connections.length} 条记录`}</Badge></div>
       <div className="activity-toolbar"><Input contentBefore={<SearchRegular />} value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} placeholder="搜索地址、客户端、策略或 ID" /></div>
       {filteredConnections.length === 0 ? <EmptyState title={running ? "暂无请求记录" : "暂无请求历史"} description={running ? "让应用通过 Mixed 代理访问网络后，请求会显示在这里。" : "启动代理接入后，请求记录会显示在这里。"} /> : <>
         <div className="activity-table-scroll" tabIndex={0} aria-label="代理请求记录">

@@ -22,3 +22,10 @@ This branch contains the current SongsterX source snapshot for external review.
 - system sampler 在阻塞式 lsof 前后和写共享缓存时检查 generation；system socket 使用连续快照 key 与生命周期 instance id 分离；
 - system observer 改用 `lsof -FpcfnT` 的机器可读输出，并补充 TCP/UDP、wildcard LAN 地址、tuple 重现等单元测试；
 - system 连接详情改用“首次观测/观测时长”语义，活动表更新为 8 列宽度规则。
+
+本轮针对最新复审继续修复：
+
+- 停止 worker 失败但仍持有进程、guest runtime 或代理资源时，后端保留运行元数据并继续发布 `running`，前端可以再次点击停止；无资源时才进入 `error`；
+- system 连接进入 `observed` 后，详情页的观测时长使用 `lastSeenUs` 冻结，不再随当前时间继续增长；
+- Host Clash API 请求、响应读取或 JSON 解析失败时仍发送指标帧，携带 `hostSnapshotValid=false` 和错误说明，活动页显示 Host 观察不可用，而不会丢弃整帧 guest/system 观察结果；
+- 新增停止失败状态转换的 Rust 单元测试。

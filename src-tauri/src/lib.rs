@@ -260,6 +260,7 @@ struct RuntimeMetrics {
     memory: u64,
     connections: Vec<ConnectionInfo>,
     host_snapshot_valid: bool,
+    host_snapshot_error: Option<String>,
     guest_snapshot_valid: bool,
     guest_snapshot_error: Option<String>,
     system_snapshot_valid: bool,
@@ -5232,6 +5233,23 @@ fn set_stopped(state: &RuntimeState, message: impl Into<String>) -> RuntimeStatu
     next
 }
 
+fn status_after_stop_failure(
+    mut current: RuntimeStatus,
+    resources_owned: bool,
+    message: impl Into<String>,
+) -> RuntimeStatus {
+    // A failed teardown that still owns a child, guest runtime, or proxy must
+    // remain stoppable. Preserve the last runtime metadata and expose the
+    // failure through the message while keeping the lifecycle state running.
+    current.state = if resources_owned {
+        "running".into()
+    } else {
+        "error".into()
+    };
+    current.message = message.into();
+    current
+}
+
 fn resolve_sing_box_binary(app: &AppHandle, settings: &RuntimeSettings) -> PathBuf {
     if let Ok(path) = app.path().resolve("sing-box", BaseDirectory::Resource) {
         if path.is_file() {
@@ -6532,15 +6550,45 @@ fn forward_output<R: std::io::Read>(app: AppHandle, output: R, fallback_level: &
 }
 
 fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
-    let body = ureq::get(&format!("http://{CLASH_API_ADDR}/connections"))
+    let mut metrics = RuntimeMetrics {
+        upload_total: 0,
+        download_total: 0,
+        active_connections: 0,
+        memory: 0,
+        connections: Vec::new(),
+        host_snapshot_valid: false,
+        host_snapshot_error: Some("Host Clash API 尚未返回连接快照".into()),
+        guest_snapshot_valid: true,
+        guest_snapshot_error: None,
+        system_snapshot_valid: false,
+        system_snapshot_error: None,
+    };
+
+    match ureq::get(&format!("http://{CLASH_API_ADDR}/connections"))
         .timeout(std::time::Duration::from_secs(2))
         .call()
-        .ok()?
-        .into_string()
-        .ok()?;
-    let host_value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let mut metrics = runtime_metrics_from_clash_value(&host_value, "host");
-    metrics.host_snapshot_valid = true;
+    {
+        Ok(response) => match response.into_string() {
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(host_value) => {
+                    metrics = runtime_metrics_from_clash_value(&host_value, "host");
+                    metrics.host_snapshot_valid = true;
+                    metrics.host_snapshot_error = None;
+                }
+                Err(error) => {
+                    metrics.host_snapshot_error =
+                        Some(format!("Host Clash API 返回了无法解析的连接快照：{error}"));
+                }
+            },
+            Err(error) => {
+                metrics.host_snapshot_error =
+                    Some(format!("读取 Host Clash API 响应失败：{error}"));
+            }
+        },
+        Err(error) => {
+            metrics.host_snapshot_error = Some(format!("Host Clash API 请求失败：{error}"));
+        }
+    }
 
     let settings = load_settings(app).ok();
     if let Some(settings) = settings.as_ref() {
@@ -6672,6 +6720,7 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
         memory,
         connections,
         host_snapshot_valid: runtime == "host",
+        host_snapshot_error: None,
         guest_snapshot_valid: true,
         guest_snapshot_error: None,
         system_snapshot_valid: false,
@@ -7165,13 +7214,10 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                         LifecyclePhase::Stopped
                     },
                 );
+                let current = current_status(&worker_state).unwrap_or_default();
                 update_status(
                     &worker_state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: error.clone(),
-                        ..RuntimeStatus::default()
-                    },
+                    status_after_stop_failure(current, resources_owned, error.clone()),
                 );
                 emit_log(&worker_app, "error", error);
             }
@@ -7190,13 +7236,10 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                 } else {
                     "停止 worker 异常退出，已确认没有运行时资源".to_string()
                 };
+                let current = current_status(&worker_state).unwrap_or_default();
                 update_status(
                     &worker_state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: error.clone(),
-                        ..RuntimeStatus::default()
-                    },
+                    status_after_stop_failure(current, resources_owned, error.clone()),
                 );
                 emit_log(&worker_app, "error", error);
             }
@@ -8037,6 +8080,25 @@ mod tests {
         assert!(GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE);
         assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("等待验收"));
         assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("LAN 与 tun0"));
+    }
+
+    #[test]
+    fn stop_failure_with_owned_resources_remains_stoppable() {
+        let mut current = RuntimeStatus::default();
+        current.mode = "lan-gateway no-dhcp".into();
+        current.pid = Some(42);
+        let next = status_after_stop_failure(current, true, "child refused to exit");
+        assert_eq!(next.state, "running");
+        assert_eq!(next.mode, "lan-gateway no-dhcp");
+        assert_eq!(next.pid, Some(42));
+        assert_eq!(next.message, "child refused to exit");
+    }
+
+    #[test]
+    fn stop_failure_without_owned_resources_is_error() {
+        let next = status_after_stop_failure(RuntimeStatus::default(), false, "teardown failed");
+        assert_eq!(next.state, "error");
+        assert_eq!(next.message, "teardown failed");
     }
 
     fn interface_stats(
