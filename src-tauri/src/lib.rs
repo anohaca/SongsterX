@@ -5139,7 +5139,7 @@ fn spawn_sing_box_process(
     config: &Path,
     endpoint: &str,
     cancellation: &(dyn Fn() -> bool + Sync),
-) -> Result<Child, String> {
+) -> Result<Child, (Option<Child>, String)> {
     let mut command = Command::new(binary);
     command
         .arg("run")
@@ -5147,13 +5147,20 @@ fn spawn_sing_box_process(
         .arg(config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("无法启动 sing-box（{}）：{}", binary.display(), error))?;
+    let mut child = command.spawn().map_err(|error| {
+        (
+            None,
+            format!("无法启动 sing-box（{}）：{}", binary.display(), error),
+        )
+    })?;
     if let Err(error) = wait_for_sing_box(&mut child, endpoint, cancellation) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        return match stop_unowned_child(child) {
+            Ok(()) => Err((None, error)),
+            Err((child, cleanup)) => Err((
+                Some(child),
+                format!("{error}；Mixed 启动阶段回收失败：{cleanup}"),
+            )),
+        };
     }
     Ok(child)
 }
@@ -5172,6 +5179,30 @@ fn stop_unowned_child(mut child: Child) -> Result<(), (Child, String)> {
             },
         )),
     }
+}
+
+fn adopt_unowned_child(state: &RuntimeState, failure: (Option<Child>, String)) -> String {
+    let (child, message) = failure;
+    let Some(child) = child else {
+        return message;
+    };
+    match state.child.lock() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(child);
+            message
+        }
+        Ok(_) => format!("{message}；Mixed 所有权槽已被占用，无法登记残留进程"),
+        Err(_) => format!("{message}；Mixed 所有权锁不可用，无法登记残留进程"),
+    }
+}
+
+fn update_start_error_status(state: &RuntimeState, message: String) {
+    let mut status = current_status(state).unwrap_or_default();
+    status.state = "error".into();
+    status.healthy = false;
+    status.can_stop = runtime_owns_resources(state);
+    status.message = message;
+    update_status(state, status);
 }
 
 fn set_stopped(state: &RuntimeState, message: impl Into<String>) -> RuntimeStatus {
@@ -5202,17 +5233,30 @@ fn status_after_stop_failure(
     current
 }
 
-fn finalize_start_failure(app: &AppHandle, state: &RuntimeState, error: String) {
+fn finalize_start_failure(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    error: String,
+) -> bool {
+    let mut phase = match state.lifecycle_phase.lock() {
+        Ok(phase) => phase,
+        Err(_) => return false,
+    };
+    if *phase != LifecyclePhase::Starting
+        || state.lifecycle_generation.load(Ordering::SeqCst) != generation
+    {
+        return false;
+    }
     let resources_owned = runtime_owns_resources(state);
-    mark_lifecycle_phase(
-        state,
-        if resources_owned {
-            LifecyclePhase::Running
-        } else {
-            LifecyclePhase::Stopped
-        },
-    );
+    *phase = if resources_owned {
+        LifecyclePhase::Running
+    } else {
+        LifecyclePhase::Stopped
+    };
+    drop(phase);
     if !resources_owned {
+        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut session) = state.metrics_session.lock() {
             *session = None;
         }
@@ -5231,6 +5275,7 @@ fn finalize_start_failure(app: &AppHandle, state: &RuntimeState, error: String) 
         restart_runtime_observers(app, state);
     }
     emit_log(app, "error", error);
+    true
 }
 
 fn finalize_unexpected_runtime_exit(
@@ -5478,7 +5523,7 @@ fn start_gateway_runtime_supervisor(
         }
     };
 
-    let mut runtime = match gateway_runtime::GatewayRuntime::start_with_cancellation(
+    let runtime = match gateway_runtime::GatewayRuntime::start_with_cancellation(
         runtime_plan,
         cancellation,
     ) {
@@ -5502,7 +5547,7 @@ fn start_gateway_runtime_supervisor(
             if let Ok(mut readiness) = state.gateway_readiness.lock() {
                 readiness.mark_failed(error.clone());
             }
-            return Err(runtime_failure_with_cleanup(error, &mut runtime));
+            return Err(runtime_failure_with_cleanup(error, runtime, state));
         }
     };
     if let Err(error) = commit_gateway_runtime(&state, runtime) {
@@ -5544,14 +5589,15 @@ fn guest_agent_status_diagnostic(status: &guest_agent::GuestAgentStatus) -> Stri
 /// uncommitted runtime before returning the error instead of relying on Drop.
 fn commit_gateway_runtime(
     state: &RuntimeState,
-    mut runtime: gateway_runtime::GatewayRuntime,
+    runtime: gateway_runtime::GatewayRuntime,
 ) -> Result<(), String> {
     let mut slot = match state.gateway_runtime.lock() {
         Ok(slot) => slot,
         Err(_) => {
             return Err(runtime_failure_with_cleanup(
                 "Gateway runtime 锁不可用".into(),
-                &mut runtime,
+                runtime,
+                state,
             ));
         }
     };
@@ -5559,7 +5605,8 @@ fn commit_gateway_runtime(
         drop(slot);
         return Err(runtime_failure_with_cleanup(
             "Gateway supervisor 已经在运行".into(),
-            &mut runtime,
+            runtime,
+            state,
         ));
     }
     *slot = Some(runtime);
@@ -5678,11 +5725,22 @@ fn observe_gateway_packet_path(
 
 fn runtime_failure_with_cleanup(
     primary: String,
-    runtime: &mut gateway_runtime::GatewayRuntime,
+    mut runtime: gateway_runtime::GatewayRuntime,
+    state: &RuntimeState,
 ) -> String {
     match runtime.stop() {
         Ok(()) => primary,
-        Err(cleanup) => format!("{primary}；回收失败：{cleanup}"),
+        Err(cleanup) => {
+            if let Ok(mut slot) = state.gateway_runtime.lock() {
+                if slot.is_none() {
+                    *slot = Some(runtime);
+                    return format!(
+                        "{primary}；回收失败：{cleanup}；残留 Gateway 已登记，可再次停止"
+                    );
+                }
+            }
+            format!("{primary}；回收失败：{cleanup}；残留 Gateway 无法登记")
+        }
     }
 }
 
@@ -6058,14 +6116,8 @@ fn start_mix_direct(
                 let _ = complete_start_success(&worker_state, lifecycle_generation, next);
             }
             Err(error) => {
-                let should_report = worker_state
-                    .lifecycle_phase
-                    .lock()
-                    .map(|phase| *phase == LifecyclePhase::Starting)
-                    .unwrap_or(false);
-                if should_report {
-                    finalize_start_failure(&worker_app, &worker_state, error);
-                }
+                let _ =
+                    finalize_start_failure(&worker_app, &worker_state, lifecycle_generation, error);
             }
         }
     });
@@ -6183,17 +6235,22 @@ fn start_mix_direct_transaction(
         },
     );
 
+    let managed_endpoints = managed_system_endpoints(&app, Some(&settings));
+    let metrics_session = metrics_session_for_runtime(&app, &settings, managed_endpoints);
+    if let Ok(mut current) = state.metrics_session.lock() {
+        *current = Some(metrics_session.clone());
+    }
+    spawn_runtime_observers(
+        app.clone(),
+        metrics_generation.clone(),
+        metrics_generation_id,
+        metrics_session,
+    );
+
     let sing_box_endpoint = sing_box_probe_endpoint(&settings.listen, settings.port);
     if let Err(error) = ensure_sing_box_listener_available(&settings.listen, settings.port) {
         let message = format!("Mixed 入口启动失败：{error}");
-        update_status(
-            &state,
-            RuntimeStatus {
-                state: "error".into(),
-                message: message.clone(),
-                ..RuntimeStatus::default()
-            },
-        );
+        update_start_error_status(&state, message.clone());
         emit_log(&app, "error", message.clone());
         return Err(message);
     }
@@ -6227,14 +6284,29 @@ fn start_mix_direct_transaction(
         });
         let local_result = match local_task.join() {
             Ok(result) => result,
-            Err(_) => Err("Mixed 启动线程异常退出".into()),
+            Err(_) => Err((None, "Mixed 启动线程异常退出".into())),
         };
         (gateway_result, local_result)
     });
 
     if lifecycle_cancelled(state, lifecycle_generation) {
+        let local_message = match local_result {
+            Ok(child) => match stop_unowned_child(child) {
+                Ok(()) => None,
+                Err((child, error)) => {
+                    if let Ok(mut slot) = state.child.lock() {
+                        *slot = Some(child);
+                    }
+                    Some(error)
+                }
+            },
+            Err(failure) => Some(adopt_unowned_child(state, failure)),
+        };
         let _ = stop_runtime_processes_locked(&app, state);
-        return Err("启动已取消".into());
+        return Err(match local_message {
+            Some(error) => format!("启动已取消；{error}"),
+            None => "启动已取消".into(),
+        });
     }
 
     let mut child = match (gateway_result, local_result) {
@@ -6261,19 +6333,12 @@ fn start_mix_direct_transaction(
                     None => error,
                 },
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Err(error)), Err(local_error)) => {
+            let local_error = adopt_unowned_child(&state, local_error);
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => {
@@ -6281,48 +6346,27 @@ fn start_mix_direct_transaction(
                 }
                 None => format!("{error}；Mixed 启动失败：{local_error}"),
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Ok(())), Err(error)) => {
+            let error = adopt_unowned_child(&state, error);
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => format!("Mixed 入口启动失败：{error}；回收失败：{cleanup}"),
                 None => format!("Mixed 入口启动失败：{error}"),
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Ok(())), Ok(child)) => child,
         (None, Ok(child)) => child,
         (None, Err(error)) => {
+            let error = adopt_unowned_child(&state, error);
             let message = format!("Mixed 入口启动失败：{error}");
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
@@ -6391,14 +6435,7 @@ fn start_mix_direct_transaction(
                             }
                         }
                     };
-                    update_status(
-                        &state,
-                        RuntimeStatus {
-                            state: "error".into(),
-                            message: message.clone(),
-                            ..RuntimeStatus::default()
-                        },
-                    );
+                    update_start_error_status(&state, message.clone());
                     emit_log(&app, "error", message.clone());
                     return Err(message);
                 }
@@ -6451,14 +6488,7 @@ fn start_mix_direct_transaction(
                     Ok(()) => message,
                     Err(cleanup) => format!("{message}；回收失败：{cleanup}"),
                 };
-                update_status(
-                    &state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: message.clone(),
-                        ..RuntimeStatus::default()
-                    },
-                );
+                update_start_error_status(&state, message.clone());
                 emit_log(&app, "error", message.clone());
                 return Err(message);
             }
@@ -6524,17 +6554,6 @@ fn start_mix_direct_transaction(
                 String::new()
             }
         ),
-    );
-    let managed_endpoints = managed_system_endpoints(&app, Some(&settings));
-    let metrics_session = metrics_session_for_runtime(&app, &settings, managed_endpoints);
-    if let Ok(mut current) = state.metrics_session.lock() {
-        *current = Some(metrics_session.clone());
-    }
-    spawn_runtime_observers(
-        app.clone(),
-        metrics_generation,
-        metrics_generation_id,
-        metrics_session,
     );
     Ok(next)
 }

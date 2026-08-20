@@ -123,10 +123,12 @@ button, input, select { font: inherit; }
   border-radius: 6px; font-size: 11px;
 }
 .status-running.fui-Badge { color: var(--sx-success); border-color: color-mix(in srgb, var(--sx-success) 35%, transparent); }
+.status-running.status-degraded.fui-Badge { color: var(--sx-danger); border-color: color-mix(in srgb, var(--sx-danger) 35%, transparent); }
 .status-starting.fui-Badge { color: var(--sx-info); border-color: color-mix(in srgb, var(--sx-info) 35%, transparent); }
 .status-error.fui-Badge, .status-exited.fui-Badge { color: var(--sx-danger); border-color: color-mix(in srgb, var(--sx-danger) 35%, transparent); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--sx-text-3); }
 .status-running .status-dot, .running-dot { background: var(--sx-success); }
+.status-running.status-degraded .status-dot { background: var(--sx-danger); }
 .status-error .status-dot, .status-exited .status-dot { background: var(--sx-danger); }
 
 /* ---------- 内容区（全宽，无居中限宽） ---------- */

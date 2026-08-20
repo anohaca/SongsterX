@@ -930,7 +930,7 @@ function App() {
     if (status.state === "error") return "错误";
     if (status.state === "exited") return "已退出";
     return "已停止";
-  }, [status.state]);
+  }, [status.state, status.healthy]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1356,7 +1356,7 @@ function App() {
               </div>
             </header>
 
-            {view === "overview" && <OverviewPage status={status} settings={settings} settingsDirty={settingsDirty} metrics={metrics} running={isActive} guestStatus={guestStatus} guestStatusError={guestStatusError} onNavigate={setView} />}
+            {view === "overview" && <OverviewPage status={status} settings={settings} settingsDirty={settingsDirty} metrics={metrics} running={isRunning} guestStatus={guestStatus} guestStatusError={guestStatusError} onNavigate={setView} />}
             {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} hostSnapshotValid={metrics.hostSnapshotValid} hostSnapshotError={metrics.hostSnapshotError} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
             {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "rules" && <RulesPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
@@ -1407,7 +1407,8 @@ function NavItem({ active, label, icon, badge, onClick }: { active: boolean; lab
 
 function StatusBadge({ status, label }: { status: RuntimeStatus; label: string }) {
   const color = status.state === "running" && status.healthy ? "success" : status.state === "error" || status.state === "exited" || (status.state === "running" && !status.healthy) ? "danger" : "subtle";
-  return <Badge className={`status-badge status-${status.state}`} appearance="tint" color={color as "success" | "danger" | "subtle"}><span className="status-dot" />{label}</Badge>;
+  const degraded = status.state === "running" && !status.healthy;
+  return <Badge className={`status-badge status-${status.state}${degraded ? " status-degraded" : ""}`} appearance="tint" color={color as "success" | "danger" | "subtle"}><span className="status-dot" />{label}</Badge>;
 }
 
 function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
