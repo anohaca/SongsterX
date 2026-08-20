@@ -10,14 +10,17 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_LINE: usize = 64 * 1024;
 const MAX_CONFIG_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_MODULE_PLAN_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_UPGRADE_SIZE: u64 = 64 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(200);
+const MITM_CERTIFICATE_WAIT: Duration = Duration::from_secs(5);
+const MITM_CERTIFICATE_POLL: Duration = Duration::from_millis(50);
 const GUEST_CLASH_API_ADDR: &str = "127.0.0.1:9090";
 const CLASH_HTTP_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const AGENT_CONNECTIONS_RESPONSE_LIMIT: usize = 60 * 1024;
@@ -42,9 +45,14 @@ struct ManagedSingBox {
     child: Child,
 }
 
+struct ManagedMitm {
+    child: Child,
+}
+
 #[derive(Default)]
 struct AgentRuntime {
     sing_box: Option<ManagedSingBox>,
+    mitm: Option<ManagedMitm>,
     last_error: Option<String>,
     control_listening: bool,
 }
@@ -83,6 +91,10 @@ struct Request {
     config_size: u64,
     #[serde(default, alias = "configSha256")]
     config_sha256: String,
+    #[serde(default, alias = "modulePlanSize")]
+    module_plan_size: u64,
+    #[serde(default, alias = "modulePlanSha256")]
+    module_plan_sha256: String,
     #[serde(default)]
     group: String,
     #[serde(default)]
@@ -103,6 +115,12 @@ struct StagedArtifact {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StagedConfig {
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StagedModulePlan {
     size: u64,
     sha256: String,
 }
@@ -131,6 +149,27 @@ impl AgentRuntime {
         }
     }
 
+    fn refresh_mitm(&mut self, plan_path: &Path) {
+        let result = self.mitm.as_mut().map(|process| process.child.try_wait());
+        match result {
+            Some(Ok(Some(status))) => {
+                self.mitm = None;
+                self.last_error = Some(format!("mitmdump 已退出，状态码 {:?}", status.code()));
+                if module_plan_requires_mitm(plan_path) {
+                    self.last_error = Some(format!(
+                        "mitmdump 已退出，状态码 {:?}；模块 MITM 仍需要运行",
+                        status.code()
+                    ));
+                }
+            }
+            Some(Err(error)) => {
+                self.mitm = None;
+                self.last_error = Some(format!("无法检查 mitmdump 状态：{error}"));
+            }
+            _ => {}
+        }
+    }
+
     fn is_healthy(&mut self, version: &str, readiness_file: &Path) -> bool {
         self.refresh(readiness_file);
         self.sing_box
@@ -143,32 +182,56 @@ impl AgentRuntime {
         self.sing_box.as_ref().map(|process| process.child.id())
     }
 
-    fn stop(&mut self, readiness_file: &Path) -> Result<(), String> {
-        let Some(mut process) = self.sing_box.take() else {
-            remove_readiness_path(readiness_file);
+    fn mitm_pid(&self) -> Option<u32> {
+        self.mitm.as_ref().map(|process| process.child.id())
+    }
+
+    fn mitm_healthy(&self) -> bool {
+        self.mitm.is_some()
+    }
+
+    fn stop_mitm(&mut self) -> Result<(), String> {
+        let Some(mut process) = self.mitm.take() else {
             return Ok(());
         };
-        match process
-            .child
-            .try_wait()
-            .map_err(|error| format!("检查 sing-box 停止状态失败：{error}"))?
-        {
-            Some(_) => {
-                remove_readiness_path(readiness_file);
-                Ok(())
+        stop_child(&mut process.child, "mitmdump")
+    }
+
+    fn stop(&mut self, readiness_file: &Path) -> Result<(), String> {
+        let mut failures = Vec::new();
+        if let Some(mut process) = self.mitm.take() {
+            if let Err(error) = stop_child(&mut process.child, "mitmdump") {
+                failures.push(error);
             }
-            None => {
-                process
-                    .child
-                    .kill()
-                    .map_err(|error| format!("停止 sing-box 失败：{error}"))?;
-                process
-                    .child
-                    .wait()
-                    .map_err(|error| format!("等待 sing-box 停止失败：{error}"))?;
-                remove_readiness_path(readiness_file);
-                Ok(())
+        }
+        if let Some(mut process) = self.sing_box.take() {
+            if let Err(error) = stop_child(&mut process.child, "sing-box") {
+                failures.push(error);
             }
+        }
+        remove_readiness_path(readiness_file);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("；"))
+        }
+    }
+}
+
+fn stop_child(child: &mut Child, label: &str) -> Result<(), String> {
+    match child
+        .try_wait()
+        .map_err(|error| format!("检查 {label} 停止状态失败：{error}"))?
+    {
+        Some(_) => Ok(()),
+        None => {
+            child
+                .kill()
+                .map_err(|error| format!("停止 {label} 失败：{error}"))?;
+            child
+                .wait()
+                .map_err(|error| format!("等待 {label} 停止失败：{error}"))?;
+            Ok(())
         }
     }
 }
@@ -302,8 +365,10 @@ fn handle_connection(
         "test_proxy_delay" => test_proxy_delay(&mut reader, &request),
         "stage_upgrade" => stage_upgrade(&mut reader, config, &request),
         "stage_config" => stage_config(&mut reader, config, &request),
+        "stage_module_plan" => stage_module_plan(&mut reader, config, &request),
         "activate_upgrade" => activate_upgrade(&mut reader, config, &request, runtime),
         "activate_config" => activate_config(&mut reader, config, &request, runtime),
+        "activate_module_plan" => activate_module_plan(&mut reader, config, &request, runtime),
         "rollback" => rollback(&mut reader, config, runtime),
         "stop_runtime" => stop_guest_runtime(&mut reader, config, runtime),
         method => respond(
@@ -773,6 +838,63 @@ fn stage_config(
     respond(reader, json!({"ok": true, "state": "staged"}))
 }
 
+fn stage_module_plan(
+    reader: &mut BufReader<TcpStream>,
+    config: &AgentConfig,
+    request: &Request,
+) -> Result<(), String> {
+    validate_module_plan_request(request)?;
+    let incoming = module_plan_incoming_path(config);
+    if let Some(parent) = incoming.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建模块运行计划目录：{error}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&incoming)
+        .map_err(|error| format!("无法创建模块运行计划临时文件：{error}"))?;
+    respond(reader, json!({"ok": true, "state": "ready_for_upload"}))?;
+
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+    let mut remaining = request.module_plan_size;
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining)
+            .unwrap_or(COPY_BUFFER_SIZE)
+            .min(COPY_BUFFER_SIZE);
+        let read = reader
+            .read(&mut buffer[..wanted])
+            .map_err(|error| format!("读取模块运行计划失败：{error}"))?;
+        if read == 0 {
+            return Err("模块运行计划在达到声明大小前断开".into());
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| format!("写入模块运行计划失败：{error}"))?;
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    file.sync_all()
+        .map_err(|error| format!("同步模块运行计划失败：{error}"))?;
+    let actual_sha256 = format!("{:x}", digest.finalize());
+    if actual_sha256 != request.module_plan_sha256 {
+        let _ = fs::remove_file(&incoming);
+        return respond(
+            reader,
+            error_response("模块运行计划 SHA-256 校验失败".into()),
+        );
+    }
+    write_staged_module_plan(
+        config,
+        &StagedModulePlan {
+            size: request.module_plan_size,
+            sha256: actual_sha256,
+        },
+    )?;
+    respond(reader, json!({"ok": true, "state": "staged"}))
+}
+
 fn activate_upgrade(
     reader: &mut BufReader<TcpStream>,
     config: &AgentConfig,
@@ -937,6 +1059,65 @@ fn activate_config(
     )
 }
 
+fn activate_module_plan(
+    reader: &mut BufReader<TcpStream>,
+    config: &AgentConfig,
+    request: &Request,
+    runtime: &mut AgentRuntime,
+) -> Result<(), String> {
+    let staged =
+        read_staged_module_plan(config)?.ok_or_else(|| "没有可激活的模块运行计划".to_string())?;
+    if staged.size != request.module_plan_size || staged.sha256 != request.module_plan_sha256 {
+        return respond(
+            reader,
+            error_response("待激活模块运行计划与 staged 元数据不匹配".into()),
+        );
+    }
+    let incoming = module_plan_incoming_path(config);
+    if !incoming.is_file() {
+        return respond(reader, error_response("staged 模块运行计划不存在".into()));
+    }
+    let candidate =
+        fs::read(&incoming).map_err(|error| format!("读取 staged 模块运行计划失败：{error}"))?;
+    let value: Value = serde_json::from_slice(&candidate)
+        .map_err(|error| format!("staged 模块运行计划不是有效 JSON：{error}"))?;
+    if let Err(error) = runtime.stop_mitm() {
+        return respond(
+            reader,
+            error_response(format!("停止旧 Module Engine 失败：{error}")),
+        );
+    }
+    write_atomic_bytes(&module_plan_path(config), &candidate)?;
+    let _ = fs::remove_file(&incoming);
+    let _ = fs::remove_file(module_plan_staged_path(config));
+    if module_plan_requires_mitm_value(&value) {
+        if let Err(error) = start_mitm(config, runtime) {
+            runtime.last_error = Some(error.clone());
+            return respond(
+                reader,
+                error_response(format!("启动 guest Module Engine 失败：{error}")),
+            );
+        }
+    }
+    let mitm_certificate_pem = if module_plan_requires_mitm_value(&value) {
+        wait_for_mitm_certificate(config, runtime)
+    } else {
+        None
+    };
+    respond(
+        reader,
+        json!({
+            "ok": true,
+            "state": "active",
+            "modulePlanSha256": request.module_plan_sha256,
+            "mitmHealthy": runtime.mitm_healthy(),
+            "mitmReady": runtime.mitm_healthy(),
+            "mitmPid": runtime.mitm_pid(),
+            "mitmCertificatePem": mitm_certificate_pem,
+        }),
+    )
+}
+
 fn rollback(
     reader: &mut BufReader<TcpStream>,
     config: &AgentConfig,
@@ -1005,12 +1186,16 @@ fn rollback(
 
 fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<Value, String> {
     runtime.refresh(&config.readiness_file);
+    runtime.refresh_mitm(&module_plan_path(config));
     let active_version =
         read_pointer(&active_path(&config.state_dir), "active")?.unwrap_or_default();
     let staged_version = read_staged(&config.state_dir)?.map(|value| value.version);
     let config_sha256 = file_sha256(&sing_box_config_path(config)).ok();
-    let healthy =
-        !active_version.is_empty() && runtime.is_healthy(&active_version, &config.readiness_file);
+    let mitm_required = module_plan_requires_mitm(&module_plan_path(config));
+    let mitm_healthy = !mitm_required || runtime.mitm_healthy();
+    let healthy = !active_version.is_empty()
+        && runtime.is_healthy(&active_version, &config.readiness_file)
+        && mitm_healthy;
     let network_ready = guest_network_ready(config);
     let control_listening = !config.network_ready_file.is_some() || runtime.control_listening;
     let ready = healthy && network_ready && control_listening && config.readiness_file.is_file();
@@ -1043,6 +1228,10 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
             "packetStats": packet_stats,
             "lastError": runtime.last_error,
             "pid": runtime.pid(),
+            "mitmHealthy": runtime.mitm_healthy(),
+            "mitmReady": runtime.mitm_healthy(),
+            "mitmPid": runtime.mitm_pid(),
+            "modulePlanSha256": file_sha256(&module_plan_path(config)).ok(),
         }
     }))
 }
@@ -1069,6 +1258,7 @@ fn read_interface_stats(interface: &str) -> Option<InterfaceStats> {
 
 fn runtime_ready(config: &AgentConfig, runtime: &AgentRuntime) -> bool {
     runtime.sing_box.is_some()
+        && (!module_plan_requires_mitm(&module_plan_path(config)) || runtime.mitm_healthy())
         && guest_network_ready(config)
         && (!config.network_ready_file.is_some() || runtime.control_listening)
         && config.readiness_file.is_file()
@@ -1150,6 +1340,12 @@ fn start_version(
                 child,
             });
             runtime.last_error = None;
+            if module_plan_requires_mitm(&module_plan_path(config)) {
+                if let Err(error) = start_mitm(config, runtime) {
+                    let _ = runtime.stop(&config.readiness_file);
+                    return Err(error);
+                }
+            }
             if let Err(error) = write_readiness(config, runtime) {
                 let _ = runtime.stop(&config.readiness_file);
                 return Err(error);
@@ -1157,6 +1353,128 @@ fn start_version(
             Ok(())
         }
     }
+}
+
+fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), String> {
+    if runtime.mitm_healthy() {
+        return Ok(());
+    }
+    let plan_path = module_plan_path(config);
+    if !module_plan_requires_mitm(&plan_path) {
+        return Ok(());
+    }
+    let binary = Path::new("/usr/bin/mitmdump");
+    let addon = Path::new("/usr/lib/songsterx/mitm_minimal_addon.py");
+    let runtime_module = Path::new("/usr/lib/songsterx/surge_js_runtime.py");
+    if !binary.is_file() {
+        return Err(format!("guest mitmdump 不存在：{}", binary.display()));
+    }
+    if !addon.is_file() || !runtime_module.is_file() {
+        return Err("guest Module Engine addon/runtime 文件不完整".into());
+    }
+    if !plan_path.is_file() {
+        return Err(format!("guest 模块运行计划不存在：{}", plan_path.display()));
+    }
+    let confdir = config.state_dir.join("mitmproxy");
+    fs::create_dir_all(&confdir)
+        .map_err(|error| format!("无法创建 guest mitmproxy 配置目录：{error}"))?;
+    let module_plan: Value = serde_json::from_slice(
+        &fs::read(&plan_path).map_err(|error| format!("读取 guest 模块运行计划失败：{error}"))?,
+    )
+    .map_err(|error| format!("guest 模块运行计划不是有效 JSON：{error}"))?;
+    if let Some(ca_pem) = module_plan.get("mitmCaPem").and_then(Value::as_str) {
+        if !ca_pem.contains("PRIVATE KEY") || !ca_pem.contains("CERTIFICATE") {
+            return Err("guest 模块运行计划中的 MITM CA 不完整".into());
+        }
+        write_atomic_bytes(&confdir.join("mitmproxy-ca.pem"), ca_pem.as_bytes())?;
+    }
+    let mut child = Command::new(binary)
+        .arg("--listen-host")
+        .arg("127.0.0.1")
+        .arg("--listen-port")
+        .arg("8080")
+        .arg("--set")
+        .arg(format!("confdir={}", confdir.display()))
+        .arg("-s")
+        .arg(addon)
+        .env("SONGSTERX_MODULE_PLAN", &plan_path)
+        .env("PYTHONPATH", "/usr/lib/songsterx")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("启动 guest mitmdump 失败：{error}"))?;
+    thread::sleep(SING_BOX_STARTUP_GRACE);
+    match child
+        .try_wait()
+        .map_err(|error| format!("检查 guest mitmdump 启动状态失败：{error}"))?
+    {
+        Some(status) => Err(format!(
+            "guest mitmdump 启动后退出，状态码 {:?}",
+            status.code()
+        )),
+        None => {
+            runtime.mitm = Some(ManagedMitm { child });
+            Ok(())
+        }
+    }
+}
+
+fn read_mitm_certificate(config: &AgentConfig) -> Option<String> {
+    let path = config
+        .state_dir
+        .join("mitmproxy")
+        .join("mitmproxy-ca-cert.pem");
+    let certificate = fs::read_to_string(path).ok()?;
+    if certificate.contains("BEGIN CERTIFICATE") {
+        Some(certificate)
+    } else {
+        None
+    }
+}
+
+fn wait_for_mitm_certificate(config: &AgentConfig, runtime: &mut AgentRuntime) -> Option<String> {
+    let deadline = Instant::now() + MITM_CERTIFICATE_WAIT;
+    let plan_path = module_plan_path(config);
+    loop {
+        runtime.refresh_mitm(&plan_path);
+        if runtime.mitm.is_none() {
+            return None;
+        }
+        if let Some(certificate) = read_mitm_certificate(config) {
+            return Some(certificate);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(MITM_CERTIFICATE_POLL);
+    }
+}
+
+fn module_plan_requires_mitm(path: &Path) -> bool {
+    let Ok(content) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&content) else {
+        return false;
+    };
+    module_plan_requires_mitm_value(&value)
+}
+
+fn module_plan_requires_mitm_value(value: &Value) -> bool {
+    [
+        "mitmHostnames",
+        "urlRewrites",
+        "mapLocals",
+        "headerRewrites",
+    ]
+    .iter()
+    .any(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    })
 }
 
 fn write_readiness(config: &AgentConfig, runtime: &AgentRuntime) -> Result<(), String> {
@@ -1274,6 +1592,18 @@ fn config_staged_path(config: &AgentConfig) -> PathBuf {
     sing_box_config_path(config).with_extension("staged.json")
 }
 
+fn module_plan_path(config: &AgentConfig) -> PathBuf {
+    config.state_dir.join("module-plan.json")
+}
+
+fn module_plan_incoming_path(config: &AgentConfig) -> PathBuf {
+    config.state_dir.join("module-plan.incoming")
+}
+
+fn module_plan_staged_path(config: &AgentConfig) -> PathBuf {
+    config.state_dir.join("module-plan.staged.json")
+}
+
 fn read_staged_config(config: &AgentConfig) -> Result<Option<StagedConfig>, String> {
     match fs::read_to_string(config_staged_path(config)) {
         Ok(value) => serde_json::from_str(&value)
@@ -1288,6 +1618,22 @@ fn write_staged_config(config: &AgentConfig, value: &StagedConfig) -> Result<(),
     let content = serde_json::to_vec(value)
         .map_err(|error| format!("序列化 staged sing-box 配置失败：{error}"))?;
     write_atomic_bytes(&config_staged_path(config), &content)
+}
+
+fn read_staged_module_plan(config: &AgentConfig) -> Result<Option<StagedModulePlan>, String> {
+    match fs::read_to_string(module_plan_staged_path(config)) {
+        Ok(value) => serde_json::from_str(&value)
+            .map(Some)
+            .map_err(|error| format!("staged 模块运行计划元数据无效：{error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取 staged 模块运行计划元数据失败：{error}")),
+    }
+}
+
+fn write_staged_module_plan(config: &AgentConfig, value: &StagedModulePlan) -> Result<(), String> {
+    let content = serde_json::to_vec(value)
+        .map_err(|error| format!("序列化 staged 模块运行计划失败：{error}"))?;
+    write_atomic_bytes(&module_plan_staged_path(config), &content)
 }
 
 fn restore_config(config: &AgentConfig, previous: Option<&[u8]>) -> Result<(), String> {
@@ -1387,6 +1733,21 @@ fn validate_config_request(request: &Request) -> Result<(), String> {
             .all(|value| value.is_ascii_hexdigit())
     {
         return Err("sing-box 配置 SHA-256 无效".into());
+    }
+    Ok(())
+}
+
+fn validate_module_plan_request(request: &Request) -> Result<(), String> {
+    if request.module_plan_size == 0 || request.module_plan_size > MAX_MODULE_PLAN_SIZE {
+        return Err("模块运行计划大小必须在 1-16777216 字节之间".into());
+    }
+    if request.module_plan_sha256.len() != 64
+        || !request
+            .module_plan_sha256
+            .chars()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err("模块运行计划 SHA-256 无效".into());
     }
     Ok(())
 }
@@ -1526,6 +1887,8 @@ mod tests {
             sha256: "a".repeat(64),
             config_size: 0,
             config_sha256: String::new(),
+            module_plan_size: 0,
+            module_plan_sha256: String::new(),
             group: String::new(),
             name: String::new(),
             url: String::new(),
@@ -1546,6 +1909,8 @@ mod tests {
             sha256: "a".repeat(64),
             config_size: 0,
             config_sha256: String::new(),
+            module_plan_size: 0,
+            module_plan_sha256: String::new(),
             group: String::new(),
             name: String::new(),
             url: String::new(),

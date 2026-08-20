@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,7 +12,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
 // The supervisor owns the Gateway process graph. The data-plane acceptance
@@ -38,10 +38,13 @@ const IMPORTED_MODULES_FILE: &str = "imported-modules.json";
 const IMPORTED_ASSETS_FILE: &str = "imported-module-assets.json";
 const IMPORTED_MODULES_DIR: &str = "modules";
 const CLASH_API_ADDR: &str = "127.0.0.1:9090";
-const MODULE_PROXY_PORT: u16 = 8080;
+const DEFAULT_MODULE_PROXY_PORT: u16 = 8080;
+const FALLBACK_MODULE_PROXY_PORT_START: u16 = 18080;
+const FALLBACK_MODULE_PROXY_PORT_END: u16 = 18089;
 const GATEWAY_AGENT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const GATEWAY_CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 const GATEWAY_AGENT_STOP_TIMEOUT: Duration = Duration::from_millis(250);
+const MITM_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Release gate for the IPv4 VM guest packet path.
 ///
 /// The supervisor may start after validating its runtime prerequisites. The
@@ -160,6 +163,8 @@ pub struct RuntimeSettings {
     pub gateway_client_policy: String,
     #[serde(default = "default_gateway_policy_mode")]
     pub gateway_policy_mode: String,
+    #[serde(default)]
+    pub mitm_ca_dir: String,
     pub log_level: String,
 }
 
@@ -225,6 +230,7 @@ impl Default for RuntimeSettings {
             gateway_clients: String::new(),
             gateway_client_policy: default_gateway_client_policy(),
             gateway_policy_mode: default_gateway_policy_mode(),
+            mitm_ca_dir: String::new(),
             log_level: "info".into(),
         }
     }
@@ -305,6 +311,14 @@ struct ModuleArgumentInfo {
     description: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MitmCertificateInfo {
+    available: bool,
+    path: String,
+    client_note: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ModulePreference {
@@ -369,6 +383,10 @@ struct ModuleAssetEntry {
 #[serde(rename_all = "camelCase")]
 struct ModuleRuntimePlan {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mitm_ca_pem: Option<String>,
     enabled_modules: Vec<String>,
     module_files: Vec<serde_json::Value>,
     mitm_hostnames: Vec<String>,
@@ -404,6 +422,7 @@ struct ConnectionInfo {
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 struct SystemConnectionSample {
     connections: Vec<ConnectionInfo>,
     valid: bool,
@@ -946,6 +965,97 @@ fn module_root(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&root)
         .map_err(|error| format!("无法创建模块目录 {}：{error}", root.display()))?;
     Ok(root)
+}
+
+fn mitm_certificate_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let settings = load_settings(app).unwrap_or_default();
+    let directory = mitmproxy_confdir(app, &settings)?;
+    for filename in ["mitmproxy-ca-cert.cer", "mitmproxy-ca-cert.pem"] {
+        let path = directory.join(filename);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "SongsterX MITM 根证书尚未生成：{}",
+        directory.display()
+    ))
+}
+
+fn load_mitm_ca_for_guest(app: &AppHandle) -> Result<Option<String>, String> {
+    let settings = load_settings(app).unwrap_or_default();
+    let configured = settings.mitm_ca_dir.trim();
+    let directory = if configured.is_empty() {
+        app_data_dir(app)?.join("mitmproxy")
+    } else {
+        PathBuf::from(configured)
+    };
+    let ca_path = directory.join("mitmproxy-ca.pem");
+    match fs::read_to_string(&ca_path) {
+        Ok(ca_pem) => {
+            if !ca_pem.contains("PRIVATE KEY") || !ca_pem.contains("CERTIFICATE") {
+                return Err(format!(
+                    "{} 必须同时包含 MITM CA 证书和私钥",
+                    ca_path.display()
+                ));
+            }
+            Ok(Some(ca_pem))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && configured.is_empty() => Ok(None),
+        Err(error) => Err(format!(
+            "无法读取用于 guest Module Engine 的 MITM CA {}：{}",
+            ca_path.display(),
+            error
+        )),
+    }
+}
+
+fn persist_guest_mitm_certificate(app: &AppHandle, certificate_pem: &str) -> Result<(), String> {
+    if !certificate_pem.contains("BEGIN CERTIFICATE") {
+        return Err("guest Module Engine 返回的 MITM 证书格式无效".into());
+    }
+    let settings = load_settings(app).unwrap_or_default();
+    let directory = if settings.mitm_ca_dir.trim().is_empty() {
+        app_data_dir(app)?.join("mitmproxy")
+    } else {
+        PathBuf::from(settings.mitm_ca_dir.trim())
+    };
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建 MITM 证书目录 {}：{error}", directory.display()))?;
+    let path = directory.join("mitmproxy-ca-cert.pem");
+    write_private_file(&path, certificate_pem.as_bytes())
+        .map_err(|error| format!("无法保存 guest MITM 根证书 {}：{error}", path.display()))
+}
+
+fn mitmproxy_confdir(app: &AppHandle, settings: &RuntimeSettings) -> Result<PathBuf, String> {
+    let configured = settings.mitm_ca_dir.trim();
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if !path.is_dir() {
+            return Err(format!(
+                "已有 MITM CA 目录不存在或不是目录：{}",
+                path.display()
+            ));
+        }
+        let ca_path = path.join("mitmproxy-ca.pem");
+        let ca = fs::read_to_string(&ca_path).map_err(|error| {
+            format!(
+                "已有 MITM CA 目录缺少 mitmproxy-ca.pem：{} ({error})",
+                ca_path.display()
+            )
+        })?;
+        if !ca.contains("PRIVATE KEY") || !ca.contains("CERTIFICATE") {
+            return Err(format!(
+                "{} 必须同时包含 CA 证书和私钥；只有 .cer/.crt 公钥证书不能用于 MITM",
+                ca_path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    let directory = app_data_dir(app)?.join("mitmproxy");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建 mitmproxy 配置目录：{error}"))?;
+    Ok(directory)
 }
 
 fn imported_modules_manifest_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1561,6 +1671,18 @@ fn parse_module_runtime_source(
                         });
                     if let Some(path) = asset_path {
                         map["localPath"] = serde_json::Value::String(path);
+                        if let Some(asset) = assets.iter().find(|asset| {
+                            asset.module == entry.id && asset.kind == "data" && asset.source == data
+                        }) {
+                            let relative = asset
+                                .local_file
+                                .strip_prefix("modules/")
+                                .unwrap_or(&asset.local_file);
+                            if let Ok(bytes) = fs::read(module_root.join(relative)) {
+                                map["inlineDataBase64"] =
+                                    serde_json::Value::String(base64_encode(&bytes));
+                            }
+                        }
                     } else if data.starts_with("http://") || data.starts_with("https://") {
                         map["disabledReason"] =
                             serde_json::Value::String("远程数据未找到本地哈希资源".into());
@@ -1794,14 +1916,61 @@ fn load_module_runtime_plan(app: &AppHandle) -> Result<ModuleRuntimePlan, String
         let source = fs::read_to_string(&path)
             .map_err(|error| format!("无法读取已启用模块 {}：{error}", path.display()))?;
         module_push_unique(&mut plan.enabled_modules, entry.id.clone());
-        plan.module_files.push(serde_json::json!({
+        let mut module_file = serde_json::json!({
             "id": entry.id,
             "path": path.display().to_string(),
+            "content": source,
             "arguments": preferences.argument_values.get(&entry.id).cloned().unwrap_or_default()
-        }));
+        });
+        let embedded_assets = assets
+            .iter()
+            .filter(|asset| asset.module == entry.id)
+            .filter_map(|asset| {
+                let relative = asset
+                    .local_file
+                    .strip_prefix("modules/")
+                    .unwrap_or(&asset.local_file);
+                let asset_path = module_root.join(relative);
+                let bytes = fs::read(&asset_path).ok()?;
+                Some(serde_json::json!({
+                    "kind": asset.kind,
+                    "source": asset.source,
+                    "contentBase64": base64_encode(&bytes),
+                    "sha256": asset.sha256,
+                }))
+            })
+            .collect::<Vec<_>>();
+        module_file["assets"] = serde_json::Value::Array(embedded_assets);
+        plan.module_files.push(module_file);
         parse_module_runtime_source(&entry, &source, &module_root, &assets, &mut plan);
     }
+    if module_plan_requires_mitm(&plan) {
+        plan.mitm_ca_pem = load_mitm_ca_for_guest(app)?;
+    }
     Ok(plan)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(TABLE[((first & 0x03) << 4 | second >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((second & 0x0f) << 2 | third >> 6) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn module_runtime_plan_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1809,15 +1978,20 @@ fn module_runtime_plan_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn write_module_runtime_plan(app: &AppHandle) -> Result<ModuleRuntimePlan, String> {
+    let plan = load_module_runtime_plan(app)?;
+    persist_module_runtime_plan(app, &plan)?;
+    Ok(plan)
+}
+
+fn persist_module_runtime_plan(app: &AppHandle, plan: &ModuleRuntimePlan) -> Result<(), String> {
     let directory = app_data_dir(app)?;
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    let plan = load_module_runtime_plan(app)?;
     let path = module_runtime_plan_path(app)?;
-    let content = serde_json::to_string_pretty(&plan)
+    let content = serde_json::to_string_pretty(plan)
         .map_err(|error| format!("无法序列化模块运行计划：{error}"))?;
     write_private_file(&path, format!("{content}\n").as_bytes())
         .map_err(|error| format!("无法写入模块运行计划 {}：{error}", path.display()))?;
-    Ok(plan)
+    Ok(())
 }
 
 fn module_route_rules(plan: &ModuleRuntimePlan) -> Vec<serde_json::Value> {
@@ -2380,6 +2554,11 @@ fn render_songsterx_config(
         output,
         "fakeip-dns-ip = {}",
         surge_config_value(&settings.gateway_dns_ip)
+    );
+    let _ = writeln!(
+        output,
+        "mitm-ca-dir = {}",
+        surge_config_value(&settings.mitm_ca_dir)
     );
     let _ = writeln!(output, "log-level = {}", settings.log_level);
     let _ = writeln!(output, "tun = {}", settings.mode == "gateway");
@@ -2976,6 +3155,7 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                     "vm-gateway-ip" | "gateway-ip" => settings.gateway_ip = value,
                     "vm-gateway-cidr" | "gateway-cidr" => settings.gateway_cidr = value,
                     "fakeip-dns-ip" | "gateway-dns-ip" => settings.gateway_dns_ip = value,
+                    "mitm-ca-dir" => settings.mitm_ca_dir = value,
                     "log-level" => settings.log_level = value,
                     "format-version" | "config-version" | "tun" | "system-dns"
                     | "gateway-profile" | "gatewaykit-path" | "gateway-backend" => {}
@@ -4810,6 +4990,7 @@ fn apply_module_runtime_plan(
     rendered: &mut serde_json::Value,
     settings: &RuntimeSettings,
     module_plan: &ModuleRuntimePlan,
+    guest: bool,
 ) -> Result<(), String> {
     if let Some(rules) = rendered["route"]["rules"].as_array_mut() {
         let mut module_rules = module_route_rules(module_plan);
@@ -4820,7 +5001,12 @@ fn apply_module_runtime_plan(
         *rules = module_rules;
     }
     if module_plan_requires_mitm(module_plan) {
-        let module_proxy_host = module_proxy_host(settings);
+        let module_proxy_host = if guest {
+            "127.0.0.1".to_string()
+        } else {
+            module_proxy_host(settings)
+        };
+        let module_proxy_port = module_proxy_port(module_plan);
         rendered["outbounds"]
             .as_array_mut()
             .expect("sing-box outbounds must be an array")
@@ -4828,7 +5014,7 @@ fn apply_module_runtime_plan(
                 "type": "http",
                 "tag": "module-mitm",
                 "server": module_proxy_host,
-                "server_port": MODULE_PROXY_PORT
+                "server_port": module_proxy_port
             }));
     }
     Ok(())
@@ -4843,7 +5029,7 @@ fn render_runtime_config_document(
     let mut rendered: serde_json::Value =
         serde_json::from_str(&render_runtime_config_for(settings, proxy, guest)?)
             .map_err(|error| format!("运行配置不是有效 JSON：{error}"))?;
-    apply_module_runtime_plan(&mut rendered, settings, module_plan)?;
+    apply_module_runtime_plan(&mut rendered, settings, module_plan, guest)?;
     if guest {
         let tun = rendered["inbounds"]
             .as_array_mut()
@@ -4978,8 +5164,76 @@ fn module_proxy_host(settings: &RuntimeSettings) -> String {
     }
 }
 
-fn module_proxy_endpoint(settings: &RuntimeSettings) -> String {
-    format!("{}:{MODULE_PROXY_PORT}", module_proxy_host(settings))
+fn module_proxy_probe_host(settings: &RuntimeSettings) -> &str {
+    if settings.mode == "gateway" {
+        // The host-only vmnet address is created by the Gateway supervisor
+        // later in the startup transaction. The caller probes the configured
+        // host first to catch a specific-address listener, then falls back to
+        // the wildcard address only while the host-only address is unavailable.
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+fn module_proxy_port(plan: &ModuleRuntimePlan) -> u16 {
+    plan.proxy_port.unwrap_or(DEFAULT_MODULE_PROXY_PORT)
+}
+
+fn bind_module_proxy_listener(
+    settings: &RuntimeSettings,
+    port: u16,
+) -> Result<TcpListener, String> {
+    let host = module_proxy_host(settings);
+    let probe_host = module_proxy_probe_host(settings);
+    match TcpListener::bind((host.as_str(), port)) {
+        Ok(listener) => Ok(listener),
+        Err(host_error)
+            if settings.mode == "gateway"
+                && host_error.kind() == io::ErrorKind::AddrNotAvailable =>
+        {
+            TcpListener::bind((probe_host, port)).map_err(|probe_error| {
+                format!(
+                    "{}:{} 不可用（{}）；{}:{} 也不可用（{}）",
+                    host, port, host_error, probe_host, port, probe_error
+                )
+            })
+        }
+        Err(host_error) => Err(format!("{}:{} 不可用：{}", host, port, host_error)),
+    }
+}
+
+fn select_module_proxy_port(settings: &RuntimeSettings) -> Result<u16, String> {
+    let host = module_proxy_host(settings);
+    let mut last_error = None;
+    let candidates = std::iter::once(DEFAULT_MODULE_PROXY_PORT)
+        .chain(FALLBACK_MODULE_PROXY_PORT_START..=FALLBACK_MODULE_PROXY_PORT_END);
+    for port in candidates {
+        match bind_module_proxy_listener(settings, port) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(port);
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    if let Ok(listener) = bind_module_proxy_listener(settings, 0) {
+        if let Ok(address) = listener.local_addr() {
+            return Ok(address.port());
+        }
+    }
+    Err(format!(
+        "模块 MITM 监听地址 {} 无可用端口（已尝试 {} 和 {}-{}；最后错误：{}）",
+        host,
+        DEFAULT_MODULE_PROXY_PORT,
+        FALLBACK_MODULE_PROXY_PORT_START,
+        FALLBACK_MODULE_PROXY_PORT_END,
+        last_error.unwrap_or_else(|| "无法申请临时端口".into())
+    ))
+}
+
+fn module_proxy_endpoint(settings: &RuntimeSettings, port: u16) -> String {
+    format!("{}:{port}", module_proxy_host(settings))
 }
 
 fn runtime_phase_is_active(state: &RuntimeState) -> Result<bool, String> {
@@ -5009,11 +5263,10 @@ fn spawn_mitmproxy(
     app: &AppHandle,
     plan_path: &Path,
     settings: &RuntimeSettings,
+    port: u16,
 ) -> Result<Child, String> {
     let addon = resolve_mitmproxy_addon(app)?;
-    let confdir = app_data_dir(app)?.join("mitmproxy");
-    fs::create_dir_all(&confdir)
-        .map_err(|error| format!("无法创建 mitmproxy 配置目录：{error}"))?;
+    let confdir = mitmproxy_confdir(app, settings)?;
     let binary = resolve_mitmproxy_binary(app);
     let host = module_proxy_host(settings);
     let mut command = Command::new(&binary);
@@ -5021,7 +5274,7 @@ fn spawn_mitmproxy(
         .arg("--listen-host")
         .arg(&host)
         .arg("--listen-port")
-        .arg(MODULE_PROXY_PORT.to_string())
+        .arg(port.to_string())
         .arg("--set")
         .arg(format!("confdir={}", confdir.display()))
         .arg("-s")
@@ -5043,13 +5296,20 @@ fn wait_for_mitmproxy(
     endpoint: &str,
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    for _ in 0..30 {
+    let deadline = Instant::now() + MITM_STARTUP_TIMEOUT;
+    loop {
         if cancellation() {
             return Err("启动已取消".into());
         }
         if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
+            let diagnostics = child_process_diagnostics(child);
+            let diagnostics = if diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!("；输出：{diagnostics}")
+            };
             return Err(format!(
-                "mitmdump 在监听 {} 前退出，状态码 {:?}",
+                "mitmdump 在监听 {} 前退出，状态码 {:?}{diagnostics}",
                 endpoint,
                 exit.code()
             ));
@@ -5057,9 +5317,37 @@ fn wait_for_mitmproxy(
         if TcpStream::connect(endpoint).is_ok() {
             return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(format!("mitmdump 启动超时，未监听 {}", endpoint));
+        }
         thread::sleep(std::time::Duration::from_millis(100));
     }
-    Err(format!("mitmdump 启动超时，未监听 {}", endpoint))
+}
+
+fn child_process_diagnostics(child: &mut Child) -> String {
+    let mut output = Vec::new();
+    drain_process_pipe(&mut child.stdout, &mut output);
+    drain_process_pipe(&mut child.stderr, &mut output);
+    let text = String::from_utf8_lossy(&output).trim().to_string();
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if text.len() <= MAX_DIAGNOSTIC_BYTES {
+        return text;
+    }
+    let suffix = text
+        .chars()
+        .rev()
+        .take(MAX_DIAGNOSTIC_BYTES)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("…{suffix}")
+}
+
+fn drain_process_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>) {
+    if let Some(mut pipe) = pipe.take() {
+        let _ = pipe.read_to_end(output);
+    }
 }
 
 fn sing_box_probe_endpoint(listen: &str, port: u16) -> String {
@@ -5450,8 +5738,10 @@ fn start_gateway_runtime_supervisor(
     state: &RuntimeState,
     settings: &RuntimeSettings,
     config_path: &Path,
+    module_plan_path: &Path,
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    let startup_started_at = Instant::now();
     if !GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE {
         return Err(GATEWAY_PACKET_PATH_UNAVAILABLE.into());
     }
@@ -5540,6 +5830,50 @@ fn start_gateway_runtime_supervisor(
             return Err(format!("启动 vfkit Gateway supervisor 失败：{message}"));
         }
     };
+    emit_log(
+        app,
+        "info",
+        format!(
+            "VM 基础运行时已就绪，耗时 {} ms；正在同步 guest 配置",
+            startup_started_at.elapsed().as_millis()
+        ),
+    );
+
+    let module_result = match guest_agent::sync_module_plan_with_cancellation(
+        &endpoint,
+        module_plan_path,
+        GATEWAY_CONFIG_SYNC_TIMEOUT,
+        cancellation,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            if let Ok(mut readiness) = state.gateway_readiness.lock() {
+                readiness.mark_failed(error.clone());
+            }
+            return Err(runtime_failure_with_cleanup(
+                format!("guest Module Engine 计划同步失败：{error}"),
+                runtime,
+                state,
+            ));
+        }
+    };
+    if let Some(certificate_pem) = module_result.certificate_pem.as_deref() {
+        if let Err(error) = persist_guest_mitm_certificate(app, certificate_pem) {
+            emit_log(
+                app,
+                "warn",
+                format!("guest Module Engine 已启动，但保存 MITM 根证书失败：{error}"),
+            );
+        }
+    }
+    emit_log(
+        app,
+        "info",
+        format!(
+            "guest Module Engine 计划已同步，耗时 {} ms；正在同步 sing-box 配置",
+            startup_started_at.elapsed().as_millis()
+        ),
+    );
 
     let config_result = match guest_agent::sync_config_with_cancellation(
         &endpoint,
@@ -5572,7 +5906,8 @@ fn start_gateway_runtime_supervisor(
         app,
         "info",
         format!(
-            "vfkit Gateway supervisor 已启动：bridged LAN、host-only、vfkit 和 guest-agent 均就绪（配置已激活；实体 LAN packet path 尚未现场验收）"
+            "vfkit Gateway supervisor 已启动：bridged LAN、host-only、vfkit 和 guest-agent 均就绪（配置已激活；实体 LAN packet path 尚未现场验收；总耗时 {} ms）",
+            startup_started_at.elapsed().as_millis()
         ),
     );
     Ok(())
@@ -5940,10 +6275,18 @@ fn gateway_guest_agent_endpoint(
 }
 
 #[tauri::command]
-fn get_gateway_guest_status(app: AppHandle) -> Result<guest_agent::GuestAgentStatus, String> {
-    let settings = load_settings(&app)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    guest_agent::query_status(&endpoint, Duration::from_secs(2))
+async fn get_gateway_guest_status(app: AppHandle) -> Result<guest_agent::GuestAgentStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load_settings(&app)?;
+        let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
+        // This command is called by the UI polling loop. Keep an unreachable
+        // guest from holding the Tauri main thread for seconds, while the
+        // blocking socket work itself runs on the async runtime's blocking
+        // pool.
+        guest_agent::query_status(&endpoint, Duration::from_millis(500))
+    })
+    .await
+    .map_err(|error| format!("guest agent 状态探测任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -6193,7 +6536,18 @@ fn start_mix_direct_transaction(
             vfkit_gateway_preflight_message(&app, &settings),
         );
     }
-    let module_plan = write_module_runtime_plan(&app)?;
+    let mut module_plan = write_module_runtime_plan(&app)?;
+    if module_plan_requires_mitm(&module_plan) {
+        let port = if gateway_mode {
+            // Gateway Module Engine is inside the Linux guest and is reached by
+            // guest sing-box over loopback. Do not probe/bind a host-only port.
+            DEFAULT_MODULE_PROXY_PORT
+        } else {
+            select_module_proxy_port(&settings)?
+        };
+        module_plan.proxy_port = Some(port);
+    }
+    persist_module_runtime_plan(&app, &module_plan)?;
     let config = write_runtime_config(&app, &settings, &module_plan)?;
     let gateway_config = if gateway_mode {
         Some(write_gateway_guest_runtime_config(
@@ -6258,9 +6612,7 @@ fn start_mix_direct_transaction(
         },
     );
 
-    let managed_endpoints =
-        managed_system_endpoints(Some(&settings), module_plan_requires_mitm(&module_plan));
-    let metrics_session = metrics_session_for_runtime(&app, &settings, managed_endpoints);
+    let metrics_session = metrics_session_for_runtime(&app, &settings);
     if let Ok(mut current) = state.metrics_session.lock() {
         *current = Some(metrics_session.clone());
     }
@@ -6271,13 +6623,89 @@ fn start_mix_direct_transaction(
         metrics_session,
     );
 
-    let sing_box_endpoint = sing_box_probe_endpoint(&settings.listen, settings.port);
-    if let Err(error) = ensure_sing_box_listener_available(&settings.listen, settings.port) {
-        let message = format!("Mixed 入口启动失败：{error}");
-        update_start_error_status(&state, message.clone());
-        emit_log(&app, "error", message.clone());
-        return Err(message);
+    if !gateway_mode {
+        if let Err(error) = ensure_sing_box_listener_available(&settings.listen, settings.port) {
+            let message = format!("Mixed 入口启动失败：{error}");
+            update_start_error_status(&state, message.clone());
+            emit_log(&app, "error", message.clone());
+            return Err(message);
+        }
     }
+
+    // Gateway is a single guest data plane. The host intentionally does not
+    // start either a second sing-box or a host mitmdump process.
+    if gateway_mode {
+        let startup_cancelled = || lifecycle_cancelled(state, lifecycle_generation);
+        if let Err(error) = start_gateway_runtime_supervisor(
+            &app,
+            &state,
+            &settings,
+            gateway_config
+                .as_deref()
+                .expect("gateway config is prepared for gateway mode"),
+            &plan_path,
+            &startup_cancelled,
+        ) {
+            update_start_error_status(&state, error.clone());
+            emit_log(&app, "error", error.clone());
+            return Err(error);
+        }
+        if lifecycle_cancelled(state, lifecycle_generation) {
+            let _ = stop_runtime_processes_locked(&app, state);
+            return Err("启动已取消".into());
+        }
+        let guest_status =
+            gateway_guest_agent_endpoint(&app, &settings)
+                .ok()
+                .and_then(|endpoint| {
+                    guest_agent::query_status(&endpoint, GATEWAY_AGENT_PROBE_TIMEOUT).ok()
+                });
+        let module_proxy = module_plan_requires_mitm(&module_plan)
+            .then(|| format!("VM 内 127.0.0.1:{}", module_proxy_port(&module_plan)));
+        let next = RuntimeStatus {
+            state: "starting".into(),
+            healthy: false,
+            can_stop: true,
+            mode: "lan-gateway no-dhcp".into(),
+            listen: format!("VM tun0 + {}:{}", settings.gateway_ip.trim(), settings.port),
+            dns: dns_status(&settings),
+            gateway_ip: Some(settings.gateway_ip.trim().to_string()),
+            gateway_dns_ip: Some(if settings.gateway_dns_ip.trim().is_empty() {
+                if settings.dns_mode == "fakeip" {
+                    "198.18.0.2".into()
+                } else {
+                    settings.gateway_ip.trim().into()
+                }
+            } else {
+                settings.gateway_dns_ip.trim().into()
+            }),
+            gateway_packet_path_ready: false,
+            pid: guest_status.as_ref().and_then(|status| status.pid),
+            module_proxy,
+            message: if module_plan_requires_mitm(&module_plan) {
+                "Linux VM 单数据面已启动：guest sing-box + guest mitmdump；等待 LAN packet path 验收".into()
+            } else {
+                "Linux VM 单 sing-box 数据面已启动；等待 LAN packet path 验收".into()
+            },
+        };
+        update_status(&state, next.clone());
+        emit_log(
+            &app,
+            "info",
+            format!(
+                "Linux VM 单数据面已启动：guest sing-box PID {}{}；主机不再启动第二个 sing-box/mitmdump",
+                next.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "未知".into()),
+                if module_plan_requires_mitm(&module_plan) {
+                    "，guest mitmdump 已挂接 127.0.0.1:8080"
+                } else {
+                    ""
+                }
+            ),
+        );
+        return Ok(next);
+    }
+
+    let sing_box_endpoint = sing_box_probe_endpoint(&settings.listen, settings.port);
 
     // Mixed and Gateway own different processes and sockets. Start their
     // independent bootstrap phases in parallel, then publish both only after
@@ -6295,6 +6723,7 @@ fn start_mix_direct_transaction(
                     &state,
                     &settings,
                     gateway_config,
+                    &plan_path,
                     &startup_cancelled,
                 )
             })
@@ -6429,8 +6858,9 @@ fn start_mix_direct_transaction(
         .lock()
         .map_err(|_| "运行时锁不可用".to_string())? = Some(child);
     let module_proxy = if module_plan_requires_mitm(&module_plan) {
-        let endpoint = module_proxy_endpoint(&settings);
-        match spawn_mitmproxy(&app, &plan_path, &settings) {
+        let port = module_proxy_port(&module_plan);
+        let endpoint = module_proxy_endpoint(&settings, port);
+        match spawn_mitmproxy(&app, &plan_path, &settings, port) {
             Ok(mut mitm_child) => {
                 if let Err(error) =
                     wait_for_mitmproxy(&mut mitm_child, &endpoint, &startup_cancelled)
@@ -6500,7 +6930,7 @@ fn start_mix_direct_transaction(
                     &app,
                     "info",
                     format!(
-                        "Module Engine 已启动，mitmdump PID {}，监听 {}",
+                        "Module Engine 已启动，mitmdump PID {}，监听 {}；HTTPS 客户端需信任 SongsterX MITM 根证书，否则匹配域名会连接失败",
                         mitm_pid, endpoint
                     ),
                 );
@@ -6657,7 +7087,7 @@ fn forward_output<R: std::io::Read>(app: AppHandle, output: R, fallback_level: &
     }
 }
 
-fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMetrics> {
+fn fetch_metrics(_app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMetrics> {
     let mut metrics = RuntimeMetrics {
         upload_total: 0,
         download_total: 0,
@@ -6668,7 +7098,10 @@ fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMet
         host_snapshot_error: Some("Host Clash API 尚未返回连接快照".into()),
         guest_snapshot_valid: !session.guest_required,
         guest_snapshot_error: session.guest_error.clone(),
-        system_snapshot_valid: false,
+        // Activity/metrics only expose connections reported by SongsterX's
+        // Host sing-box or Gateway guest. macOS lsof snapshots are not merged
+        // here because they also contain applications that bypass SongsterX.
+        system_snapshot_valid: true,
         system_snapshot_error: None,
     };
 
@@ -6714,23 +7147,15 @@ fn fetch_metrics(app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMet
         }
     }
 
-    // sing-box 的 Clash API 只能看到进入 sing-box 的连接。macOS 的 lsof
-    // 快照补充记录绕过代理的已建立 TCP/已连接 UDP 元数据，并明确标记为
-    // system，避免误认为它们经过了 sing-box。不会读取数据包内容。采样
-    // 在独立线程完成，这里只读取最近一次快照，不阻塞 Clash API。
-    if let Ok(sample) = app.state::<RuntimeState>().system_connections.lock() {
-        metrics.connections.extend(sample.connections.clone());
-        metrics.system_snapshot_valid = sample.valid;
-        metrics.system_snapshot_error = sample.error.clone();
-    }
     metrics.active_connections = metrics.connections.len();
 
     Some(metrics)
 }
 
+#[allow(dead_code)]
 fn managed_system_endpoints(
     settings: Option<&RuntimeSettings>,
-    module_proxy_active: bool,
+    module_proxy_port: Option<u16>,
 ) -> Vec<ManagedSystemEndpoint> {
     let mut endpoints = settings
         .filter(|value| !value.listen.trim().is_empty())
@@ -6749,13 +7174,13 @@ fn managed_system_endpoints(
         })
         .into_iter()
         .collect::<Vec<_>>();
-    if module_proxy_active {
+    if let Some(module_proxy_port) = module_proxy_port {
         if let Some(settings) = settings {
             let host = module_proxy_host(settings);
             endpoints.push(ManagedSystemEndpoint {
                 family: managed_address_family(&host),
                 host,
-                port: MODULE_PROXY_PORT,
+                port: module_proxy_port,
                 wildcard_host: false,
             });
         }
@@ -6763,17 +7188,12 @@ fn managed_system_endpoints(
     endpoints
 }
 
-fn metrics_session_for_runtime(
-    app: &AppHandle,
-    settings: &RuntimeSettings,
-    managed_endpoints: Vec<ManagedSystemEndpoint>,
-) -> MetricsSession {
+fn metrics_session_for_runtime(app: &AppHandle, settings: &RuntimeSettings) -> MetricsSession {
     if settings.mode != "gateway" {
         return MetricsSession {
             guest_endpoint: None,
             guest_required: false,
             guest_error: None,
-            managed_endpoints,
         };
     }
 
@@ -6782,13 +7202,11 @@ fn metrics_session_for_runtime(
             guest_endpoint: Some(endpoint),
             guest_required: true,
             guest_error: None,
-            managed_endpoints,
         },
         Err(error) => MetricsSession {
             guest_endpoint: None,
             guest_required: true,
             guest_error: Some(error),
-            managed_endpoints,
         },
     }
 }
@@ -7036,7 +7454,6 @@ struct MetricsSession {
     guest_endpoint: Option<guest_agent::GuestAgentEndpoint>,
     guest_required: bool,
     guest_error: Option<String>,
-    managed_endpoints: Vec<ManagedSystemEndpoint>,
 }
 
 fn normalize_endpoint_host(value: &str) -> String {
@@ -7088,6 +7505,7 @@ fn is_managed_network_process(process: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn local_interface_addresses() -> HashSet<String> {
     let mut addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
     let mut ifaddrs = ptr::null_mut();
@@ -7125,6 +7543,7 @@ fn local_interface_addresses() -> HashSet<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn local_interface_addresses() -> HashSet<String> {
     HashSet::from(["127.0.0.1".into(), "::1".into()])
 }
@@ -7225,6 +7644,7 @@ fn parse_lsof_machine_output(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> SystemConnectionSample {
     let (timestamp, _) = now_timestamp();
     let local_addresses = local_interface_addresses();
@@ -7278,6 +7698,7 @@ fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> Syst
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn fetch_system_connections(
     _managed_endpoints: &[ManagedSystemEndpoint],
 ) -> SystemConnectionSample {
@@ -7323,6 +7744,7 @@ fn assign_system_connection_instances(
     sample
 }
 
+#[allow(dead_code)]
 fn spawn_system_connection_sampler(
     app: AppHandle,
     generation: Arc<AtomicU64>,
@@ -7358,12 +7780,6 @@ fn spawn_runtime_observers(
     expected: u64,
     session: MetricsSession,
 ) {
-    spawn_system_connection_sampler(
-        app.clone(),
-        Arc::clone(&generation),
-        expected,
-        session.managed_endpoints.clone(),
-    );
     spawn_metrics_poller(app, generation, expected, session);
 }
 
@@ -7748,6 +8164,78 @@ fn reload_songsterx_config(
 #[tauri::command]
 fn get_modules(app: AppHandle) -> Result<Vec<ModuleInfo>, String> {
     load_modules(&app)
+}
+
+#[tauri::command]
+fn get_mitm_certificate_info(app: AppHandle) -> Result<MitmCertificateInfo, String> {
+    match mitm_certificate_path(&app) {
+        Ok(path) => Ok(MitmCertificateInfo {
+            available: true,
+            path: path.display().to_string(),
+            client_note: "HTTPS MITM 的每台客户端都必须信任此根证书；Gateway 模式下本机安装不会替 LAN 客户端安装。".into(),
+        }),
+        Err(_) => Ok(MitmCertificateInfo {
+            available: false,
+            path: String::new(),
+            client_note: "启动一次包含 MITM 主机的模块后，SongsterX 才会生成根证书。".into(),
+        }),
+    }
+}
+
+#[tauri::command]
+fn open_mitm_certificate(app: AppHandle) -> Result<(), String> {
+    let path = mitm_certificate_path(&app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("/usr/bin/open")
+            .arg(&path)
+            .status()
+            .map_err(|error| format!("无法打开 MITM 根证书：{error}"))?;
+        if !status.success() {
+            return Err(format!("打开 MITM 根证书失败，状态码：{status}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("当前平台暂不支持从 SongsterX 打开证书安装器；请手工分发 MITM 根证书。".into())
+    }
+}
+
+#[tauri::command]
+fn install_mitm_certificate(app: AppHandle) -> Result<(), String> {
+    let path = mitm_certificate_path(&app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "无法定位当前用户 HOME 目录".to_string())?;
+        let keychain = home.join("Library/Keychains/login.keychain-db");
+        if !keychain.is_file() {
+            return Err(format!("当前用户登录钥匙串不存在：{}", keychain.display()));
+        }
+        let output = Command::new("/usr/bin/security")
+            .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+            .arg(&keychain)
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("无法调用 macOS 证书工具：{error}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if detail.is_empty() {
+                format!("安装 MITM 根证书失败，状态码：{}", output.status)
+            } else {
+                format!("安装 MITM 根证书失败：{detail}")
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("当前平台暂不支持自动安装 MITM 根证书；请手工导入并信任证书。".into())
+    }
 }
 
 #[tauri::command]
@@ -8302,6 +8790,9 @@ pub fn run() {
             generate_gateway_guest_config,
             sync_gateway_guest_runtime_config,
             upgrade_gateway_sing_box,
+            get_mitm_certificate_info,
+            open_mitm_certificate,
+            install_mitm_certificate,
             start_mix_direct,
             stop_runtime,
             get_app_info,
@@ -9012,8 +9503,64 @@ gateway-guest-host-selector = \"\"\n",
             gateway_host_ip: "192.168.250.1".into(),
             ..RuntimeSettings::default()
         };
-        assert_eq!(module_proxy_endpoint(&settings), "192.168.250.1:8080");
+        assert_eq!(module_proxy_endpoint(&settings, 8080), "192.168.250.1:8080");
         assert_eq!(module_proxy_host(&RuntimeSettings::default()), "127.0.0.1");
+    }
+
+    #[test]
+    fn module_proxy_plan_port_overrides_default_without_changing_host() {
+        let settings = RuntimeSettings::default();
+        let plan = ModuleRuntimePlan {
+            proxy_port: Some(18080),
+            ..ModuleRuntimePlan::default()
+        };
+        assert_eq!(module_proxy_port(&plan), 18080);
+        assert_eq!(
+            module_proxy_endpoint(&settings, module_proxy_port(&plan)),
+            "127.0.0.1:18080"
+        );
+    }
+
+    #[test]
+    fn gateway_module_proxy_port_probe_does_not_require_vmnet_address_yet() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_host_ip: "192.168.250.1".into(),
+            ..RuntimeSettings::default()
+        };
+        assert_eq!(module_proxy_probe_host(&settings), "0.0.0.0");
+        assert_eq!(
+            module_proxy_probe_host(&RuntimeSettings::default()),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn module_proxy_port_probe_detects_existing_listener_on_configured_host() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let port = occupied
+            .local_addr()
+            .expect("read test listener address")
+            .port();
+        let error = bind_module_proxy_listener(&RuntimeSettings::default(), port)
+            .expect_err("occupied configured host port must be rejected");
+        assert!(error.contains("127.0.0.1"));
+        assert!(error.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn gateway_module_proxy_port_probe_falls_back_when_host_only_address_is_not_ready() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_host_ip: "203.0.113.1".into(),
+            ..RuntimeSettings::default()
+        };
+        let listener = bind_module_proxy_listener(&settings, 0)
+            .expect("wildcard probe should work before vmnet host-only address exists");
+        assert_eq!(
+            listener.local_addr().expect("read wildcard address").ip(),
+            "0.0.0.0".parse::<IpAddr>().expect("parse wildcard address")
+        );
     }
 
     #[test]

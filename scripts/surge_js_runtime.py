@@ -19,7 +19,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-import quickjs
+try:
+    import quickjs
+except ModuleNotFoundError:  # Alpine guest currently ships static MITM support first.
+    quickjs = None
 
 
 _PLACEHOLDER = re.compile(r"\{\{\{([^{}]+)\}\}\}")
@@ -150,7 +153,7 @@ def _asset_map(module_path: Path) -> dict[str, Path]:
     return {}
 
 
-def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Path], module_id: str) -> dict[str, Any] | None:
+def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Any], module_id: str) -> dict[str, Any] | None:
     match = re.match(r"^(.*?)\s*=\s*(?=type=)", line)
     if not match:
         return None
@@ -164,8 +167,10 @@ def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Pa
         if key in _OPTION_KEYS:
             options[key] = _unquote(value)
     source = options.get("script-path", "")
-    local_path = assets.get(source)
-    if not local_path or not local_path.is_file():
+    asset = assets.get(source)
+    local_path = asset if isinstance(asset, Path) else None
+    source_content = asset.get("content") if isinstance(asset, dict) else None
+    if not source_content and (not local_path or not local_path.is_file()):
         return {
             "module": module_id,
             "name": name,
@@ -185,7 +190,8 @@ def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Pa
         "engine": options.get("engine", "jsc"),
         "argument": _substitute(options.get("argument", ""), defaults),
         "source": source,
-        "localPath": str(local_path),
+        "localPath": str(local_path) if local_path else "",
+        "sourceContent": source_content or "",
     }
 
 
@@ -195,19 +201,36 @@ def parse_module_files(module_files: list[dict[str, Any]]) -> tuple[list[dict[st
     for item in module_files:
         module_id = str(item.get("id", ""))
         path_value = item.get("path")
-        if not module_id or not isinstance(path_value, str):
+        if not module_id:
             continue
-        path = Path(path_value)
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
+        path = Path(path_value) if isinstance(path_value, str) else Path(".")
+        content = item.get("content")
+        if isinstance(content, str):
+            lines = content.splitlines()
+        else:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
         defaults: dict[str, str] = {}
         overrides = item.get("arguments", {})
         if isinstance(overrides, dict):
             defaults.update({str(key): str(value) for key, value in overrides.items()})
         section = ""
-        assets = _asset_map(path)
+        assets: dict[str, Any] = _asset_map(path)
+        embedded_assets = item.get("assets", [])
+        if isinstance(embedded_assets, list):
+            for asset in embedded_assets:
+                if not isinstance(asset, dict) or not isinstance(asset.get("source"), str):
+                    continue
+                raw = asset.get("contentBase64")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    decoded = base64.b64decode(raw, validate=True)
+                    assets[asset["source"]] = {"content": decoded.decode("utf-8")}
+                except (ValueError, UnicodeDecodeError):
+                    continue
         for raw in lines:
             line = raw.strip()
             if re.match(r"#!arguments(?:\s|=)", line, re.IGNORECASE):
@@ -345,10 +368,15 @@ class SurgeScriptRuntime:
         response: dict[str, Any] | None,
     ) -> dict[str, Any]:
         source_path = Path(str(script.get("localPath", "")))
-        try:
-            source = source_path.read_text(encoding="utf-8")
-        except OSError as error:
-            self.logger(f"脚本读取失败 {source_path}: {error}")
+        source = script.get("sourceContent")
+        if not isinstance(source, str) or not source:
+            try:
+                source = source_path.read_text(encoding="utf-8")
+            except OSError as error:
+                self.logger(f"脚本读取失败 {source_path}: {error}")
+                return {}
+        if quickjs is None:
+            self.logger("当前 guest 未提供 Python QuickJS，跳过脚本，仅执行静态/HTTP MITM 规则")
             return {}
         result: dict[str, Any] = {}
         context = quickjs.Context()

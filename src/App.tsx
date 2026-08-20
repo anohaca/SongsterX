@@ -271,6 +271,12 @@ type RuntimeConnectionSnapshot = {
   systemSocketKey?: string;
 };
 
+type QueuedRuntimeUpdate = {
+  log: RuntimeLog;
+  traceEvent: ConnectionEvent | null;
+  connection: ConnectionInfo | null;
+};
+
 function parseConnectionEndpoint(value: string): { host: string; port: string } {
   const match = value.match(/^(.*?)(?::(\d+))?$/);
   return { host: match?.[1] ?? value, port: match?.[2] ?? "" };
@@ -748,6 +754,12 @@ type ModuleInfo = {
   arguments: ModuleArgumentInfo[];
 };
 
+type MitmCertificateInfo = {
+  available: boolean;
+  path: string;
+  clientNote: string;
+};
+
 type ConfigDocument = {
   id: string;
   title: string;
@@ -790,6 +802,7 @@ type RuntimeSettings = {
   gatewayClients: string;
   gatewayClientPolicy: "all" | "allowlist";
   gatewayPolicyMode: "shared" | "separate";
+  mitmCaDir: string;
   logLevel: "trace" | "debug" | "info" | "warn" | "error";
 };
 
@@ -852,6 +865,7 @@ const defaultSettings: RuntimeSettings = {
   gatewayClients: "",
   gatewayClientPolicy: "all",
   gatewayPolicyMode: "shared",
+  mitmCaDir: "",
   logLevel: "info",
 };
 
@@ -904,6 +918,8 @@ function App() {
   const [proxyConfigTarget, setProxyConfigTarget] = useState<ProxyConfigTarget>("host");
   const [proxies, setProxies] = useState<ProxyInfo[]>([]);
   const [modules, setModules] = useState<ModuleInfo[]>([]);
+  const [mitmCertificate, setMitmCertificate] = useState<MitmCertificateInfo | null>(null);
+  const [mitmCertificateMessage, setMitmCertificateMessage] = useState("");
   const [configDocuments, setConfigDocuments] = useState<ConfigDocument[]>([]);
   const [configError, setConfigError] = useState("");
   const [testingProxy, setTestingProxy] = useState(false);
@@ -913,6 +929,8 @@ function App() {
   const [appearanceMode, setAppearanceMode] = useState<AppearanceMode>(loadAppearanceMode);
   const runtimeOperationInFlight = useRef(false);
   const runtimeIntentGeneration = useRef(0);
+  const runtimeEventQueue = useRef<QueuedRuntimeUpdate[]>([]);
+  const runtimeFlushTimer = useRef<number | null>(null);
   const [systemDark, setSystemDark] = useState(true);
   const prefersDark = appearanceMode === "dark" || (appearanceMode === "system" && systemDark);
 
@@ -956,23 +974,53 @@ function App() {
     root.classList.toggle("theme-light", !prefersDark);
   }, [prefersDark]);
 
+  function flushRuntimeEvents() {
+    runtimeFlushTimer.current = null;
+    const updates = runtimeEventQueue.current.splice(0);
+    if (updates.length === 0) return;
+
+    // sing-box can emit several lines for one request. Apply one state update
+    // per batch instead of re-rendering the whole application for every line.
+    setLogs((current) => updates.reduce((next, update) => appendRuntimeLog(next, update.log), current));
+
+    if (updates.some((update) => update.traceEvent)) {
+      setConnectionEvents((current) => updates.reduce(
+        (next, update) => update.traceEvent ? appendConnectionEvent(next, update.traceEvent) : next,
+        current,
+      ));
+    }
+
+    if (updates.some((update) => update.traceEvent || update.connection)) {
+      setConnectionHistory((current) => updates.reduce((next, update) => {
+        let merged = next;
+        const traceEvent = update.traceEvent;
+        if (traceEvent?.kind === "close" && traceEvent.requestId) {
+          merged = merged.map((connection) => connection.logId === traceEvent.requestId
+            ? completeConnection(connection, traceEvent.timestampUs ?? Date.now() * 1_000)
+            : connection);
+        }
+        return update.connection ? mergeConnectionInfo(merged, update.connection) : merged;
+      }, current));
+    }
+  }
+
+  function queueRuntimeEvent(log: RuntimeLog) {
+    runtimeEventQueue.current.push({
+      log,
+      traceEvent: connectionEventFromRuntimeLog(log),
+      connection: connectionFromRuntimeLog(log),
+    });
+    if (runtimeFlushTimer.current === null) {
+      runtimeFlushTimer.current = window.setTimeout(flushRuntimeEvents, 80);
+    }
+  }
+
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let unlistenMetrics: UnlistenFn | undefined;
     void (async () => {
       unlisten = await listen<RuntimeLog>("runtime-log", (event) => {
-        setLogs((current) => appendRuntimeLog(current, event.payload));
-        const traceEvent = connectionEventFromRuntimeLog(event.payload);
-        if (traceEvent) {
-          setConnectionEvents((current) => appendConnectionEvent(current, traceEvent));
-          if (traceEvent.kind === "close" && traceEvent.requestId) {
-            setConnectionHistory((current) => current.map((connection) => connection.logId === traceEvent.requestId
-              ? completeConnection(connection, traceEvent.timestampUs ?? Date.now() * 1_000)
-              : connection));
-          }
-        }
-        const connection = connectionFromRuntimeLog(event.payload);
-        if (connection) setConnectionHistory((current) => mergeConnectionInfo(current, connection));
+        queueRuntimeEvent(event.payload);
       });
       unlistenMetrics = await listen<RuntimeMetrics>("runtime-metrics", (event) => {
         setMetrics(event.payload);
@@ -996,11 +1044,17 @@ function App() {
       await refreshSettings();
       await refreshProxyConfig();
       await refreshModules();
+      await refreshMitmCertificate();
       await refreshConfigDocuments();
     })();
     return () => {
       unlisten?.();
       unlistenMetrics?.();
+      if (runtimeFlushTimer.current !== null) {
+        window.clearTimeout(runtimeFlushTimer.current);
+        runtimeFlushTimer.current = null;
+      }
+      runtimeEventQueue.current = [];
     };
   }, []);
 
@@ -1061,6 +1115,34 @@ function App() {
     try {
       setModules(await invoke<ModuleInfo[]>("get_modules"));
     } catch (error) {
+      addLocalLog("error", String(error));
+    }
+  }
+
+  async function refreshMitmCertificate() {
+    try {
+      setMitmCertificate(await invoke<MitmCertificateInfo>("get_mitm_certificate_info"));
+    } catch (error) {
+      addLocalLog("error", String(error));
+    }
+  }
+
+  async function openMitmCertificate() {
+    try {
+      await invoke("open_mitm_certificate");
+      setMitmCertificateMessage("已打开证书文件，请导入并信任它。");
+    } catch (error) {
+      setMitmCertificateMessage(String(error));
+      addLocalLog("error", String(error));
+    }
+  }
+
+  async function installMitmCertificate() {
+    try {
+      await invoke("install_mitm_certificate");
+      setMitmCertificateMessage("已安装到当前 macOS 登录钥匙串；正在运行的客户端可能需要重启。");
+    } catch (error) {
+      setMitmCertificateMessage(String(error));
       addLocalLog("error", String(error));
     }
   }
@@ -1300,21 +1382,25 @@ function App() {
     }
 
     let cancelled = false;
+    let inFlight = false;
     const refreshGuestStatus = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         const next = await invoke<GuestAgentStatus>("get_gateway_guest_status");
         if (!cancelled) {
           setGuestStatus(next);
           setGuestStatusError("");
-          void refreshStatus();
         }
       } catch (error) {
         if (!cancelled) setGuestStatusError(String(error));
+      } finally {
+        inFlight = false;
       }
     };
 
     void refreshGuestStatus();
-    const timer = window.setInterval(() => void refreshGuestStatus(), 2000);
+    const timer = window.setInterval(() => void refreshGuestStatus(), 3000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1360,7 +1446,7 @@ function App() {
             {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} hostSnapshotValid={metrics.hostSnapshotValid} hostSnapshotError={metrics.hostSnapshotError} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
             {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
             {view === "rules" && <RulesPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
-            {view === "modules" && <ModulesPage modules={modules} onToggleModule={toggleModule} onSetModuleArgument={setModuleArgument} onImportModule={importModules} onImportModuleUrl={importModuleUrl} />}
+            {view === "modules" && <ModulesPage modules={modules} mitmCertificate={mitmCertificate} mitmCertificateMessage={mitmCertificateMessage} onOpenMitmCertificate={openMitmCertificate} onInstallMitmCertificate={installMitmCertificate} onToggleModule={toggleModule} onSetModuleArgument={setModuleArgument} onImportModule={importModules} onImportModuleUrl={importModuleUrl} />}
             {view === "config" && <div className="page-content page-stack"><ConfigViewer documents={configDocuments} error={configError} onRefresh={refreshConfigDocuments} onReload={reloadConfigDocuments} /></div>}
             {view === "settings" && <SettingsPage settings={settings} settingsDirty={settingsDirty} running={isActive} runtimeBusy={busy} busy={settingsBusy} message={settingsMessage} appearanceMode={appearanceMode} onAppearanceChange={setAppearanceMode} onChange={setSettings} onSave={() => void saveSettings()} onReset={() => void resetSettings()} onStop={() => void toggleRuntime()} />}
           </main>
@@ -1486,7 +1572,7 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
       </Card>
 
       <section className="overview-live-section">
-        <SectionHeading title="实时连接" description="当前仍在传输的连接；已完成请求请前往活动查看。" action={<Badge appearance="outline" color={running ? "success" : "subtle"}>{metrics.activeConnections} 个</Badge>} />
+        <SectionHeading title="实时连接" description="当前仍在传输且已经进入 SongsterX 的连接；已完成请求请前往活动查看。" action={<Badge appearance="outline" color={running ? "success" : "subtle"}>{metrics.activeConnections} 个</Badge>} />
         <Card className="panel overview-live-panel"><LiveConnections metrics={metrics} running={running} /></Card>
       </section>
     </div>
@@ -1712,7 +1798,7 @@ function ActivityPage({ connections, connectionEvents, running, logs, hostSnapsh
       <Tab value="logs">运行日志</Tab>
     </TabList>
     {activityTab === "requests" && <Card className="panel activity-connections-panel">
-      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !hostSnapshotValid && <Text className="activity-warning-note" size={200}>Host 连接观察暂时不可用，已保留上一批记录{hostSnapshotError ? `：${hostSnapshotError}` : ""}。</Text>}{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}{running && !systemSnapshotValid && <Text className="activity-warning-note" size={200}>系统连接观察暂时不可用，已保留上一批记录{systemSnapshotError ? `：${systemSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!hostSnapshotValid || !guestSnapshotValid || !systemSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !hostSnapshotValid ? "Host 观察不可用" : running && !guestSnapshotValid ? "Guest 观察不可用" : running && !systemSnapshotValid ? "系统观察不可用" : `${connections.length} 条记录`}</Badge></div>
+      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>仅显示已经进入 Host sing-box 或 Gateway guest 的连接：何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !hostSnapshotValid && <Text className="activity-warning-note" size={200}>Host 连接观察暂时不可用，已保留上一批记录{hostSnapshotError ? `：${hostSnapshotError}` : ""}。</Text>}{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!hostSnapshotValid || !guestSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !hostSnapshotValid ? "Host 观察不可用" : running && !guestSnapshotValid ? "Guest 观察不可用" : `${connections.length} 条记录`}</Badge></div>
       <div className="activity-toolbar"><Input contentBefore={<SearchRegular />} value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} placeholder="搜索地址、客户端、策略或 ID" /></div>
       {filteredConnections.length === 0 ? <EmptyState title={running ? "暂无请求记录" : "暂无请求历史"} description={running ? "让应用通过 Mixed 代理访问网络后，请求会显示在这里。" : "启动代理接入后，请求记录会显示在这里。"} /> : <>
         <div className="activity-table-scroll" tabIndex={0} aria-label="代理请求记录">
@@ -2598,8 +2684,9 @@ function RuleSetEditorDialog({ ruleSet, onChange, onCancel, onConfirm }: { ruleS
   </div>;
 }
 
-function ModulesPage({ modules, onToggleModule, onSetModuleArgument, onImportModule, onImportModuleUrl }: { modules: ModuleInfo[]; onToggleModule: (id: string, enabled: boolean) => void; onSetModuleArgument: (id: string, key: string, value: string) => Promise<void>; onImportModule: (files: File[]) => Promise<void>; onImportModuleUrl: (url: string) => Promise<void> }) {
+function ModulesPage({ modules, mitmCertificate, mitmCertificateMessage, onOpenMitmCertificate, onInstallMitmCertificate, onToggleModule, onSetModuleArgument, onImportModule, onImportModuleUrl }: { modules: ModuleInfo[]; mitmCertificate: MitmCertificateInfo | null; mitmCertificateMessage: string; onOpenMitmCertificate: () => Promise<void>; onInstallMitmCertificate: () => Promise<void>; onToggleModule: (id: string, enabled: boolean) => void; onSetModuleArgument: (id: string, key: string, value: string) => Promise<void>; onImportModule: (files: File[]) => Promise<void>; onImportModuleUrl: (url: string) => Promise<void> }) {
   const verifiedCount = modules.filter((module) => module.verified).length;
+  const mitmModules = modules.filter((module) => module.enabled && module.mitmHostnames.length > 0);
   const [editingModule, setEditingModule] = useState<ModuleInfo | null>(null);
   const [showUrlImport, setShowUrlImport] = useState(false);
   const moduleInputRef = useRef<HTMLInputElement>(null);
@@ -2610,6 +2697,10 @@ function ModulesPage({ modules, onToggleModule, onSetModuleArgument, onImportMod
         <div className="module-panel-header-actions"><Badge appearance="outline" color={verifiedCount === modules.length && modules.length > 0 ? "success" : "subtle"}>{verifiedCount}/{modules.length} 已校验</Badge><Button appearance="secondary" onClick={() => setShowUrlImport(true)}>从 URL 导入</Button><Button appearance="primary" onClick={() => moduleInputRef.current?.click()}>导入文件</Button><input ref={moduleInputRef} className="module-file-input" type="file" multiple accept=".sgmodule,.module,.js,.json,.list,.txt" onChange={(event) => { const files = Array.from(event.target.files ?? []); event.target.value = ""; if (files.length > 0) void onImportModule(files).catch(() => undefined); }} /></div>
       </div>
       <div className="module-safety-note"><Text size={200}>支持导入 .sgmodule、脚本和规则集。模块会先提取元数据、脚本引用、MITM 主机、静态规则及参数，再通过完整性校验后参与运行计划；不会自动接管流量。</Text></div>
+      {mitmModules.length > 0 && <div className="module-certificate-note">
+        <div className="module-certificate-copy"><Text weight="semibold">HTTPS MITM 证书</Text><Text size={200}>已启用 {mitmModules.length} 个需要 MITM 的模块。未信任 SongsterX 根证书时，匹配域名会出现 TLS 连接失败；{mitmCertificate?.clientNote || "Gateway 模式还要在每台 LAN 客户端安装。"}</Text>{mitmCertificate?.available && <Text className="module-list-meta" size={200}>{mitmCertificate.path}</Text>}{mitmCertificateMessage && <Text className="module-certificate-message" size={200}>{mitmCertificateMessage}</Text>}</div>
+        <div className="module-list-actions"><Button appearance="secondary" disabled={!mitmCertificate?.available} onClick={() => void onOpenMitmCertificate()}>打开证书</Button><Button appearance="primary" disabled={!mitmCertificate?.available} onClick={() => void onInstallMitmCertificate()}>安装到本机</Button></div>
+      </div>}
       {modules.length === 0 ? <EmptyState title="还没有导入模块" description="点击右上角“导入文件”，选择 .sgmodule 文件；依赖的脚本或规则集可以一起多选。" /> : <div className="module-list">{modules.map((module) => <div className="module-list-row" key={module.id}>
         <div className="module-list-main"><div className="module-list-title"><Text weight="semibold">{module.name}</Text><Badge appearance="outline" color={module.verified ? "success" : "danger"}>{module.verified ? "完整性通过" : "校验失败"}</Badge></div>{module.description && <Text className="module-list-description" size={200}>{module.description}</Text>}<Text className="module-list-meta" size={200}>{module.id} · v{module.version || "未知"} · {module.sections.join(" · ")}</Text><Text className="module-list-meta" size={200}>{module.ruleCount} 条静态规则 · {module.scriptCount} 个脚本 · {module.mitmHostnames.length} 个 MITM 主机 · {module.runtimeStatus}</Text>{module.warning && <Text className="module-list-warning" size={200}>{module.warning}</Text>}</div><div className="module-list-actions"><Button appearance="subtle" disabled={!module.verified} onClick={() => setEditingModule(module)}>{module.arguments.length > 0 ? "配置" : "详情"}</Button><Button appearance={module.enabled ? "primary" : "secondary"} disabled={!module.verified} onClick={() => onToggleModule(module.id, !module.enabled)}>{module.enabled ? "已启用" : "启用模块"}</Button></div>
       </div>)}</div>}
@@ -2678,6 +2769,9 @@ function EntrySettingsPanel({ settings, settingsDirty, running, runtimeBusy, bus
       <SettingSection title="DNS" description={gatewayMode ? "局域网客户端使用 FakeIP；手工把 198.18.0.2 设为 DNS，sing-box 负责恢复真实域名。" : "不劫持系统 DNS，只影响 sing-box 运行时配置。"}>
         <SettingRow label="解析模式" description={settings.dnsMode === "fakeip" ? "A/AAAA 查询返回 198.18.0.0/15 或 fc00::/18 的映射地址；网关连接会先恢复真实域名。" : "默认跟随系统 DNS。"} control={<Select disabled={disabled} value={settings.dnsMode} onChange={(event) => update({ dnsMode: event.target.value as RuntimeSettings["dnsMode"] })}><option value="system">系统 DNS</option><option value="custom">自定义 UDP DNS</option>{gatewayMode && <option value="fakeip">FakeIP（网关）</option>}</Select>} />
         {settings.dnsMode === "custom" && <SettingRow label="DNS 服务器" description="填写 IPv4、IPv6 或 DNS 地址。" control={<Input disabled={disabled} value={settings.dnsServer} onChange={(event) => update({ dnsServer: event.target.value })} />} />}
+      </SettingSection>
+      <SettingSection title="模块 MITM" description="默认使用 SongsterX 自己生成的 CA；如果已有 mitmproxy CA，可直接复用而不让客户端重新安装证书。">
+        <SettingRow label="已有 MITM CA 目录" description="填写包含 mitmproxy-ca.pem 的目录。该 PEM 必须同时包含 CA 证书和私钥；只有 .cer/.crt 公钥证书不能用于 MITM。留空使用 SongsterX 默认目录。" control={<Input disabled={disabled} value={settings.mitmCaDir} onChange={(event) => update({ mitmCaDir: event.target.value })} placeholder="例如 /Users/你的用户名/.mitmproxy" />} />
       </SettingSection>
       <SettingSection title="运行时" description="sing-box 进程和日志行为。">
         <SettingRow label="sing-box 可执行文件" description="留空时从当前 PATH 查找。" control={<Input disabled={disabled} value={settings.singBoxPath} onChange={(event) => update({ singBoxPath: event.target.value })} placeholder="留空：使用 PATH" />} />

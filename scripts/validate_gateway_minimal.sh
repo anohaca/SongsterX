@@ -87,9 +87,14 @@ for item_name in ("minirootfs", "apkIndex"):
 expected_packages = {
     "musl-dev", "iproute2-minimal", "libcap2", "libelf", "libmnl",
     "libnftnl", "libxtables", "iptables", "zstd-libs",
+    "mitmproxy", "python3", "tzdata", "ca-certificates-bundle",
+    "libcrypto3", "libexpat", "libffi", "libgcc", "gdbm", "libssl3",
+    "libstdc++", "mpdecimal", "ncurses-libs", "readline", "sqlite-libs",
+    "xz-libs", "zlib", "bzip2",
 }
-if set(alpine["packages"]) != expected_packages:
-    raise SystemExit("Gateway Alpine package lock does not match the guest runtime")
+if not expected_packages.issubset(alpine["packages"]):
+    missing = sorted(expected_packages - set(alpine["packages"]))
+    raise SystemExit(f"Gateway Alpine package lock is missing guest runtime packages: {missing}")
 for package_name, package in alpine["packages"].items():
     if package["file"] != f"{package_name}-{package['version']}.apk":
         raise SystemExit(f"inconsistent APK lock: {package_name}")

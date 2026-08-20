@@ -58,6 +58,16 @@ pub(crate) struct GuestAgentStatus {
     pub config_sha256: Option<String>,
     #[serde(default)]
     pub packet_stats: Option<GuestPacketStats>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub mitm_healthy: bool,
+    #[serde(default)]
+    pub mitm_ready: bool,
+    #[serde(default)]
+    pub mitm_pid: Option<u32>,
+    #[serde(default)]
+    pub module_plan_sha256: Option<String>,
 }
 
 pub(crate) fn status_is_ready(status: &GuestAgentStatus) -> bool {
@@ -90,6 +100,11 @@ pub(crate) struct GuestConfigResult {
     pub packet_stats: Option<GuestPacketStats>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuestModulePlanResult {
+    pub certificate_pem: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArtifactMetadata {
     version: String,
@@ -100,6 +115,12 @@ struct ArtifactMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigMetadata {
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModulePlanMetadata {
     size: u64,
     sha256: String,
 }
@@ -123,6 +144,8 @@ struct AgentResponse {
     delay: Option<u64>,
     #[serde(default, rename = "packetStats")]
     packet_stats: Option<GuestPacketStats>,
+    #[serde(default, rename = "mitmCertificatePem")]
+    mitm_certificate_pem: Option<String>,
 }
 
 impl GuestAgentEndpoint {
@@ -254,6 +277,62 @@ pub(crate) fn sync_config_with_cancellation(
                     format!("guest sing-box 配置激活请求失败：{error}"),
                 );
             }
+        }
+    }
+}
+
+pub(crate) fn sync_module_plan_with_cancellation(
+    endpoint: &GuestAgentEndpoint,
+    plan_path: &Path,
+    timeout: Duration,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<GuestModulePlanResult, String> {
+    if cancellation() {
+        return Err("启动已取消".into());
+    }
+    let deadline = Instant::now() + timeout;
+    let metadata = module_plan_metadata(plan_path)?;
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
+        match stage_module_plan_and_upload(
+            endpoint,
+            plan_path,
+            &metadata,
+            remaining_timeout(deadline)?,
+            cancellation,
+        ) {
+            Ok(()) => break,
+            Err(error) if is_retryable_io_timeout(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
+        let mut stream =
+            endpoint.connect_cancellable(remaining_timeout(deadline)?, cancellation)?;
+        match request(
+            endpoint,
+            &mut stream,
+            &activate_module_plan_request(&metadata),
+        ) {
+            Ok(response) if response.ok && response.state == "active" => {
+                return Ok(GuestModulePlanResult {
+                    certificate_pem: response.mitm_certificate_pem,
+                });
+            }
+            Ok(response) => {
+                return Err(if response.message.is_empty() {
+                    "guest Module Engine 配置激活失败".into()
+                } else {
+                    format!("guest Module Engine 配置激活失败：{}", response.message)
+                });
+            }
+            Err(error) if is_retryable_io_timeout(&error) => continue,
+            Err(error) => return Err(format!("guest Module Engine 配置激活请求失败：{error}")),
         }
     }
 }
@@ -574,6 +653,41 @@ fn stage_config_and_upload(
     }
 }
 
+fn stage_module_plan_and_upload(
+    endpoint: &GuestAgentEndpoint,
+    plan_path: &Path,
+    metadata: &ModulePlanMetadata,
+    timeout: Duration,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let mut stream = endpoint.connect_cancellable(timeout, cancellation)?;
+    let response = request(endpoint, &mut stream, &stage_module_plan_request(metadata))?;
+    if !response.ok || response.state != "ready_for_upload" {
+        return Err(agent_error("stage_module_plan", &response));
+    }
+    upload_file_with_cancellation(
+        &mut stream,
+        plan_path,
+        metadata.size,
+        "模块运行计划",
+        cancellation,
+    )?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新模块运行计划上传失败：{error}"))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|error| format!("复制 guest agent 模块运行计划连接失败：{error}"))?,
+    );
+    let response = read_response(&mut reader)?;
+    if response.ok && response.state == "staged" {
+        Ok(())
+    } else {
+        Err(agent_error("upload_module_plan", &response))
+    }
+}
+
 fn upload_file_with_cancellation(
     stream: &mut TcpStream,
     path: &Path,
@@ -656,6 +770,14 @@ fn stage_config_request(metadata: &ConfigMetadata) -> Value {
     })
 }
 
+fn stage_module_plan_request(metadata: &ModulePlanMetadata) -> Value {
+    json!({
+        "method": "stage_module_plan",
+        "modulePlanSize": metadata.size,
+        "modulePlanSha256": metadata.sha256,
+    })
+}
+
 fn activate_request(metadata: &ArtifactMetadata) -> Value {
     json!({
         "method": "activate_upgrade",
@@ -669,6 +791,14 @@ fn activate_config_request(metadata: &ConfigMetadata) -> Value {
         "method": "activate_config",
         "configSize": metadata.size,
         "configSha256": metadata.sha256,
+    })
+}
+
+fn activate_module_plan_request(metadata: &ModulePlanMetadata) -> Value {
+    json!({
+        "method": "activate_module_plan",
+        "modulePlanSize": metadata.size,
+        "modulePlanSha256": metadata.sha256,
     })
 }
 
@@ -746,6 +876,25 @@ fn artifact_metadata(
         architecture: architecture.trim().into(),
         size,
         sha256,
+    })
+}
+
+fn module_plan_metadata(path: &Path) -> Result<ModulePlanMetadata, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("无法打开模块运行计划 {}：{error}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("无法读取模块运行计划大小：{error}"))?
+        .len();
+    if size == 0 {
+        return Err("模块运行计划不能为空".into());
+    }
+    if size > 16 * 1024 * 1024 {
+        return Err("模块运行计划不能超过 16 MiB".into());
+    }
+    Ok(ModulePlanMetadata {
+        size,
+        sha256: sha256_file(file)?,
     })
 }
 
@@ -844,6 +993,11 @@ mod tests {
             last_error: None,
             config_sha256: None,
             packet_stats: None,
+            pid: None,
+            mitm_healthy: false,
+            mitm_ready: false,
+            mitm_pid: None,
+            module_plan_sha256: None,
         };
         assert!(!status_is_ready(&status));
         status.ready = true;
@@ -868,6 +1022,11 @@ mod tests {
             last_error: Some("sing-box 配置文件不存在".into()),
             config_sha256: None,
             packet_stats: None,
+            pid: None,
+            mitm_healthy: false,
+            mitm_ready: false,
+            mitm_pid: None,
+            module_plan_sha256: None,
         };
         assert!(status_is_bootstrap_ready(&status));
         assert!(!status_is_ready(&status));

@@ -186,9 +186,14 @@ pub(crate) fn build_runtime_plan(
             .map_err(|error| format!("注册 vfkit Gateway runtime 文件失败：{error}"))?;
     }
 
+    // Direct ownership avoids creating two transient per-user launchd jobs on
+    // every Gateway start/stop. vmnet-helper is already an independently
+    // signed executable, and ManagedChild gives it an isolated process group
+    // plus deterministic cleanup. Keep launchd as an explicit compatibility
+    // mode for older helper/macOS combinations that require it.
     let use_launchd = env::var("SONGSTERX_VMNET_LAUNCH_MODE")
-        .map(|value| !value.eq_ignore_ascii_case("direct"))
-        .unwrap_or(true);
+        .map(|value| value.eq_ignore_ascii_case("launchd"))
+        .unwrap_or(false);
     let host_only_command = managed_command_spec(&plan.host_vmnet, "vmnet-host-only");
     let host_only_command = if use_launchd {
         host_only_command.with_launchd_logs(host_only_stdout, host_only_stderr)

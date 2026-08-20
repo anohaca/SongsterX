@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -205,8 +206,14 @@ def _map_local(flow: http.HTTPFlow) -> bool:
             continue
         local_path = rule.get("localPath")
         inline_data = rule.get("inlineData")
+        inline_data_base64 = rule.get("inlineDataBase64")
         try:
-            if isinstance(local_path, str) and local_path:
+            if isinstance(inline_data_base64, str):
+                body = base64.b64decode(inline_data_base64, validate=True)
+                if len(body) > MAX_MAP_BYTES:
+                    _log("跳过过大的内嵌 Map Local 资源")
+                    continue
+            elif isinstance(local_path, str) and local_path:
                 path = Path(local_path)
                 if not path.is_file() or path.stat().st_size > MAX_MAP_BYTES:
                     _log("跳过 Map Local 资源：%s", local_path)

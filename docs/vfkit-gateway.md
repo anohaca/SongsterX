@@ -1,6 +1,6 @@
 # vfkit Gateway 第一阶段
 
-SongsterX 的轻量 Gateway 路线使用 `vfkit + 极简 Linux guest + sing-box + gateway-agent`。
+SongsterX 的轻量 Gateway 路线使用 `vfkit + 极简 Linux guest + sing-box + mitmproxy + gateway-agent`。
 它不依赖 macOS host TUN，也不要求在 host 进程里把 LAN Ethernet 转成平台 TUN
 packet。Linux guest 自己通过 virtio-net 承担 Gateway data plane。
 
@@ -10,19 +10,21 @@ packet。Linux guest 自己通过 virtio-net 承担 Gateway data plane。
 LAN client
   -> virtio-net #1
   -> vmnet-helper bridged(en0)
-  -> Linux guest gateway-agent/sing-box
+  -> Linux guest sing-box
+  -> Linux guest mitmdump（仅命中模块 MITM 规则时）
   -> guest WAN
   -> macOS network
 
 Linux guest
   -> virtio-net #2
   -> vmnet-helper host-only(192.168.250.0/24)
-  -> macOS host-only IP 192.168.250.1:8080
-  -> host mitmdump
+  -> macOS host-only IP 192.168.250.1:38291
+  -> guest-agent 管理/配置通道
 ```
 
-第二张 virtio-net 只服务 host 与 guest 之间的 MITM 和管理通道，不能直接暴露在物理
-LAN 上。Gateway 不提供 DHCP、IPv6 RA/NDP；客户端的网关和 DNS 仍需要显式配置。
+第二张 virtio-net 只服务 host 与 guest 之间的管理通道，不能直接暴露在物理 LAN 上；
+MITM 已经移动到 guest 内部，不再经过主机的 `mitmdump`。Gateway 不提供 DHCP、IPv6
+RA/NDP；客户端的网关和 DNS 仍需要显式配置。
 guest tun 的自动路由会排除 LAN 和 host-only 网段，确保客户端回程以及
 192.168.250.2 上的 guest-agent 管理连接保持直连。
 
@@ -39,6 +41,11 @@ guest tun 的自动路由会排除 LAN 和 host-only 网段，确保客户端回
 - 校验 host-only 地址、CIDR、socket 路径、资源限制和必要文件；
 - 单元测试只生成命令计划，不启动 VM、不请求 root 权限、不下载镜像。
 
+运行时默认由 SongsterX 直接托管两个 `vmnet-helper` 进程，避免每次启动和停止都创建、销毁
+临时 launchd job；如果旧版 macOS 或特定 helper 环境必须使用 launchd，可设置
+`SONGSTERX_VMNET_LAUNCH_MODE=launchd`。应用日志会分别报告 VM 基础运行时就绪耗时和完整
+guest 配置激活耗时，便于区分 vmnet/vfkit 启动慢与 guest sing-box 配置激活慢。
+
 guest initramfs 的网络控制器位于 `guest-runtime/songsterx-gateway-net.sh`。它只配置
 guest 自己拥有的两张 virtio-net、默认路由、IPv4 forwarding 和本次创建的防火墙规则；
 host-only 网卡不会被转发，且不提供 DHCP、IPv6 RA/NDP。`guest-runtime/init` 先等待
@@ -46,6 +53,13 @@ host-only 网卡不会被转发，且不提供 DHCP、IPv6 RA/NDP。`guest-runti
 readiness 文件同时成立。网络控制器会把 `songsterx.dns_server` 原子写入 guest 的
 `/etc/resolv.conf`，完整停止时恢复原文件；网络状态会记录 agent 端口、DNS 和实际创建的
 地址/路由/防火墙对象，清理时不会覆盖或删除非本次启动拥有的状态。
+
+Gateway 启动时，host 侧将当前模块运行计划（模块源码、静态资源、规则和参数）通过
+authenticated guest-agent 通道上传到 guest；guest 内的 `mitmdump` 固定监听
+`127.0.0.1:8080`，guest sing-box 的 `module-mitm` outbound 也只连接这个 loopback
+地址。这样 Gateway 只有一个 guest sing-box 数据面和一个 guest Module Engine，不会再
+启动第二个 host sing-box 或 host mitmdump。已配置的 `mitmproxy-ca.pem` 会随计划安全同步
+到 guest；未配置时由 guest mitmproxy 生成根证书并回传到应用数据目录，设置页仍可打开它。
 
 `src-tauri/src/guest_agent.rs` 定义了独立升级通道。sing-box 不需要随 kernel/initrd 一起
 替换：host 侧按 64 KiB 分块上传版本文件，先发送版本、架构、大小和 SHA-256，guest
@@ -129,8 +143,8 @@ scripts/build_gateway_guest.sh --output "/absolute/path/songsterx-gateway-guest"
 
 脚本按 `config/gateway-guest-inputs.json` 锁定版本、文件名和 SHA-256 下载 Alpine arm64
 `virt` kernel/rootfs，提取 vfkit 要求的未压缩 Linux `Image`，
-加入 virtio-net、tun、netfilter/NAT modules、`iproute2`、iptables、guest-agent 和
-Linux arm64 musl sing-box。编译目录和下载目录都在临时目录，结束时自动清理；输出目录
+加入 virtio-net、tun、netfilter/NAT modules、`iproute2`、iptables、Python、mitmproxy、
+guest-agent 和 Linux arm64 musl sing-box。编译目录和下载目录都在临时目录，结束时自动清理；输出目录
 只保留 kernel、initrd、agent、sing-box、token 和 manifest。
 
 单独运行 guest 构建脚本时，仍可以将设置页的 Linux kernel/initrd 指向输出目录中的
