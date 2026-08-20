@@ -36,3 +36,4 @@ This branch contains the current SongsterX source snapshot for external review.
 - Gateway session 在 endpoint 不可用或查询失败时保持 guestSnapshotValid=false；Mixed session 固定为没有 Guest 数据源，不会把配置漂移误判为有效空快照；
 - 停止失败但仍持有资源时，使用冻结的 MetricsSession 重启 system sampler 和 metrics poller；彻底停止时清除 session；停止 Guest 也优先使用本轮冻结 endpoint。
 - metrics poller 在阻塞采集返回后、发出 `runtime-metrics` 前以及执行 packet-path observer 前重新检查 generation，丢弃停止或重启期间已经失效的旧 session 快照；packet-path observer 同样只使用冻结的 Guest endpoint，不再重新读取可变配置。
+- packet-path observer 在 Guest 状态查询返回后，以及修改 readiness/status 前再次检查 generation，停止或重启期间不再确认旧 session 的 LAN packet path。

@@ -5574,7 +5574,15 @@ fn guest_packet_path_progressed(
         && interface_packet_progressed(before_tun, after_tun)
 }
 
-fn observe_gateway_packet_path(app: &AppHandle, session: &MetricsSession) {
+fn observe_gateway_packet_path(
+    app: &AppHandle,
+    session: &MetricsSession,
+    generation: &AtomicU64,
+    expected: u64,
+) {
+    if generation.load(Ordering::SeqCst) != expected {
+        return;
+    }
     let state = app.state::<RuntimeState>();
     let baseline = match state.gateway_packet_baseline.lock() {
         Ok(baseline) => baseline.clone(),
@@ -5590,6 +5598,9 @@ fn observe_gateway_packet_path(app: &AppHandle, session: &MetricsSession) {
         Ok(status) => status.packet_stats,
         Err(_) => return,
     };
+    if generation.load(Ordering::SeqCst) != expected {
+        return;
+    }
     let Some(current) = current else {
         return;
     };
@@ -5601,6 +5612,9 @@ fn observe_gateway_packet_path(app: &AppHandle, session: &MetricsSession) {
         .gateway_readiness
         .lock()
         .map(|mut readiness| {
+            if generation.load(Ordering::SeqCst) != expected {
+                return true;
+            }
             if readiness.guest_packet_path.is_ready() {
                 true
             } else {
@@ -5614,6 +5628,9 @@ fn observe_gateway_packet_path(app: &AppHandle, session: &MetricsSession) {
     }
 
     if let Ok(mut status) = state.status.lock() {
+        if generation.load(Ordering::SeqCst) != expected {
+            return;
+        }
         if status.mode.contains("gateway") {
             status.state = "running".into();
             status.gateway_packet_path_ready = true;
@@ -7227,7 +7244,7 @@ fn spawn_metrics_poller(
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        observe_gateway_packet_path(&app, &session);
+        observe_gateway_packet_path(&app, &session, &generation, expected);
     });
 }
 
