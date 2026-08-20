@@ -40,3 +40,10 @@ This branch contains the current SongsterX source snapshot for external review.
 - metrics emit 与 packet-path readiness/status 更新的最终 generation 检查受运行时转换锁保护；Stop 先使 generation 失效再取得该锁，避免“检查通过后被抢占”导致旧 session 事件在停止完成后发布。
 - 代理配置的“立即应用”流程等待后端实际进入 `stopped` 后才保存，并等待实际进入 `running` 后才刷新；停止失败或仍在停止时不会继续写配置并盲目重启。
 - sing-box、mitmdump 或 vfkit supervisor 异常退出统一经过清理终结逻辑：清理失败且仍有资源所有权时保留 `running`、保留可再次停止的元数据并重启观察器；Gateway owner 在清理完成前不会提前丢弃。
+
+本轮继续修复：
+
+- 配置和模块修改只由 `LifecyclePhase::Stopped` 放行；健康检查与配置变更 gate 分离，`runtime_phase_is_active` 不再探测 child 或 `take()` Gateway owner。启动事务不再用“查询即清理”的 predicate 判断是否运行。
+- “立即应用”与顶部启停共用前端 runtime operation lock；保存重启流程持有 intent generation，用户启停意图变化后，旧保存流程没有权限自动恢复启动。
+- Managed system endpoint 保存 IPv4/IPv6 地址族；`0.0.0.0` 不再过滤 IPv6-only 的本机目的地址；异常退出确认无资源后清除冻结的 metrics session。
+- 新增生命周期 gate 回归测试，并保留地址族 wildcard 过滤测试。

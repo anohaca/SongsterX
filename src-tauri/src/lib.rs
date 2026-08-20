@@ -4975,92 +4975,27 @@ fn module_proxy_endpoint(settings: &RuntimeSettings) -> String {
     format!("{}:{MODULE_PROXY_PORT}", module_proxy_host(settings))
 }
 
-fn runtime_is_running(state: &RuntimeState) -> Result<bool, String> {
-    if state
+fn runtime_phase_is_active(state: &RuntimeState) -> Result<bool, String> {
+    let phase = state
         .lifecycle_phase
         .lock()
-        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?
-        .eq(&LifecyclePhase::Starting)
-    {
-        return Ok(true);
-    }
-    let mut sing_box = state
-        .child
-        .lock()
-        .map_err(|_| "运行时锁不可用".to_string())?;
-    let sing_box_running = if let Some(child) = sing_box.as_mut() {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            true
-        } else {
-            *sing_box = None;
-            false
-        }
-    } else {
-        false
-    };
-    drop(sing_box);
+        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?;
+    Ok(matches!(
+        *phase,
+        LifecyclePhase::Starting | LifecyclePhase::Running | LifecyclePhase::Stopping
+    ))
+}
 
-    let mut mitm = state
-        .mitm_child
+fn runtime_mutation_allowed(state: &RuntimeState) -> Result<(), String> {
+    let phase = state
+        .lifecycle_phase
         .lock()
-        .map_err(|_| "运行时锁不可用".to_string())?;
-    let mitm_running = if let Some(child) = mitm.as_mut() {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            true
-        } else {
-            *mitm = None;
-            false
-        }
+        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?;
+    if *phase == LifecyclePhase::Stopped {
+        Ok(())
     } else {
-        false
-    };
-    drop(mitm);
-
-    let (managed_gateway_running, managed_gateway_failed) = {
-        let mut gateway_runtime = state
-            .gateway_runtime
-            .lock()
-            .map_err(|_| "Gateway runtime 锁不可用".to_string())?;
-        let had_runtime = gateway_runtime.is_some();
-        let running = match gateway_runtime.as_mut() {
-            Some(runtime) => runtime
-                .leaders_running()
-                .map_err(|error| format!("检查 Gateway supervisor 失败：{error}"))?,
-            None => false,
-        };
-        if !running {
-            gateway_runtime.take();
-            if let Ok(mut readiness) = state.gateway_readiness.lock() {
-                readiness.mark_stopped();
-            }
-        }
-        (running, had_runtime && !running)
-    };
-    if managed_gateway_failed {
-        if let Ok(mut child) = state.child.lock() {
-            if let Some(mut child) = child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        if let Ok(mut mitm) = state.mitm_child.lock() {
-            if let Some(mut child) = mitm.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        return Ok(false);
+        Err("请先停止运行时，再修改配置".into())
     }
-    Ok(sing_box_running || mitm_running || managed_gateway_running)
 }
 
 fn spawn_mitmproxy(
@@ -5261,6 +5196,9 @@ fn finalize_unexpected_runtime_exit(
     state.metrics_generation.fetch_add(1, Ordering::SeqCst);
     match cleanup_result {
         Ok(()) => {
+            if let Ok(mut session) = state.metrics_session.lock() {
+                *session = None;
+            }
             mark_lifecycle_phase(state, LifecyclePhase::Stopped);
             set_stopped(state, exit_message)
         }
@@ -5273,6 +5211,11 @@ fn finalize_unexpected_runtime_exit(
                 LifecyclePhase::Stopped
             };
             mark_lifecycle_phase(state, phase);
+            if !resources_owned {
+                if let Ok(mut session) = state.metrics_session.lock() {
+                    *session = None;
+                }
+            }
             let current = current_status(state).unwrap_or_default();
             let next = status_after_stop_failure(current, resources_owned, message.clone());
             update_status(state, next.clone());
@@ -5745,7 +5688,7 @@ fn save_runtime_settings(
     state: State<'_, RuntimeState>,
     settings: RuntimeSettings,
 ) -> Result<RuntimeSettings, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存设置".into());
     }
     persist_settings(&app, &settings)
@@ -5756,7 +5699,7 @@ fn reset_runtime_settings(
     app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<RuntimeSettings, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再恢复默认设置".into());
     }
     persist_settings(&app, &RuntimeSettings::default())
@@ -6025,7 +5968,7 @@ fn start_mix_direct(
     state: State<'_, RuntimeState>,
 ) -> Result<RuntimeStatus, String> {
     let settings = load_settings(&app)?;
-    if runtime_is_running(&state)? {
+    if runtime_phase_is_active(&state)? {
         return current_status(&state);
     }
     let Some(lifecycle_generation) = begin_lifecycle_start(&state)? else {
@@ -6121,10 +6064,6 @@ fn start_mix_direct_transaction(
     if lifecycle_cancelled(state, lifecycle_generation) {
         return Err("启动已取消".into());
     }
-    if runtime_is_running(&state)? {
-        return current_status(state);
-    }
-
     let metrics_generation = Arc::clone(&state.metrics_generation);
     let metrics_generation_id = metrics_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -6664,10 +6603,18 @@ fn managed_system_endpoints(
 ) -> Vec<ManagedSystemEndpoint> {
     let mut endpoints = settings
         .filter(|value| !value.listen.trim().is_empty())
-        .map(|value| ManagedSystemEndpoint {
-            host: value.listen.trim().to_string(),
-            port: value.port,
-            wildcard_host: matches!(value.listen.trim(), "0.0.0.0" | "::" | "*"),
+        .map(|value| {
+            let host = value.listen.trim();
+            ManagedSystemEndpoint {
+                host: host.to_string(),
+                port: value.port,
+                wildcard_host: matches!(host, "0.0.0.0" | "::" | "*"),
+                family: if host == "*" {
+                    ManagedAddressFamily::Any
+                } else {
+                    managed_address_family(host)
+                },
+            }
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -6679,8 +6626,10 @@ fn managed_system_endpoints(
         .unwrap_or(false);
     if module_proxy_active {
         if let Some(settings) = settings {
+            let host = module_proxy_host(settings);
             endpoints.push(ManagedSystemEndpoint {
-                host: module_proxy_host(settings),
+                family: managed_address_family(&host),
+                host,
                 port: MODULE_PROXY_PORT,
                 wildcard_host: false,
             });
@@ -6902,6 +6851,34 @@ struct ManagedSystemEndpoint {
     host: String,
     port: u16,
     wildcard_host: bool,
+    family: ManagedAddressFamily,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedAddressFamily {
+    Any,
+    V4,
+    V6,
+}
+
+fn managed_address_family(host: &str) -> ManagedAddressFamily {
+    match host.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => ManagedAddressFamily::V4,
+        Ok(IpAddr::V6(_)) => ManagedAddressFamily::V6,
+        Err(_) => ManagedAddressFamily::Any,
+    }
+}
+
+fn managed_address_family_matches(expected: ManagedAddressFamily, actual: &str) -> bool {
+    let Ok(actual) = actual.parse::<IpAddr>() else {
+        return true;
+    };
+    match (expected, actual) {
+        (ManagedAddressFamily::Any, _) => true,
+        (ManagedAddressFamily::V4, IpAddr::V4(_)) => true,
+        (ManagedAddressFamily::V6, IpAddr::V6(_)) => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -6939,6 +6916,7 @@ fn is_managed_local_destination(
     let normalized_host = normalize_endpoint_host(&host);
     managed_endpoints.iter().any(|endpoint| {
         endpoint.port == port.parse::<u16>().unwrap_or_default()
+            && managed_address_family_matches(endpoint.family, &normalized_host)
             && ((endpoint.wildcard_host
                 && (is_loopback_endpoint_host(&normalized_host)
                     || local_addresses.contains(&normalized_host)))
@@ -7596,7 +7574,7 @@ fn reload_songsterx_config(
     app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<ConfigReloadResult, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再从 SongsterX.conf 重载配置".into());
     }
     let path = songsterx_config_path(&app)?;
@@ -7626,7 +7604,7 @@ fn import_module(
     state: State<'_, RuntimeState>,
     files: Vec<ImportedFile>,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再导入模块".into());
     }
     persist_imported_module_files(&app, files)
@@ -7877,7 +7855,7 @@ fn import_module_url(
     state: State<'_, RuntimeState>,
     url: String,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再导入模块".into());
     }
     let url = url.trim().to_string();
@@ -7918,7 +7896,7 @@ fn set_module_enabled(
     id: String,
     enabled: bool,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再修改模块启用状态".into());
     }
     let modules = load_modules(&app)?;
@@ -7951,7 +7929,7 @@ fn set_module_argument(
     key: String,
     value: String,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再修改模块参数".into());
     }
     if value.len() > 64 * 1024 {
@@ -7991,7 +7969,7 @@ fn save_proxy_config(
     state: State<'_, RuntimeState>,
     config: ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存代理配置".into());
     }
     persist_proxy_config(&app, &config)
@@ -8003,7 +7981,7 @@ fn save_gateway_guest_proxy_config(
     state: State<'_, RuntimeState>,
     config: ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存 Gateway guest 策略".into());
     }
     persist_gateway_guest_proxy_config(&app, &config)
@@ -8232,6 +8210,21 @@ mod tests {
         assert_eq!(next.message, "teardown failed");
     }
 
+    #[test]
+    fn runtime_mutation_gate_uses_lifecycle_phase_only() {
+        let state = RuntimeState::default();
+        assert!(runtime_mutation_allowed(&state).is_ok());
+        assert!(!runtime_phase_is_active(&state).unwrap());
+
+        mark_lifecycle_phase(&state, LifecyclePhase::Stopping);
+        assert!(runtime_mutation_allowed(&state).is_err());
+        assert!(runtime_phase_is_active(&state).unwrap());
+
+        mark_lifecycle_phase(&state, LifecyclePhase::Running);
+        assert!(runtime_mutation_allowed(&state).is_err());
+        assert!(runtime_phase_is_active(&state).unwrap());
+    }
+
     fn interface_stats(
         interface: &str,
         rx_packets: u64,
@@ -8359,6 +8352,7 @@ mod tests {
             host: "0.0.0.0".into(),
             port: 2080,
             wildcard_host: true,
+            family: ManagedAddressFamily::V4,
         }];
         let local_addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
         assert!(is_managed_local_destination(
@@ -8366,7 +8360,7 @@ mod tests {
             &endpoints,
             &local_addresses
         ));
-        assert!(is_managed_local_destination(
+        assert!(!is_managed_local_destination(
             "[::1]:2080",
             &endpoints,
             &local_addresses
@@ -8381,6 +8375,18 @@ mod tests {
             &endpoints,
             &local_addresses
         ));
+
+        let ipv6_endpoints = vec![ManagedSystemEndpoint {
+            host: "::".into(),
+            port: 2080,
+            wildcard_host: true,
+            family: ManagedAddressFamily::V6,
+        }];
+        assert!(is_managed_local_destination(
+            "[::1]:2080",
+            &ipv6_endpoints,
+            &local_addresses
+        ));
     }
 
     #[test]
@@ -8389,6 +8395,7 @@ mod tests {
             host: "0.0.0.0".into(),
             port: 2080,
             wildcard_host: true,
+            family: ManagedAddressFamily::V4,
         }];
         let local_addresses = HashSet::from(["192.168.1.20".into(), "fe80::1".into()]);
         assert!(is_managed_local_destination(
@@ -8396,7 +8403,7 @@ mod tests {
             &endpoints,
             &local_addresses
         ));
-        assert!(is_managed_local_destination(
+        assert!(!is_managed_local_destination(
             "[fe80::1]:2080",
             &endpoints,
             &local_addresses

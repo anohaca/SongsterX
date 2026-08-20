@@ -907,6 +907,8 @@ function App() {
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
   const [appearanceMode, setAppearanceMode] = useState<AppearanceMode>(loadAppearanceMode);
+  const runtimeOperationInFlight = useRef(false);
+  const runtimeIntentGeneration = useRef(0);
   const [systemDark, setSystemDark] = useState(true);
   const prefersDark = appearanceMode === "dark" || (appearanceMode === "system" && systemDark);
 
@@ -1163,7 +1165,13 @@ function App() {
   }
 
   async function saveProxyConfig(config: ProxyConfig, target: ProxyConfigTarget = "host"): Promise<ProxyConfig> {
+    if (runtimeOperationInFlight.current) {
+      throw new Error("运行时操作进行中，请稍后重试");
+    }
+    runtimeOperationInFlight.current = true;
+    const operation = ++runtimeIntentGeneration.current;
     const wasRunning = isActive;
+    setBusy(true);
     try {
       if (wasRunning) {
         setStatus(await invoke<RuntimeStatus>("stop_runtime"));
@@ -1183,11 +1191,11 @@ function App() {
       }
       return saved;
     } catch (error) {
-      if (wasRunning) {
+      if (wasRunning && runtimeIntentGeneration.current === operation) {
         try {
           const current = await invoke<RuntimeStatus>("get_runtime_status");
           setStatus(current);
-          if (current.state === "stopped") {
+          if (current.state === "stopped" && runtimeIntentGeneration.current === operation) {
             setStatus(await invoke<RuntimeStatus>("start_mix_direct"));
             await waitForRuntimeState("running");
           }
@@ -1197,11 +1205,18 @@ function App() {
       }
       addLocalLog("error", String(error));
       throw error;
+    } finally {
+      if (runtimeIntentGeneration.current === operation) {
+        runtimeOperationInFlight.current = false;
+        setBusy(false);
+      }
     }
   }
 
   async function toggleRuntime() {
-    if (status.state === "stopping") return;
+    if (status.state === "stopping" || runtimeOperationInFlight.current) return;
+    runtimeOperationInFlight.current = true;
+    const operation = ++runtimeIntentGeneration.current;
     setBusy(true);
     try {
       const shouldStop = status.state === "running" || status.state === "starting";
@@ -1221,7 +1236,10 @@ function App() {
       await refreshStatus();
       setStatus((current) => current.state === "stopped" ? { ...current, state: "error", message } : current);
     } finally {
-      setBusy(false);
+      if (runtimeIntentGeneration.current === operation) {
+        runtimeOperationInFlight.current = false;
+        setBusy(false);
+      }
     }
   }
 
