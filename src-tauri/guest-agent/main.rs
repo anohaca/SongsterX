@@ -150,7 +150,6 @@ impl AgentRuntime {
                 ));
             }
             Some((version, Err(error))) => {
-                self.sing_box = None;
                 remove_readiness_path(readiness_file);
                 self.last_error = Some(format!("无法检查 sing-box {version} 状态：{error}"));
             }
@@ -172,7 +171,6 @@ impl AgentRuntime {
                 }
             }
             Some(Err(error)) => {
-                self.mitm = None;
                 self.last_error = Some(format!("无法检查 mitmdump 状态：{error}"));
             }
             _ => {}
