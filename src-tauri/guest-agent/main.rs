@@ -1014,11 +1014,13 @@ fn activate_upgrade(
         );
     }
     if let Err(start_error) = start_version(config, runtime, &staged.version) {
-        let recovery = restart_version(config, runtime, current.as_deref());
-        let recovery_message = recovery
-            .err()
-            .map(|error| format!("；旧版本恢复失败：{error}"))
-            .unwrap_or_default();
+        let recovery_message = match runtime.stop(&config.readiness_file) {
+            Ok(()) => restart_version(config, runtime, current.as_deref())
+                .err()
+                .map(|error| format!("；旧版本恢复失败：{error}"))
+                .unwrap_or_default(),
+            Err(error) => format!("；候选 sing-box 停止失败，未重启旧版本：{error}"),
+        };
         runtime.last_error = Some(format!("{start_error}{recovery_message}"));
         return respond(
             reader,
@@ -1165,6 +1167,7 @@ fn activate_session(
         start_version(config, runtime, &active)
     })();
     if let Err(start_error) = activation {
+        let stop_error = runtime.stop(&config.readiness_file).err();
         let config_restore = restore_config(config, previous_config.as_deref());
         let plan_restore = restore_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
         let config_verify =
@@ -1172,6 +1175,7 @@ fn activate_session(
         let plan_verify =
             verify_restored_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
         let rollback_error = [
+            stop_error,
             config_restore.err(),
             plan_restore.err(),
             config_verify.err(),
@@ -1181,12 +1185,7 @@ fn activate_session(
         .flatten()
         .collect::<Vec<_>>();
         if !rollback_error.is_empty() {
-            let stop_error = runtime.stop(&config.readiness_file).err();
-            let details = rollback_error
-                .into_iter()
-                .chain(stop_error)
-                .collect::<Vec<_>>()
-                .join("；");
+            let details = rollback_error.into_iter().collect::<Vec<_>>().join("；");
             let message = format!(
                 "{start_error}；Gateway session 回滚失败，data plane 已保持停止：{details}"
             );
@@ -1306,13 +1305,26 @@ fn activate_config(
         );
     }
     if let Err(start_error) = start_version(config, runtime, &active) {
+        let stop_error = runtime.stop(&config.readiness_file).err();
         let restore_error = restore_config(config, previous.as_deref());
-        let recovery = restart_version(config, runtime, Some(&active));
-        let details = restore_error
-            .err()
-            .or_else(|| recovery.err())
-            .map(|error| format!("；旧配置恢复失败：{error}"))
-            .unwrap_or_default();
+        let recovery = if stop_error.is_none() && restore_error.is_ok() {
+            restart_version(config, runtime, Some(&active))
+        } else {
+            Ok(())
+        };
+        let details = [
+            stop_error.map(|error| format!("；候选 sing-box 停止失败，未重启旧版本：{error}")),
+            restore_error
+                .err()
+                .map(|error| format!("；旧配置恢复失败：{error}")),
+            recovery
+                .err()
+                .map(|error| format!("；旧配置恢复启动失败：{error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("");
         runtime.last_error = Some(format!("{start_error}{details}"));
         return respond(
             reader,
@@ -1422,11 +1434,13 @@ fn rollback(
         );
     }
     if let Err(start_error) = start_version(config, runtime, &previous) {
-        let recovery = restart_version(config, runtime, current.as_deref());
-        let recovery_message = recovery
-            .err()
-            .map(|error| format!("；当前版本恢复失败：{error}"))
-            .unwrap_or_default();
+        let recovery_message = match runtime.stop(&config.readiness_file) {
+            Ok(()) => restart_version(config, runtime, current.as_deref())
+                .err()
+                .map(|error| format!("；当前版本恢复失败：{error}"))
+                .unwrap_or_default(),
+            Err(error) => format!("；候选 sing-box 停止失败，未重启当前版本：{error}"),
+        };
         runtime.last_error = Some(format!("{start_error}{recovery_message}"));
         return respond(
             reader,
