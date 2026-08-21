@@ -5839,8 +5839,9 @@ fn start_gateway_runtime_supervisor(
         ),
     );
 
-    let module_result = match guest_agent::sync_module_plan_with_cancellation(
+    let session_result = match guest_agent::sync_session_with_cancellation(
         &endpoint,
+        config_path,
         module_plan_path,
         GATEWAY_CONFIG_SYNC_TIMEOUT,
         cancellation,
@@ -5851,13 +5852,13 @@ fn start_gateway_runtime_supervisor(
                 readiness.mark_failed(error.clone());
             }
             return Err(runtime_failure_with_cleanup(
-                format!("guest Module Engine 计划同步失败：{error}"),
+                format!("guest Gateway session 激活失败：{error}"),
                 runtime,
                 state,
             ));
         }
     };
-    if let Some(certificate_pem) = module_result.certificate_pem.as_deref() {
+    if let Some(certificate_pem) = session_result.certificate_pem.as_deref() {
         if let Err(error) = persist_guest_mitm_certificate(app, certificate_pem) {
             emit_log(
                 app,
@@ -5870,25 +5871,10 @@ fn start_gateway_runtime_supervisor(
         app,
         "info",
         format!(
-            "guest Module Engine 计划已同步，耗时 {} ms；正在同步 sing-box 配置",
+            "guest Gateway session 已原子激活（配置 + Module Engine 计划），耗时 {} ms",
             startup_started_at.elapsed().as_millis()
         ),
     );
-
-    let config_result = match guest_agent::sync_config_with_cancellation(
-        &endpoint,
-        config_path,
-        GATEWAY_CONFIG_SYNC_TIMEOUT,
-        cancellation,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            if let Ok(mut readiness) = state.gateway_readiness.lock() {
-                readiness.mark_failed(error.clone());
-            }
-            return Err(runtime_failure_with_cleanup(error, runtime, state));
-        }
-    };
     if let Err(error) = commit_gateway_runtime(&state, runtime) {
         if let Ok(mut readiness) = state.gateway_readiness.lock() {
             readiness.mark_failed(error.clone());
@@ -5896,7 +5882,7 @@ fn start_gateway_runtime_supervisor(
         return Err(error);
     }
     if let Ok(mut baseline) = state.gateway_packet_baseline.lock() {
-        *baseline = config_result.packet_stats.clone();
+        *baseline = session_result.packet_stats.clone();
     }
     if let Ok(mut readiness) = state.gateway_readiness.lock() {
         readiness.mark_runtime_started();

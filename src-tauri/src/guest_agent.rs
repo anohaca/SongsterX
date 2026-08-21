@@ -101,8 +101,13 @@ pub(crate) struct GuestConfigResult {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GuestModulePlanResult {
+pub(crate) struct GuestSessionResult {
+    pub config_sha256: String,
+    pub module_plan_sha256: String,
+    pub config_size: u64,
+    pub module_plan_size: u64,
     pub certificate_pem: Option<String>,
+    pub packet_stats: Option<GuestPacketStats>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,25 +286,32 @@ pub(crate) fn sync_config_with_cancellation(
     }
 }
 
-pub(crate) fn sync_module_plan_with_cancellation(
+/// Upload the configuration and Module Engine plan first, then activate both
+/// as one guest transaction.  The guest therefore starts the MITM engine only
+/// after the final sing-box configuration is already staged, avoiding the
+/// previous module-then-config double start.
+pub(crate) fn sync_session_with_cancellation(
     endpoint: &GuestAgentEndpoint,
+    config_path: &Path,
     plan_path: &Path,
     timeout: Duration,
     cancellation: &(dyn Fn() -> bool + Sync),
-) -> Result<GuestModulePlanResult, String> {
+) -> Result<GuestSessionResult, String> {
     if cancellation() {
         return Err("启动已取消".into());
     }
     let deadline = Instant::now() + timeout;
-    let metadata = module_plan_metadata(plan_path)?;
+    let config = config_metadata(config_path)?;
+    let module_plan = module_plan_metadata(plan_path)?;
+
     loop {
         if cancellation() {
             return Err("启动已取消".into());
         }
-        match stage_module_plan_and_upload(
+        match stage_config_and_upload(
             endpoint,
-            plan_path,
-            &metadata,
+            config_path,
+            &config,
             remaining_timeout(deadline)?,
             cancellation,
         ) {
@@ -312,27 +324,54 @@ pub(crate) fn sync_module_plan_with_cancellation(
         if cancellation() {
             return Err("启动已取消".into());
         }
+        match stage_module_plan_and_upload(
+            endpoint,
+            plan_path,
+            &module_plan,
+            remaining_timeout(deadline)?,
+            cancellation,
+        ) {
+            Ok(()) => break,
+            Err(error) if is_retryable_io_timeout(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
         let mut stream =
             endpoint.connect_cancellable(remaining_timeout(deadline)?, cancellation)?;
         match request(
             endpoint,
             &mut stream,
-            &activate_module_plan_request(&metadata),
+            &activate_session_request(&config, &module_plan),
         ) {
-            Ok(response) if response.ok && response.state == "active" => {
-                return Ok(GuestModulePlanResult {
+            Ok(response)
+                if response.ok
+                    && response.state == "active"
+                    && response.healthy
+                    && response.ready =>
+            {
+                return Ok(GuestSessionResult {
+                    config_sha256: config.sha256,
+                    module_plan_sha256: module_plan.sha256,
+                    config_size: config.size,
+                    module_plan_size: module_plan.size,
                     certificate_pem: response.mitm_certificate_pem,
+                    packet_stats: response.packet_stats,
                 });
             }
             Ok(response) => {
                 return Err(if response.message.is_empty() {
-                    "guest Module Engine 配置激活失败".into()
+                    "guest Gateway session 激活失败".into()
                 } else {
-                    format!("guest Module Engine 配置激活失败：{}", response.message)
+                    format!("guest Gateway session 激活失败：{}", response.message)
                 });
             }
             Err(error) if is_retryable_io_timeout(&error) => continue,
-            Err(error) => return Err(format!("guest Module Engine 配置激活请求失败：{error}")),
+            Err(error) => return Err(format!("guest Gateway session 激活请求失败：{error}")),
         }
     }
 }
@@ -794,11 +833,13 @@ fn activate_config_request(metadata: &ConfigMetadata) -> Value {
     })
 }
 
-fn activate_module_plan_request(metadata: &ModulePlanMetadata) -> Value {
+fn activate_session_request(config: &ConfigMetadata, module_plan: &ModulePlanMetadata) -> Value {
     json!({
-        "method": "activate_module_plan",
-        "modulePlanSize": metadata.size,
-        "modulePlanSha256": metadata.sha256,
+        "method": "activate_session",
+        "configSize": config.size,
+        "configSha256": config.sha256,
+        "modulePlanSize": module_plan.size,
+        "modulePlanSha256": module_plan.sha256,
     })
 }
 
@@ -1073,6 +1114,25 @@ mod tests {
         assert!(stage.contains("\"configSize\":12"));
         assert!(stage.contains(&format!("\"configSha256\":\"{}\"", metadata.sha256)));
         assert!(activate.contains("\"method\":\"activate_config\""));
+    }
+
+    #[test]
+    fn session_activation_carries_both_artifact_integrities() {
+        let config = ConfigMetadata {
+            size: 12,
+            sha256: "b".repeat(64),
+        };
+        let module_plan = ModulePlanMetadata {
+            size: 34,
+            sha256: "c".repeat(64),
+        };
+        let request = serialize_request(&activate_session_request(&config, &module_plan)).unwrap();
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.contains("\"method\":\"activate_session\""));
+        assert!(request.contains("\"configSize\":12"));
+        assert!(request.contains("\"modulePlanSize\":34"));
+        assert!(request.contains(&format!("\"configSha256\":\"{}\"", config.sha256)));
+        assert!(request.contains(&format!("\"modulePlanSha256\":\"{}\"", module_plan.sha256)));
     }
 
     #[test]

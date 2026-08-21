@@ -21,6 +21,8 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(200);
 const MITM_CERTIFICATE_WAIT: Duration = Duration::from_secs(5);
 const MITM_CERTIFICATE_POLL: Duration = Duration::from_millis(50);
+const DATAPLANE_PROBE_WAIT: Duration = Duration::from_secs(3);
+const DATAPLANE_PROBE_POLL: Duration = Duration::from_millis(50);
 const GUEST_CLASH_API_ADDR: &str = "127.0.0.1:9090";
 const CLASH_HTTP_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const AGENT_CONNECTIONS_RESPONSE_LIMIT: usize = 60 * 1024;
@@ -190,6 +192,14 @@ impl AgentRuntime {
         self.mitm.is_some()
     }
 
+    fn sing_box_ready(&self) -> bool {
+        self.sing_box.is_some() && clash_api_ready()
+    }
+
+    fn mitm_ready(&self) -> bool {
+        self.mitm.is_some() && tcp_listener_ready("127.0.0.1:8080")
+    }
+
     fn stop_mitm(&mut self) -> Result<(), String> {
         let Some(mut process) = self.mitm.take() else {
             return Ok(());
@@ -233,6 +243,33 @@ fn stop_child(child: &mut Child, label: &str) -> Result<(), String> {
                 .map_err(|error| format!("等待 {label} 停止失败：{error}"))?;
             Ok(())
         }
+    }
+}
+
+fn tcp_listener_ready(address: &str) -> bool {
+    let Ok(mut addresses) = address.to_socket_addrs() else {
+        return false;
+    };
+    let Some(address) = addresses.next() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+}
+
+fn clash_api_ready() -> bool {
+    clash_http_request("GET", "/proxies", None).is_ok()
+}
+
+fn wait_for_clash_api() -> Result<(), String> {
+    let deadline = Instant::now() + DATAPLANE_PROBE_WAIT;
+    loop {
+        if clash_api_ready() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("sing-box Clash API 仍未监听 127.0.0.1:9090".into());
+        }
+        thread::sleep(DATAPLANE_PROBE_POLL);
     }
 }
 
@@ -367,6 +404,7 @@ fn handle_connection(
         "stage_config" => stage_config(&mut reader, config, &request),
         "stage_module_plan" => stage_module_plan(&mut reader, config, &request),
         "activate_upgrade" => activate_upgrade(&mut reader, config, &request, runtime),
+        "activate_session" => activate_session(&mut reader, config, &request, runtime),
         "activate_config" => activate_config(&mut reader, config, &request, runtime),
         "activate_module_plan" => activate_module_plan(&mut reader, config, &request, runtime),
         "rollback" => rollback(&mut reader, config, runtime),
@@ -968,6 +1006,129 @@ fn activate_upgrade(
     )
 }
 
+/// Atomically activate the sing-box configuration and Module Engine plan as
+/// one data-plane session.  Both artifacts are validated before the current
+/// runtime is stopped, and `start_version` then starts sing-box and mitmdump
+/// exactly once from the final pair of files.
+fn activate_session(
+    reader: &mut BufReader<TcpStream>,
+    config: &AgentConfig,
+    request: &Request,
+    runtime: &mut AgentRuntime,
+) -> Result<(), String> {
+    let staged_config =
+        read_staged_config(config)?.ok_or_else(|| "没有可激活的 sing-box 配置".to_string())?;
+    if staged_config.size != request.config_size || staged_config.sha256 != request.config_sha256 {
+        return respond(
+            reader,
+            error_response("待激活配置与 staged 元数据不匹配".into()),
+        );
+    }
+    let staged_module_plan =
+        read_staged_module_plan(config)?.ok_or_else(|| "没有可激活的模块运行计划".to_string())?;
+    if staged_module_plan.size != request.module_plan_size
+        || staged_module_plan.sha256 != request.module_plan_sha256
+    {
+        return respond(
+            reader,
+            error_response("待激活模块运行计划与 staged 元数据不匹配".into()),
+        );
+    }
+
+    let config_incoming = config_incoming_path(config);
+    let plan_incoming = module_plan_incoming_path(config);
+    if !config_incoming.is_file() {
+        return respond(reader, error_response("staged sing-box 配置不存在".into()));
+    }
+    if !plan_incoming.is_file() {
+        return respond(reader, error_response("staged 模块运行计划不存在".into()));
+    }
+    let candidate_config = fs::read(&config_incoming)
+        .map_err(|error| format!("读取 staged sing-box 配置失败：{error}"))?;
+    serde_json::from_slice::<Value>(&candidate_config)
+        .map_err(|error| format!("staged sing-box 配置不是有效 JSON：{error}"))?;
+    let candidate_plan = fs::read(&plan_incoming)
+        .map_err(|error| format!("读取 staged 模块运行计划失败：{error}"))?;
+    let candidate_plan_value: Value = serde_json::from_slice(&candidate_plan)
+        .map_err(|error| format!("staged 模块运行计划不是有效 JSON：{error}"))?;
+
+    let active = read_pointer(&active_path(&config.state_dir), "active")?
+        .ok_or_else(|| "没有可运行的 sing-box 版本".to_string())?;
+    let artifact = version_dir(&config.state_dir, &active)?.join("sing-box");
+    if !artifact.is_file() {
+        return respond(reader, error_response("active sing-box 文件不存在".into()));
+    }
+    check_sing_box(&artifact, &config_incoming)?;
+
+    let config_path = sing_box_config_path(config);
+    let plan_path = module_plan_path(config);
+    let previous_config = fs::read(&config_path).ok();
+    let previous_plan = fs::read(&plan_path).ok();
+    if let Some(previous) = previous_config.as_deref() {
+        write_atomic_bytes(&config_previous_path(config), previous)?;
+    }
+
+    if let Err(error) = runtime.stop(&config.readiness_file) {
+        return respond(
+            reader,
+            error_response(format!("停止当前 Gateway data plane 失败：{error}")),
+        );
+    }
+
+    let activation = (|| {
+        write_atomic_bytes(&config_path, &candidate_config)?;
+        write_atomic_bytes(&plan_path, &candidate_plan)?;
+        start_version(config, runtime, &active)
+    })();
+    if let Err(start_error) = activation {
+        let _ = restore_config(config, previous_config.as_deref());
+        let _ = restore_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
+        let recovery = restart_version(config, runtime, Some(&active));
+        let recovery_message = recovery
+            .err()
+            .map(|error| format!("；旧 Gateway session 恢复失败：{error}"))
+            .unwrap_or_default();
+        runtime.last_error = Some(format!("{start_error}{recovery_message}"));
+        return respond(
+            reader,
+            error_response(format!(
+                "Gateway session 激活失败：{start_error}{recovery_message}"
+            )),
+        );
+    }
+
+    let _ = fs::remove_file(&config_incoming);
+    let _ = fs::remove_file(config_staged_path(config));
+    let _ = fs::remove_file(&plan_incoming);
+    let _ = fs::remove_file(module_plan_staged_path(config));
+    let mitm_certificate_pem = if module_plan_requires_mitm_value(&candidate_plan_value) {
+        read_mitm_certificate(config)
+    } else {
+        None
+    };
+    respond(
+        reader,
+        json!({
+            "ok": true,
+            "state": "active",
+            "configSha256": request.config_sha256,
+            "modulePlanSha256": request.module_plan_sha256,
+            "healthy": true,
+            "ready": runtime_ready(config, runtime),
+            "networkReady": guest_network_ready(config),
+            "packetStats": config.guest_network.as_ref().map(|network| PacketStats {
+                lan: read_interface_stats(&network.lan_interface),
+                tun: read_interface_stats("tun0"),
+            }),
+            "pid": runtime.pid(),
+            "mitmHealthy": runtime.mitm_healthy(),
+            "mitmReady": runtime.mitm_ready(),
+            "mitmPid": runtime.mitm_pid(),
+            "mitmCertificatePem": mitm_certificate_pem,
+        }),
+    )
+}
+
 fn activate_config(
     reader: &mut BufReader<TcpStream>,
     config: &AgentConfig,
@@ -1100,7 +1261,13 @@ fn activate_module_plan(
         }
     }
     let mitm_certificate_pem = if module_plan_requires_mitm_value(&value) {
-        wait_for_mitm_certificate(config, runtime)
+        match wait_for_mitm_certificate(config, runtime) {
+            Ok(certificate) => Some(certificate),
+            Err(error) => {
+                runtime.last_error = Some(error.clone());
+                return respond(reader, error_response(error));
+            }
+        }
     } else {
         None
     };
@@ -1111,7 +1278,7 @@ fn activate_module_plan(
             "state": "active",
             "modulePlanSha256": request.module_plan_sha256,
             "mitmHealthy": runtime.mitm_healthy(),
-            "mitmReady": runtime.mitm_healthy(),
+            "mitmReady": runtime.mitm_ready(),
             "mitmPid": runtime.mitm_pid(),
             "mitmCertificatePem": mitm_certificate_pem,
         }),
@@ -1192,10 +1359,15 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
     let staged_version = read_staged(&config.state_dir)?.map(|value| value.version);
     let config_sha256 = file_sha256(&sing_box_config_path(config)).ok();
     let mitm_required = module_plan_requires_mitm(&module_plan_path(config));
+    let sing_box_ready = runtime.sing_box_ready();
+    let mitm_ready =
+        !mitm_required || (runtime.mitm_ready() && read_mitm_certificate(config).is_some());
     let mitm_healthy = !mitm_required || runtime.mitm_healthy();
     let healthy = !active_version.is_empty()
         && runtime.is_healthy(&active_version, &config.readiness_file)
-        && mitm_healthy;
+        && sing_box_ready
+        && mitm_healthy
+        && mitm_ready;
     let network_ready = guest_network_ready(config);
     let control_listening = !config.network_ready_file.is_some() || runtime.control_listening;
     let ready = healthy && network_ready && control_listening && config.readiness_file.is_file();
@@ -1222,6 +1394,7 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
             "configSha256": config_sha256,
             "healthy": healthy,
             "ready": ready,
+            "singBoxReady": sing_box_ready,
             "networkReady": network_ready,
             "gatewayLanIp": gateway_lan_ip,
             "upstreamInterface": upstream_interface,
@@ -1229,7 +1402,7 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
             "lastError": runtime.last_error,
             "pid": runtime.pid(),
             "mitmHealthy": runtime.mitm_healthy(),
-            "mitmReady": runtime.mitm_healthy(),
+            "mitmReady": mitm_ready,
             "mitmPid": runtime.mitm_pid(),
             "modulePlanSha256": file_sha256(&module_plan_path(config)).ok(),
         }
@@ -1257,8 +1430,9 @@ fn read_interface_stats(interface: &str) -> Option<InterfaceStats> {
 }
 
 fn runtime_ready(config: &AgentConfig, runtime: &AgentRuntime) -> bool {
-    runtime.sing_box.is_some()
-        && (!module_plan_requires_mitm(&module_plan_path(config)) || runtime.mitm_healthy())
+    runtime.sing_box_ready()
+        && (!module_plan_requires_mitm(&module_plan_path(config))
+            || (runtime.mitm_ready() && read_mitm_certificate(config).is_some()))
         && guest_network_ready(config)
         && (!config.network_ready_file.is_some() || runtime.control_listening)
         && config.readiness_file.is_file()
@@ -1340,8 +1514,16 @@ fn start_version(
                 child,
             });
             runtime.last_error = None;
+            if let Err(error) = wait_for_clash_api() {
+                let _ = runtime.stop(&config.readiness_file);
+                return Err(error);
+            }
             if module_plan_requires_mitm(&module_plan_path(config)) {
                 if let Err(error) = start_mitm(config, runtime) {
+                    let _ = runtime.stop(&config.readiness_file);
+                    return Err(error);
+                }
+                if let Err(error) = wait_for_mitm_certificate(config, runtime) {
                     let _ = runtime.stop(&config.readiness_file);
                     return Err(error);
                 }
@@ -1415,7 +1597,21 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
         )),
         None => {
             runtime.mitm = Some(ManagedMitm { child });
-            Ok(())
+            let deadline = Instant::now() + DATAPLANE_PROBE_WAIT;
+            loop {
+                runtime.refresh_mitm(&module_plan_path(config));
+                if runtime.mitm.is_none() {
+                    return Err("guest mitmdump 启动后退出".into());
+                }
+                if runtime.mitm_ready() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    let _ = runtime.stop_mitm();
+                    return Err("guest mitmdump 已运行但 127.0.0.1:8080 尚未监听".into());
+                }
+                thread::sleep(DATAPLANE_PROBE_POLL);
+            }
         }
     }
 }
@@ -1433,19 +1629,22 @@ fn read_mitm_certificate(config: &AgentConfig) -> Option<String> {
     }
 }
 
-fn wait_for_mitm_certificate(config: &AgentConfig, runtime: &mut AgentRuntime) -> Option<String> {
+fn wait_for_mitm_certificate(
+    config: &AgentConfig,
+    runtime: &mut AgentRuntime,
+) -> Result<String, String> {
     let deadline = Instant::now() + MITM_CERTIFICATE_WAIT;
     let plan_path = module_plan_path(config);
     loop {
         runtime.refresh_mitm(&plan_path);
         if runtime.mitm.is_none() {
-            return None;
+            return Err("guest mitmdump 在证书初始化前退出".into());
         }
         if let Some(certificate) = read_mitm_certificate(config) {
-            return Some(certificate);
+            return Ok(certificate);
         }
         if Instant::now() >= deadline {
-            return None;
+            return Err("guest mitmdump 已监听，但 MITM CA 证书尚未初始化".into());
         }
         thread::sleep(MITM_CERTIFICATE_POLL);
     }
@@ -1488,6 +1687,16 @@ fn write_readiness(config: &AgentConfig, runtime: &AgentRuntime) -> Result<(), S
     }
     if runtime.sing_box.is_none() {
         return Err("sing-box 尚未运行，禁止写入 guest readiness".into());
+    }
+    if !runtime.sing_box_ready() {
+        return Err("sing-box Clash API 尚未就绪，禁止写入 guest readiness".into());
+    }
+    if module_plan_requires_mitm(&module_plan_path(config))
+        && (!runtime.mitm_ready() || read_mitm_certificate(config).is_none())
+    {
+        return Err(
+            "guest Module Engine 尚未完成监听和 CA 初始化，禁止写入 guest readiness".into(),
+        );
     }
     if let Some(parent) = config.readiness_file.parent() {
         fs::create_dir_all(parent)
@@ -1643,6 +1852,17 @@ fn restore_config(config: &AgentConfig, previous: Option<&[u8]>) -> Result<(), S
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("删除失败的 sing-box 配置失败：{error}")),
+        },
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>, label: &str) -> Result<(), String> {
+    match previous {
+        Some(previous) => write_atomic_bytes(path, previous),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("删除失败的 {label} 文件失败：{error}")),
         },
     }
 }
