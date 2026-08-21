@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_LINE: usize = 64 * 1024;
@@ -19,10 +19,6 @@ const MAX_MODULE_PLAN_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_UPGRADE_SIZE: u64 = 64 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(200);
-const MITM_CERTIFICATE_WAIT: Duration = Duration::from_secs(5);
-const MITM_CERTIFICATE_POLL: Duration = Duration::from_millis(50);
-const DATAPLANE_PROBE_WAIT: Duration = Duration::from_secs(3);
-const DATAPLANE_PROBE_POLL: Duration = Duration::from_millis(50);
 const GUEST_CLASH_API_ADDR: &str = "127.0.0.1:9090";
 const CLASH_HTTP_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const AGENT_CONNECTIONS_RESPONSE_LIMIT: usize = 60 * 1024;
@@ -257,20 +253,41 @@ fn tcp_listener_ready(address: &str) -> bool {
 }
 
 fn clash_api_ready() -> bool {
-    clash_http_request("GET", "/proxies", None).is_ok()
-}
-
-fn wait_for_clash_api() -> Result<(), String> {
-    let deadline = Instant::now() + DATAPLANE_PROBE_WAIT;
-    loop {
-        if clash_api_ready() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("sing-box Clash API 仍未监听 127.0.0.1:9090".into());
-        }
-        thread::sleep(DATAPLANE_PROBE_POLL);
+    let Ok(mut addresses) = GUEST_CLASH_API_ADDR.to_socket_addrs() else {
+        return false;
+    };
+    let Some(address) = addresses.next() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .is_err()
+    {
+        return false;
     }
+    if stream
+        .write_all(b"GET /proxies HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .and_then(|_| stream.flush())
+        .is_err()
+    {
+        return false;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line).is_err() {
+        return false;
+    }
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .is_some_and(|status| (200..300).contains(&status))
 }
 
 fn main() {
@@ -405,8 +422,10 @@ fn handle_connection(
         "stage_module_plan" => stage_module_plan(&mut reader, config, &request),
         "activate_upgrade" => activate_upgrade(&mut reader, config, &request, runtime),
         "activate_session" => activate_session(&mut reader, config, &request, runtime),
-        "activate_config" => activate_config(&mut reader, config, &request, runtime),
-        "activate_module_plan" => activate_module_plan(&mut reader, config, &request, runtime),
+        "activate_config" | "activate_module_plan" => respond(
+            &mut reader,
+            error_response("Gateway 只允许通过 activate_session 同时激活配置和模块计划".into()),
+        ),
         "rollback" => rollback(&mut reader, config, runtime),
         "stop_runtime" => stop_guest_runtime(&mut reader, config, runtime),
         method => respond(
@@ -1016,6 +1035,36 @@ fn activate_session(
     request: &Request,
     runtime: &mut AgentRuntime,
 ) -> Result<(), String> {
+    // A lost response must be safe to reconcile. If the requested pair is
+    // already active and operational, return success without requiring the
+    // staged files or restarting either child.
+    let current_config_matches =
+        file_sha256(&sing_box_config_path(config)).ok() == Some(request.config_sha256.clone());
+    let current_plan_matches =
+        file_sha256(&module_plan_path(config)).ok() == Some(request.module_plan_sha256.clone());
+    if current_config_matches && current_plan_matches && runtime_ready(config, runtime) {
+        return respond(
+            reader,
+            json!({
+                "ok": true,
+                "state": "active",
+                "configSha256": request.config_sha256,
+                "modulePlanSha256": request.module_plan_sha256,
+                "healthy": true,
+                "ready": true,
+                "networkReady": guest_network_ready(config),
+                "packetStats": config.guest_network.as_ref().map(|network| PacketStats {
+                    lan: read_interface_stats(&network.lan_interface),
+                    tun: read_interface_stats("tun0"),
+                }),
+                "pid": runtime.pid(),
+                "mitmHealthy": runtime.mitm_healthy(),
+                "mitmReady": runtime.mitm_ready(),
+                "mitmPid": runtime.mitm_pid(),
+                "mitmCertificatePem": read_mitm_certificate(config),
+            }),
+        );
+    }
     let staged_config =
         read_staged_config(config)?.ok_or_else(|| "没有可激活的 sing-box 配置".to_string())?;
     if staged_config.size != request.config_size || staged_config.sha256 != request.config_sha256 {
@@ -1062,8 +1111,8 @@ fn activate_session(
 
     let config_path = sing_box_config_path(config);
     let plan_path = module_plan_path(config);
-    let previous_config = fs::read(&config_path).ok();
-    let previous_plan = fs::read(&plan_path).ok();
+    let previous_config = read_optional_file(&config_path, "当前 sing-box 配置")?;
+    let previous_plan = read_optional_file(&plan_path, "当前模块运行计划")?;
     if let Some(previous) = previous_config.as_deref() {
         write_atomic_bytes(&config_previous_path(config), previous)?;
     }
@@ -1081,20 +1130,50 @@ fn activate_session(
         start_version(config, runtime, &active)
     })();
     if let Err(start_error) = activation {
-        let _ = restore_config(config, previous_config.as_deref());
-        let _ = restore_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
+        let config_restore = restore_config(config, previous_config.as_deref());
+        let plan_restore = restore_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
+        let config_verify =
+            verify_restored_file(&config_path, previous_config.as_deref(), "sing-box 配置");
+        let plan_verify =
+            verify_restored_file(&plan_path, previous_plan.as_deref(), "模块运行计划");
+        let rollback_error = [
+            config_restore.err(),
+            plan_restore.err(),
+            config_verify.err(),
+            plan_verify.err(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !rollback_error.is_empty() {
+            let stop_error = runtime.stop(&config.readiness_file).err();
+            let details = rollback_error
+                .into_iter()
+                .chain(stop_error)
+                .collect::<Vec<_>>()
+                .join("；");
+            let message = format!(
+                "{start_error}；Gateway session 回滚失败，data plane 已保持停止：{details}"
+            );
+            runtime.last_error = Some(message.clone());
+            return respond(reader, error_response(message));
+        }
         let recovery = restart_version(config, runtime, Some(&active));
-        let recovery_message = recovery
-            .err()
-            .map(|error| format!("；旧 Gateway session 恢复失败：{error}"))
-            .unwrap_or_default();
-        runtime.last_error = Some(format!("{start_error}{recovery_message}"));
-        return respond(
-            reader,
-            error_response(format!(
-                "Gateway session 激活失败：{start_error}{recovery_message}"
-            )),
-        );
+        let recovery_error = recovery.err().or_else(|| {
+            (!runtime_ready(config, runtime)).then_some("旧 Gateway session 探针未就绪".into())
+        });
+        if let Some(error) = recovery_error {
+            let stop_error = runtime.stop(&config.readiness_file).err();
+            let details = stop_error
+                .map(|stop_error| format!("；停止残留 data plane 失败：{stop_error}"))
+                .unwrap_or_default();
+            let message = format!("{start_error}；旧 Gateway session 恢复失败：{error}{details}");
+            runtime.last_error = Some(message.clone());
+            return respond(reader, error_response(message));
+        }
+        let message = format!("{start_error}；旧 Gateway session 已恢复");
+        runtime.last_error = Some(message.clone());
+        return respond(reader, error_response(message));
     }
 
     let _ = fs::remove_file(&config_incoming);
@@ -1129,6 +1208,7 @@ fn activate_session(
     )
 }
 
+#[allow(dead_code)]
 fn activate_config(
     reader: &mut BufReader<TcpStream>,
     config: &AgentConfig,
@@ -1220,6 +1300,7 @@ fn activate_config(
     )
 }
 
+#[allow(dead_code)]
 fn activate_module_plan(
     reader: &mut BufReader<TcpStream>,
     config: &AgentConfig,
@@ -1261,13 +1342,7 @@ fn activate_module_plan(
         }
     }
     let mitm_certificate_pem = if module_plan_requires_mitm_value(&value) {
-        match wait_for_mitm_certificate(config, runtime) {
-            Ok(certificate) => Some(certificate),
-            Err(error) => {
-                runtime.last_error = Some(error.clone());
-                return respond(reader, error_response(error));
-            }
-        }
+        read_mitm_certificate(config)
     } else {
         None
     };
@@ -1343,7 +1418,7 @@ fn rollback(
             "ok": true,
             "state": "rolled_back",
             "version": previous,
-            "healthy": true,
+            "healthy": runtime.sing_box_ready(),
             "ready": runtime_ready(config, runtime),
             "networkReady": guest_network_ready(config),
             "pid": runtime.pid(),
@@ -1405,6 +1480,7 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
             "mitmReady": mitm_ready,
             "mitmPid": runtime.mitm_pid(),
             "modulePlanSha256": file_sha256(&module_plan_path(config)).ok(),
+            "mitmCertificatePem": read_mitm_certificate(config),
         }
     }))
 }
@@ -1514,23 +1590,25 @@ fn start_version(
                 child,
             });
             runtime.last_error = None;
-            if let Err(error) = wait_for_clash_api() {
-                let _ = runtime.stop(&config.readiness_file);
-                return Err(error);
-            }
             if module_plan_requires_mitm(&module_plan_path(config)) {
                 if let Err(error) = start_mitm(config, runtime) {
                     let _ = runtime.stop(&config.readiness_file);
                     return Err(error);
                 }
-                if let Err(error) = wait_for_mitm_certificate(config, runtime) {
+            }
+            if runtime.sing_box_ready()
+                && (!module_plan_requires_mitm(&module_plan_path(config))
+                    || (runtime.mitm_ready() && read_mitm_certificate(config).is_some()))
+            {
+                if let Err(error) = write_readiness(config, runtime) {
                     let _ = runtime.stop(&config.readiness_file);
                     return Err(error);
                 }
-            }
-            if let Err(error) = write_readiness(config, runtime) {
-                let _ = runtime.stop(&config.readiness_file);
-                return Err(error);
+            } else {
+                // The control request must return promptly. The host can poll
+                // status while Clash API or mitmproxy finishes booting instead
+                // of blocking the single control loop on a multi-second wait.
+                remove_readiness(config);
             }
             Ok(())
         }
@@ -1597,21 +1675,11 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
         )),
         None => {
             runtime.mitm = Some(ManagedMitm { child });
-            let deadline = Instant::now() + DATAPLANE_PROBE_WAIT;
-            loop {
-                runtime.refresh_mitm(&module_plan_path(config));
-                if runtime.mitm.is_none() {
-                    return Err("guest mitmdump 启动后退出".into());
-                }
-                if runtime.mitm_ready() {
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    let _ = runtime.stop_mitm();
-                    return Err("guest mitmdump 已运行但 127.0.0.1:8080 尚未监听".into());
-                }
-                thread::sleep(DATAPLANE_PROBE_POLL);
-            }
+            // Do not wait for the listener or CA here. Returning releases the
+            // control loop so status/stop can be handled while mitmproxy
+            // finishes initialization; readiness is published only by the
+            // real probes in status_response/write_readiness.
+            Ok(())
         }
     }
 }
@@ -1626,27 +1694,6 @@ fn read_mitm_certificate(config: &AgentConfig) -> Option<String> {
         Some(certificate)
     } else {
         None
-    }
-}
-
-fn wait_for_mitm_certificate(
-    config: &AgentConfig,
-    runtime: &mut AgentRuntime,
-) -> Result<String, String> {
-    let deadline = Instant::now() + MITM_CERTIFICATE_WAIT;
-    let plan_path = module_plan_path(config);
-    loop {
-        runtime.refresh_mitm(&plan_path);
-        if runtime.mitm.is_none() {
-            return Err("guest mitmdump 在证书初始化前退出".into());
-        }
-        if let Some(certificate) = read_mitm_certificate(config) {
-            return Ok(certificate);
-        }
-        if Instant::now() >= deadline {
-            return Err("guest mitmdump 已监听，但 MITM CA 证书尚未初始化".into());
-        }
-        thread::sleep(MITM_CERTIFICATE_POLL);
     }
 }
 
@@ -1856,6 +1903,14 @@ fn restore_config(config: &AgentConfig, previous: Option<&[u8]>) -> Result<(), S
     }
 }
 
+fn read_optional_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("读取 {label} 失败：{error}")),
+    }
+}
+
 fn restore_file(path: &Path, previous: Option<&[u8]>, label: &str) -> Result<(), String> {
     match previous {
         Some(previous) => write_atomic_bytes(path, previous),
@@ -1864,6 +1919,16 @@ fn restore_file(path: &Path, previous: Option<&[u8]>, label: &str) -> Result<(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("删除失败的 {label} 文件失败：{error}")),
         },
+    }
+}
+
+fn verify_restored_file(path: &Path, expected: Option<&[u8]>, label: &str) -> Result<(), String> {
+    match (expected, fs::read(path)) {
+        (Some(expected), Ok(actual)) if actual == expected => Ok(()),
+        (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        (Some(_), Ok(_)) => Err(format!("恢复后的 {label} 内容校验失败")),
+        (_, Err(error)) => Err(format!("读取恢复后的 {label} 失败：{error}")),
+        (None, Ok(_)) => Err(format!("恢复后的 {label} 不应存在")),
     }
 }
 
@@ -2209,6 +2274,26 @@ mod tests {
         assert_eq!(read_auth_token(&path).unwrap(), "a".repeat(32));
         fs::write(&path, "too-short").unwrap();
         assert!(read_auth_token(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollback_verification_detects_mismatch_and_unexpected_file() {
+        let path = std::env::temp_dir().join(format!(
+            "songsterx-gateway-agent-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"old-plan").unwrap();
+        assert!(verify_restored_file(&path, Some(b"old-plan"), "模块运行计划").is_ok());
+        assert!(verify_restored_file(&path, Some(b"new-plan"), "模块运行计划").is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(verify_restored_file(&path, None, "模块运行计划").is_ok());
+        fs::write(&path, b"unexpected").unwrap();
+        assert!(verify_restored_file(&path, None, "模块运行计划").is_err());
         let _ = fs::remove_file(path);
     }
 

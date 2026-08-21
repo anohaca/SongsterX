@@ -6276,38 +6276,12 @@ async fn get_gateway_guest_status(app: AppHandle) -> Result<guest_agent::GuestAg
 }
 
 #[tauri::command]
-fn sync_gateway_guest_config(
-    app: AppHandle,
-    config_path: String,
-) -> Result<guest_agent::GuestConfigResult, String> {
-    let settings = load_settings(&app)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    let config_path = config_path.trim();
-    if config_path.is_empty() {
-        return Err("guest sing-box 配置路径不能为空".into());
-    }
-    guest_agent::sync_config(&endpoint, Path::new(config_path), Duration::from_secs(30))
-}
-
-#[tauri::command]
 fn generate_gateway_guest_config(app: AppHandle) -> Result<String, String> {
     let settings = load_settings(&app)?;
     validate_settings(&settings)?;
     let module_plan = write_module_runtime_plan(&app)?;
     write_gateway_guest_runtime_config(&app, &settings, &module_plan)
         .map(|path| path.display().to_string())
-}
-
-#[tauri::command]
-fn sync_gateway_guest_runtime_config(
-    app: AppHandle,
-) -> Result<guest_agent::GuestConfigResult, String> {
-    let settings = load_settings(&app)?;
-    validate_settings(&settings)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    let module_plan = write_module_runtime_plan(&app)?;
-    let path = write_gateway_guest_runtime_config(&app, &settings, &module_plan)?;
-    guest_agent::sync_config(&endpoint, &path, Duration::from_secs(30))
 }
 
 #[tauri::command]
@@ -8772,9 +8746,7 @@ pub fn run() {
             save_runtime_settings,
             reset_runtime_settings,
             get_gateway_guest_status,
-            sync_gateway_guest_config,
             generate_gateway_guest_config,
-            sync_gateway_guest_runtime_config,
             upgrade_gateway_sing_box,
             get_mitm_certificate_info,
             open_mitm_certificate,
