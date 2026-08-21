@@ -64,6 +64,7 @@ struct AgentRuntime {
     pending_session: Option<PendingSession>,
     last_error: Option<String>,
     control_listening: bool,
+    liveness_fault: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -151,6 +152,7 @@ impl AgentRuntime {
             }
             Some((version, Err(error))) => {
                 remove_readiness_path(readiness_file);
+                self.liveness_fault = true;
                 self.last_error = Some(format!("无法检查 sing-box {version} 状态：{error}"));
             }
             _ => {}
@@ -171,6 +173,7 @@ impl AgentRuntime {
                 }
             }
             Some(Err(error)) => {
+                self.liveness_fault = true;
                 self.last_error = Some(format!("无法检查 mitmdump 状态：{error}"));
             }
             _ => {}
@@ -198,11 +201,11 @@ impl AgentRuntime {
     }
 
     fn sing_box_ready(&self) -> bool {
-        self.sing_box.is_some() && clash_api_ready()
+        !self.liveness_fault && self.sing_box.is_some() && clash_api_ready()
     }
 
     fn mitm_ready(&self) -> bool {
-        self.mitm.is_some() && tcp_listener_ready("127.0.0.1:8080")
+        !self.liveness_fault && self.mitm.is_some() && tcp_listener_ready("127.0.0.1:8080")
     }
 
     fn stop_mitm(&mut self) -> Result<(), String> {
@@ -248,6 +251,7 @@ impl AgentRuntime {
         }
         remove_readiness_path(readiness_file);
         if failures.is_empty() {
+            self.liveness_fault = false;
             Ok(())
         } else {
             Err(failures.join("；"))
@@ -1572,7 +1576,8 @@ fn progress_pending_session(config: &AgentConfig, runtime: &mut AgentRuntime) {
         .map(|sha256| sha256 == pending.module_plan_sha256)
         .unwrap_or(false);
     let ready = config_matches && plan_matches && dataplane_probes_ready(config, runtime);
-    let child_failed = runtime.sing_box.is_none()
+    let child_failed = runtime.liveness_fault
+        || runtime.sing_box.is_none()
         || (module_plan_requires_mitm(&module_plan_path(config)) && runtime.mitm.is_none());
     if ready {
         match write_readiness(config, runtime) {
@@ -1753,6 +1758,7 @@ fn start_version(
         }
     }
     remove_readiness(config);
+    runtime.liveness_fault = false;
     validate_version(version)?;
     let artifact = version_dir(&config.state_dir, version)?.join("sing-box");
     if !artifact.is_file() {
@@ -1781,8 +1787,11 @@ fn start_version(
     let status = match child.try_wait() {
         Ok(status) => status,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            runtime.sing_box = Some(ManagedSingBox {
+                version: version.to_string(),
+                child,
+            });
+            runtime.liveness_fault = true;
             return Err(format!("检查 sing-box {version} 启动状态失败：{error}"));
         }
     };
@@ -1872,10 +1881,15 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
         .spawn()
         .map_err(|error| format!("启动 guest mitmdump 失败：{error}"))?;
     thread::sleep(SING_BOX_STARTUP_GRACE);
-    match child
-        .try_wait()
-        .map_err(|error| format!("检查 guest mitmdump 启动状态失败：{error}"))?
-    {
+    let status = match child.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            runtime.mitm = Some(ManagedMitm { child });
+            runtime.liveness_fault = true;
+            return Err(format!("检查 guest mitmdump 启动状态失败：{error}"));
+        }
+    };
+    match status {
         Some(status) => Err(format!(
             "guest mitmdump 启动后退出，状态码 {:?}",
             status.code()
