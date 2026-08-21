@@ -208,22 +208,44 @@ impl AgentRuntime {
     }
 
     fn stop_mitm(&mut self) -> Result<(), String> {
-        let Some(mut process) = self.mitm.take() else {
+        if self.mitm.is_none() {
             return Ok(());
-        };
-        stop_child(&mut process.child, "mitmdump")
+        }
+        let result = self
+            .mitm
+            .as_mut()
+            .map(|process| stop_child(&mut process.child, "mitmdump"))
+            .expect("mitmdump exists");
+        if result.is_ok() {
+            self.mitm = None;
+        }
+        result
     }
 
     fn stop(&mut self, readiness_file: &Path) -> Result<(), String> {
         let mut failures = Vec::new();
-        if let Some(mut process) = self.mitm.take() {
-            if let Err(error) = stop_child(&mut process.child, "mitmdump") {
+        if self.mitm.is_some() {
+            let result = self
+                .mitm
+                .as_mut()
+                .map(|process| stop_child(&mut process.child, "mitmdump"))
+                .expect("mitmdump exists");
+            if let Err(error) = result {
                 failures.push(error);
+            } else {
+                self.mitm = None;
             }
         }
-        if let Some(mut process) = self.sing_box.take() {
-            if let Err(error) = stop_child(&mut process.child, "sing-box") {
+        if self.sing_box.is_some() {
+            let result = self
+                .sing_box
+                .as_mut()
+                .map(|process| stop_child(&mut process.child, "sing-box"))
+                .expect("sing-box exists");
+            if let Err(error) = result {
                 failures.push(error);
+            } else {
+                self.sing_box = None;
             }
         }
         remove_readiness_path(readiness_file);
@@ -728,13 +750,8 @@ fn stop_guest_runtime(
     config: &AgentConfig,
     runtime: &mut AgentRuntime,
 ) -> Result<(), String> {
-    // An explicit stop is terminal for the current activation attempt.  Clear
-    // PendingSession before stopping children so a later status request cannot
-    // mistake the stopped candidate for a timed-out activation and restart the
-    // previous data plane behind the user's back.
-    cancel_pending_session(config, runtime);
     let mut failures = Vec::new();
-    if let Err(error) = runtime.stop(&config.readiness_file) {
+    if let Err(error) = abort_pending_session_for_stop(config, runtime) {
         failures.push(error);
     }
     if let Err(error) = stop_network_forwarding(config) {
@@ -1654,12 +1671,55 @@ fn remove_session_artifacts(config: &AgentConfig) {
     let _ = fs::remove_file(module_plan_staged_path(config));
 }
 
-fn cancel_pending_session(config: &AgentConfig, runtime: &mut AgentRuntime) -> bool {
-    if runtime.pending_session.take().is_some() {
-        remove_session_artifacts(config);
-        true
+fn abort_pending_session_for_stop(
+    config: &AgentConfig,
+    runtime: &mut AgentRuntime,
+) -> Result<(), String> {
+    let Some(pending) = runtime.pending_session.take() else {
+        return runtime.stop(&config.readiness_file);
+    };
+
+    // Stop is an explicit abort, not a failed activation.  Restore the
+    // previous pair without restarting it; the caller asked for a stopped
+    // data plane and the next start may then use the last committed state.
+    let stop_error = runtime.stop(&config.readiness_file).err();
+    let config_path = sing_box_config_path(config);
+    let plan_path = module_plan_path(config);
+    let config_restore = restore_config(config, pending.previous_config.as_deref());
+    let plan_restore = restore_file(&plan_path, pending.previous_plan.as_deref(), "模块运行计划");
+    let config_verify = verify_restored_file(
+        &config_path,
+        pending.previous_config.as_deref(),
+        "sing-box 配置",
+    );
+    let plan_verify =
+        verify_restored_file(&plan_path, pending.previous_plan.as_deref(), "模块运行计划");
+    remove_session_artifacts(config);
+    let failures = [
+        stop_error,
+        config_restore.err(),
+        plan_restore.err(),
+        config_verify.err(),
+        plan_verify.err(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
     } else {
-        false
+        // Keep the data plane fail-closed.  A retained child handle can be
+        // retried here if kill/wait had a transient failure; never restart a
+        // candidate or the previous session from an explicit Stop.
+        let retry_stop_error = runtime.stop(&config.readiness_file).err();
+        let details = failures
+            .into_iter()
+            .chain(retry_stop_error)
+            .collect::<Vec<_>>();
+        Err(format!(
+            "显式停止 Gateway session 失败，data plane 已保持停止：{}",
+            details.join("；")
+        ))
     }
 }
 
@@ -2490,13 +2550,18 @@ mod tests {
             ..AgentRuntime::default()
         };
 
-        assert!(cancel_pending_session(&config, &mut runtime));
+        abort_pending_session_for_stop(&config, &mut runtime).unwrap();
         assert!(runtime.pending_session.is_none());
+        assert_eq!(
+            fs::read(sing_box_config_path(&config)).unwrap(),
+            b"old-config"
+        );
+        assert_eq!(fs::read(module_plan_path(&config)).unwrap(), b"old-plan");
         assert!(!config_incoming_path(&config).exists());
         assert!(!config_staged_path(&config).exists());
         assert!(!module_plan_incoming_path(&config).exists());
         assert!(!module_plan_staged_path(&config).exists());
-        assert!(!cancel_pending_session(&config, &mut runtime));
+        abort_pending_session_for_stop(&config, &mut runtime).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
