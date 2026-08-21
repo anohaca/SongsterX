@@ -219,6 +219,8 @@ impl AgentRuntime {
             .expect("mitmdump exists");
         if result.is_ok() {
             self.mitm = None;
+        } else {
+            self.liveness_fault = true;
         }
         result
     }
@@ -254,6 +256,7 @@ impl AgentRuntime {
             self.liveness_fault = false;
             Ok(())
         } else {
+            self.liveness_fault = true;
             Err(failures.join("；"))
         }
     }
