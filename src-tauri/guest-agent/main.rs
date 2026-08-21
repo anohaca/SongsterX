@@ -1771,6 +1771,9 @@ fn start_version(
             return Err("guest agent control listener 尚未就绪，拒绝启动 sing-box".into());
         }
     }
+    if runtime.sing_box.is_some() || runtime.mitm.is_some() || runtime.liveness_fault {
+        return Err("已有 Gateway data-plane ownership，必须先成功停止后才能启动".into());
+    }
     remove_readiness(config);
     runtime.liveness_fault = false;
     validate_version(version)?;
@@ -1846,6 +1849,9 @@ fn start_version(
 }
 
 fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), String> {
+    if runtime.liveness_fault {
+        return Err("Gateway data-plane liveness fault 尚未清除，拒绝启动 Module Engine".into());
+    }
     if runtime.mitm_healthy() {
         return Ok(());
     }
@@ -2588,6 +2594,41 @@ mod tests {
         assert!(!module_plan_incoming_path(&config).exists());
         assert!(!module_plan_staged_path(&config).exists());
         abort_pending_session_for_stop(&config, &mut runtime).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn liveness_fault_blocks_new_data_plane_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "songsterx-gateway-agent-liveness-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = AgentConfig {
+            listen: "127.0.0.1:38293".into(),
+            state_dir: root.clone(),
+            agent_version: "test".into(),
+            sing_box_config: Some(root.join("sing-box.json")),
+            auth_token_file: root.join("agent.token"),
+            auth_token: "a".repeat(32),
+            readiness_file: root.join("ready"),
+            network_ready_file: None,
+            network_control: None,
+            guest_network: None,
+        };
+        let mut runtime = AgentRuntime {
+            liveness_fault: true,
+            ..AgentRuntime::default()
+        };
+
+        assert!(start_version(&config, &mut runtime, "1.14.0").is_err());
+        assert!(start_mitm(&config, &mut runtime).is_err());
+        assert!(runtime.sing_box.is_none());
+        assert!(runtime.mitm.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
