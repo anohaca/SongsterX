@@ -10,7 +10,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_LINE: usize = 64 * 1024;
@@ -19,6 +19,7 @@ const MAX_MODULE_PLAN_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_UPGRADE_SIZE: u64 = 64 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(200);
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(14);
 const GUEST_CLASH_API_ADDR: &str = "127.0.0.1:9090";
 const CLASH_HTTP_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const AGENT_CONNECTIONS_RESPONSE_LIMIT: usize = 60 * 1024;
@@ -47,10 +48,20 @@ struct ManagedMitm {
     child: Child,
 }
 
+struct PendingSession {
+    config_sha256: String,
+    module_plan_sha256: String,
+    previous_config: Option<Vec<u8>>,
+    previous_plan: Option<Vec<u8>>,
+    active_version: String,
+    deadline: Instant,
+}
+
 #[derive(Default)]
 struct AgentRuntime {
     sing_box: Option<ManagedSingBox>,
     mitm: Option<ManagedMitm>,
+    pending_session: Option<PendingSession>,
     last_error: Option<String>,
     control_listening: bool,
 }
@@ -1176,10 +1187,16 @@ fn activate_session(
         return respond(reader, error_response(message));
     }
 
-    let _ = fs::remove_file(&config_incoming);
-    let _ = fs::remove_file(config_staged_path(config));
-    let _ = fs::remove_file(&plan_incoming);
-    let _ = fs::remove_file(module_plan_staged_path(config));
+    runtime.pending_session = Some(PendingSession {
+        config_sha256: request.config_sha256.clone(),
+        module_plan_sha256: request.module_plan_sha256.clone(),
+        previous_config,
+        previous_plan,
+        active_version: active.clone(),
+        deadline: Instant::now() + SESSION_READY_TIMEOUT,
+    });
+    progress_pending_session(config, runtime);
+    let activating = runtime.pending_session.is_some();
     let mitm_certificate_pem = if module_plan_requires_mitm_value(&candidate_plan_value) {
         read_mitm_certificate(config)
     } else {
@@ -1189,10 +1206,10 @@ fn activate_session(
         reader,
         json!({
             "ok": true,
-            "state": "active",
+            "state": if activating { "activating" } else { "active" },
             "configSha256": request.config_sha256,
             "modulePlanSha256": request.module_plan_sha256,
-            "healthy": true,
+            "healthy": runtime.sing_box_ready(),
             "ready": runtime_ready(config, runtime),
             "networkReady": guest_network_ready(config),
             "packetStats": config.guest_network.as_ref().map(|network| PacketStats {
@@ -1429,6 +1446,7 @@ fn rollback(
 fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<Value, String> {
     runtime.refresh(&config.readiness_file);
     runtime.refresh_mitm(&module_plan_path(config));
+    progress_pending_session(config, runtime);
     let active_version =
         read_pointer(&active_path(&config.state_dir), "active")?.unwrap_or_default();
     let staged_version = read_staged(&config.state_dir)?.map(|value| value.version);
@@ -1445,7 +1463,13 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
         && mitm_ready;
     let network_ready = guest_network_ready(config);
     let control_listening = !config.network_ready_file.is_some() || runtime.control_listening;
-    let ready = healthy && network_ready && control_listening && config.readiness_file.is_file();
+    let probes_ready = healthy && network_ready && control_listening;
+    if probes_ready && !config.readiness_file.is_file() {
+        if let Err(error) = write_readiness(config, runtime) {
+            runtime.last_error = Some(error);
+        }
+    }
+    let ready = probes_ready && config.readiness_file.is_file();
     let gateway_lan_ip = config
         .guest_network
         .as_ref()
@@ -1506,12 +1530,123 @@ fn read_interface_stats(interface: &str) -> Option<InterfaceStats> {
 }
 
 fn runtime_ready(config: &AgentConfig, runtime: &AgentRuntime) -> bool {
+    dataplane_probes_ready(config, runtime) && config.readiness_file.is_file()
+}
+
+fn dataplane_probes_ready(config: &AgentConfig, runtime: &AgentRuntime) -> bool {
     runtime.sing_box_ready()
         && (!module_plan_requires_mitm(&module_plan_path(config))
             || (runtime.mitm_ready() && read_mitm_certificate(config).is_some()))
         && guest_network_ready(config)
         && (!config.network_ready_file.is_some() || runtime.control_listening)
-        && config.readiness_file.is_file()
+}
+
+fn progress_pending_session(config: &AgentConfig, runtime: &mut AgentRuntime) {
+    let Some(pending) = runtime.pending_session.as_ref() else {
+        return;
+    };
+    let config_matches = file_sha256(&sing_box_config_path(config))
+        .map(|sha256| sha256 == pending.config_sha256)
+        .unwrap_or(false);
+    let plan_matches = file_sha256(&module_plan_path(config))
+        .map(|sha256| sha256 == pending.module_plan_sha256)
+        .unwrap_or(false);
+    let ready = config_matches && plan_matches && dataplane_probes_ready(config, runtime);
+    let child_failed = runtime.sing_box.is_none()
+        || (module_plan_requires_mitm(&module_plan_path(config)) && runtime.mitm.is_none());
+    if ready {
+        match write_readiness(config, runtime) {
+            Ok(()) => {
+                remove_session_artifacts(config);
+                runtime.pending_session = None;
+                runtime.last_error = None;
+            }
+            Err(error) => runtime.last_error = Some(error),
+        }
+        return;
+    }
+    if !child_failed && Instant::now() < pending.deadline {
+        return;
+    }
+
+    let pending = runtime
+        .pending_session
+        .take()
+        .expect("pending session exists");
+    rollback_pending_session(
+        config,
+        runtime,
+        pending,
+        if child_failed {
+            "Gateway session data plane 在 ready 前退出"
+        } else {
+            "Gateway session 在 ready 前超时"
+        },
+    );
+}
+
+fn rollback_pending_session(
+    config: &AgentConfig,
+    runtime: &mut AgentRuntime,
+    pending: PendingSession,
+    reason: &str,
+) {
+    let stop_error = runtime.stop(&config.readiness_file).err();
+    let config_path = sing_box_config_path(config);
+    let plan_path = module_plan_path(config);
+    let config_restore = restore_config(config, pending.previous_config.as_deref());
+    let plan_restore = restore_file(&plan_path, pending.previous_plan.as_deref(), "模块运行计划");
+    let config_verify = verify_restored_file(
+        &config_path,
+        pending.previous_config.as_deref(),
+        "sing-box 配置",
+    );
+    let plan_verify =
+        verify_restored_file(&plan_path, pending.previous_plan.as_deref(), "模块运行计划");
+    remove_session_artifacts(config);
+    let failures = [
+        stop_error,
+        config_restore.err(),
+        plan_restore.err(),
+        config_verify.err(),
+        plan_verify.err(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        let message = format!(
+            "{reason}；Gateway session 回滚失败，data plane 已保持停止：{}",
+            failures.join("；")
+        );
+        let _ = runtime.stop(&config.readiness_file);
+        runtime.last_error = Some(message);
+        return;
+    }
+
+    match restart_version(config, runtime, Some(&pending.active_version)) {
+        Ok(()) => {
+            runtime.last_error = Some(format!(
+                "{reason}；旧 Gateway session 已恢复，等待旧 data plane 就绪"
+            ));
+        }
+        Err(error) => {
+            let stop_error = runtime.stop(&config.readiness_file).err();
+            let suffix = stop_error
+                .map(|value| format!("；停止残留 data plane 失败：{value}"))
+                .unwrap_or_default();
+            runtime.last_error = Some(format!(
+                "{reason}；旧 Gateway session 恢复失败：{error}{suffix}"
+            ));
+        }
+    }
+}
+
+fn remove_session_artifacts(config: &AgentConfig) {
+    let _ = fs::remove_file(config_incoming_path(config));
+    let _ = fs::remove_file(config_staged_path(config));
+    let _ = fs::remove_file(module_plan_incoming_path(config));
+    let _ = fs::remove_file(module_plan_staged_path(config));
 }
 
 fn start_active(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), String> {

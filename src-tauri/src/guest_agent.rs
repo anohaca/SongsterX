@@ -307,7 +307,9 @@ pub(crate) fn sync_session_with_cancellation(
                 packet_stats: response.packet_stats,
             })
         }
-        Ok(response) if response.ok && response.state == "active" => {
+        Ok(response)
+            if response.ok && (response.state == "active" || response.state == "activating") =>
+        {
             wait_for_session_ready(endpoint, &config, &module_plan, deadline, cancellation)
         }
         Ok(response) => Err(if response.message.is_empty() {
@@ -341,19 +343,29 @@ fn resolve_session_activation_failure(
         .checked_add(Duration::from_secs(2))
         .map(|reconcile_deadline| reconcile_deadline.max(deadline))
         .unwrap_or(deadline);
-    let status = query_status_cancellable(endpoint, status_deadline, cancellation)
-        .map_err(|error| format!("{message}；无法确认 guest session 状态：{error}"))?;
-    let config_matches = status.config_sha256.as_deref() == Some(&config.sha256);
-    let module_plan_matches = status.module_plan_sha256.as_deref() == Some(&module_plan.sha256);
-    if config_matches && module_plan_matches && status_is_ready(&status) {
-        return Ok(GuestSessionResult {
-            config_sha256: config.sha256.clone(),
-            module_plan_sha256: module_plan.sha256.clone(),
-            config_size: config.size,
-            module_plan_size: module_plan.size,
-            certificate_pem: status.mitm_certificate_pem,
-            packet_stats: status.packet_stats,
-        });
+    loop {
+        match query_status_cancellable(endpoint, status_deadline, cancellation) {
+            Ok(status) => {
+                let config_matches = status.config_sha256.as_deref() == Some(&config.sha256);
+                let module_plan_matches =
+                    status.module_plan_sha256.as_deref() == Some(&module_plan.sha256);
+                if config_matches && module_plan_matches && status_is_ready(&status) {
+                    return Ok(GuestSessionResult {
+                        config_sha256: config.sha256.clone(),
+                        module_plan_sha256: module_plan.sha256.clone(),
+                        config_size: config.size,
+                        module_plan_size: module_plan.size,
+                        certificate_pem: status.mitm_certificate_pem,
+                        packet_stats: status.packet_stats,
+                    });
+                }
+            }
+            Err(_) => {}
+        }
+        if remaining_timeout(status_deadline).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!("{message}；guest session 未激活目标配置和模块计划"))
 }
@@ -1186,6 +1198,60 @@ mod tests {
         .unwrap();
         assert!(response.ok);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lost_activation_response_reconciles_until_target_session_is_ready() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for ready in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let response = format!(
+                    "{{\"ok\":true,\"state\":\"ready\",\"status\":{{\"agentVersion\":\"test\",\"singBoxVersion\":\"1\",\"activeVersion\":\"1\",\"configSha256\":\"{}\",\"modulePlanSha256\":\"{}\",\"healthy\":{},\"ready\":{},\"networkReady\":true}}}}\n",
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    ready,
+                    ready
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let endpoint = GuestAgentEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+            auth_token: "a".repeat(32),
+        };
+        let config = ConfigMetadata {
+            size: 12,
+            sha256: "b".repeat(64),
+        };
+        let module_plan = ModulePlanMetadata {
+            size: 34,
+            sha256: "c".repeat(64),
+        };
+        let result = resolve_session_activation_failure(
+            &endpoint,
+            &config,
+            &module_plan,
+            Instant::now() + Duration::from_secs(1),
+            &|| false,
+            "激活响应丢失".into(),
+        )
+        .unwrap();
+        assert_eq!(result.config_sha256, config.sha256);
+        assert_eq!(result.module_plan_sha256, module_plan.sha256);
         server.join().unwrap();
     }
 
