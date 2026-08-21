@@ -728,6 +728,11 @@ fn stop_guest_runtime(
     config: &AgentConfig,
     runtime: &mut AgentRuntime,
 ) -> Result<(), String> {
+    // An explicit stop is terminal for the current activation attempt.  Clear
+    // PendingSession before stopping children so a later status request cannot
+    // mistake the stopped candidate for a timed-out activation and restart the
+    // previous data plane behind the user's back.
+    cancel_pending_session(config, runtime);
     let mut failures = Vec::new();
     if let Err(error) = runtime.stop(&config.readiness_file) {
         failures.push(error);
@@ -1649,6 +1654,15 @@ fn remove_session_artifacts(config: &AgentConfig) {
     let _ = fs::remove_file(module_plan_staged_path(config));
 }
 
+fn cancel_pending_session(config: &AgentConfig, runtime: &mut AgentRuntime) -> bool {
+    if runtime.pending_session.take().is_some() {
+        remove_session_artifacts(config);
+        true
+    } else {
+        false
+    }
+}
+
 fn start_active(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), String> {
     let Some(version) = read_pointer(&active_path(&config.state_dir), "active")? else {
         return Ok(());
@@ -2430,6 +2444,60 @@ mod tests {
         fs::write(&path, b"unexpected").unwrap();
         assert!(verify_restored_file(&path, None, "模块运行计划").is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_stop_cancels_pending_session_and_discards_staged_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "songsterx-gateway-agent-stop-pending-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("sing-box.json");
+        let config = AgentConfig {
+            listen: "127.0.0.1:38292".into(),
+            state_dir: root.clone(),
+            agent_version: "test".into(),
+            sing_box_config: Some(config_path),
+            auth_token_file: root.join("agent.token"),
+            auth_token: "a".repeat(32),
+            readiness_file: root.join("ready"),
+            network_ready_file: None,
+            network_control: None,
+            guest_network: None,
+        };
+        for path in [
+            config_incoming_path(&config),
+            config_staged_path(&config),
+            module_plan_incoming_path(&config),
+            module_plan_staged_path(&config),
+        ] {
+            fs::write(path, b"staged").unwrap();
+        }
+        let mut runtime = AgentRuntime {
+            pending_session: Some(PendingSession {
+                config_sha256: "candidate-config".into(),
+                module_plan_sha256: "candidate-plan".into(),
+                previous_config: Some(b"old-config".to_vec()),
+                previous_plan: Some(b"old-plan".to_vec()),
+                active_version: "1.14.0".into(),
+                deadline: Instant::now() + SESSION_READY_TIMEOUT,
+            }),
+            ..AgentRuntime::default()
+        };
+
+        assert!(cancel_pending_session(&config, &mut runtime));
+        assert!(runtime.pending_session.is_none());
+        assert!(!config_incoming_path(&config).exists());
+        assert!(!config_staged_path(&config).exists());
+        assert!(!module_plan_incoming_path(&config).exists());
+        assert!(!module_plan_staged_path(&config).exists());
+        assert!(!cancel_pending_session(&config, &mut runtime));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
