@@ -1033,12 +1033,13 @@ fn activate_upgrade(
     if let Err(pointer_error) = write_pointer(&previous_path(&config.state_dir), current.as_deref())
         .and_then(|_| write_pointer(&active_path(&config.state_dir), Some(&staged.version)))
     {
-        let _ = runtime.stop(&config.readiness_file);
-        let recovery = restart_version(config, runtime, current.as_deref());
-        let recovery_message = recovery
-            .err()
-            .map(|error| format!("；旧版本恢复失败：{error}"))
-            .unwrap_or_default();
+        let recovery_message = match runtime.stop(&config.readiness_file) {
+            Ok(()) => restart_version(config, runtime, current.as_deref())
+                .err()
+                .map(|error| format!("；旧版本恢复失败：{error}"))
+                .unwrap_or_default(),
+            Err(error) => format!("；候选 sing-box 停止失败，未重启旧版本：{error}"),
+        };
         runtime.last_error = Some(format!("{pointer_error}{recovery_message}"));
         return respond(
             reader,
@@ -1452,12 +1453,13 @@ fn rollback(
     if let Err(pointer_error) = write_pointer(&previous_path(&config.state_dir), current.as_deref())
         .and_then(|_| write_pointer(&active_path(&config.state_dir), Some(&previous)))
     {
-        let _ = runtime.stop(&config.readiness_file);
-        let recovery = restart_version(config, runtime, current.as_deref());
-        let recovery_message = recovery
-            .err()
-            .map(|error| format!("；当前版本恢复失败：{error}"))
-            .unwrap_or_default();
+        let recovery_message = match runtime.stop(&config.readiness_file) {
+            Ok(()) => restart_version(config, runtime, current.as_deref())
+                .err()
+                .map(|error| format!("；当前版本恢复失败：{error}"))
+                .unwrap_or_default(),
+            Err(error) => format!("；候选 sing-box 停止失败，未重启当前版本：{error}"),
+        };
         runtime.last_error = Some(format!("{pointer_error}{recovery_message}"));
         return respond(
             reader,
