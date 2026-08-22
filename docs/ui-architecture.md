@@ -4,7 +4,7 @@
 
 - UI：Tauri 2 + React 19 + TypeScript + Vite
 - 本地控制面：Rust/Tauri commands
-- 数据面：sing-box；本机始终保留 `mixed` 入站。局域网 Gateway 使用 vfkit guest、双 virtio-net 和 vmnet-helper，启动入口实际检查运行时 readiness；UI 持续读取 guest LAN/`tun0` 计数器，当前会话未观察到两侧新增流量前保持“等待局域网验收”
+- 数据面：sing-box；本机始终保留 `mixed` 入站。局域网 Gateway 使用 vfkit guest、双 virtio-net 和 vmnet-helper，启动入口实际检查运行时 readiness；UI 持续读取 guest LAN/`tun0` 计数器作为观察信息，不等待客户端流量才显示运行中
 - 平台策略：桌面端共用一套前端和 Rust 控制面；macOS、Windows、Linux 使用各自的 Tauri 打包目标，平台特有的 TUN、系统代理和网关能力后续通过 Rust adapter 接入
 
 ## 视觉基线
@@ -13,12 +13,12 @@
 - 控件、状态、表格和设置行采用 Fluent 2 / Fluent UI 的组件语义
 - 配置管理页参考 Windows Terminal 的分组和编辑方式
 - 页面使用统一的深色设计令牌、边框和间距；避免大面积渐变、装饰性阴影和不一致的圆角
-- 当前 UI 支持 Mixed 直连和 Gateway runtime 启动路径；设置页提供 vfkit、kernel/initrd、host-only 网络和 guest agent 参数，启动网关要求真实 runtime readiness，随后由 LAN/`tun0` 计数器观察当前会话的实体 packet path
+- 当前 UI 支持 Mixed 直连和 Gateway runtime 启动路径；设置页提供 vfkit、kernel/initrd、host-only 网络和 guest agent 参数，启动网关要求真实 runtime readiness，LAN/`tun0` 计数器仅用于观察当前会话的实体流量
 
 ## 当前已实现
 
 - 总览页：运行模式、Mixed 监听地址、DNS、出站、PID，以及网关接口/IP/DNS 状态
-- 设置页：可编辑监听地址、监听端口、DNS 模式与服务器、sing-box 路径、日志等级；网关开关独立于 Mixed
+- 设置页：可编辑监听地址、监听端口、DNS 模式与服务器、sing-box 路径、日志等级；网关开关独立于 Mixed，Gateway guest 会在局域网网关 IP 的同一端口提供 Mixed 入口
 - 设置持久化：保存到 Tauri 应用数据目录；启动时根据设置生成实际运行配置
 - 一键启动/停止 `sing-box`
 - 运行日志页：接收 sing-box stdout/stderr，并保留最近 200 条

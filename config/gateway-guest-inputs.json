@@ -61,6 +61,31 @@
         "file": "libnftnl-1.3.1-r0.apk",
         "sha256": "8b31395671e910c294d7f0e29d3ac3c7efe9d89264db255f39aa9944dd4b6cac"
       },
+      "nftables": {
+        "version": "1.1.6-r1",
+        "file": "nftables-1.1.6-r1.apk",
+        "sha256": "e350dc0ae7667486f925a6719add6df562055799baf0e402077ef2b11839ac9e"
+      },
+      "gmp": {
+        "version": "6.3.0-r4",
+        "file": "gmp-6.3.0-r4.apk",
+        "sha256": "4dab6e86b850fe1b5bc0cf2fac17efa4d7f648bea44f3d9019694cc1e1cb12b7"
+      },
+      "jansson": {
+        "version": "2.15.0-r0",
+        "file": "jansson-2.15.0-r0.apk",
+        "sha256": "a13822f5ca1772cced4bb7d3d178ec5dee770d8accba5b4816b2ddc413e6f055"
+      },
+      "libncursesw": {
+        "version": "6.6_p20260516-r0",
+        "file": "libncursesw-6.6_p20260516-r0.apk",
+        "sha256": "51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6"
+      },
+      "ncurses-terminfo-base": {
+        "version": "6.6_p20260516-r0",
+        "file": "ncurses-terminfo-base-6.6_p20260516-r0.apk",
+        "sha256": "e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d"
+      },
       "libxtables": {
         "version": "1.8.13-r0",
         "file": "libxtables-1.8.13-r0.apk",
@@ -77,6 +102,7 @@
         "sha256": "2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818"
       },
       "mitmproxy": {"version": "11.0.0-r3", "file": "mitmproxy-11.0.0-r3.apk", "sha256": "fbcad7ecd4f03eaa7a7a264e2f086d3bf067efea16b5a187e84e26cb292baf18", "repo": "community"},
+      "quickjs": {"version": "0.20250913-r0", "file": "quickjs-0.20250913-r0.apk", "sha256": "05b3fa1caa9c88fee1bb5a4afe726dd0d63b1e2ea258bf4e4339d3edd9e21674", "repo": "community"},
       "py3-aioquic": {"version": "1.3.0-r2", "file": "py3-aioquic-1.3.0-r2.apk", "sha256": "1c13244cc86fd53d0627a1873fb2121defe75aaccc7057417b9f8b84f02118c9", "repo": "community"},
       "py3-asgiref": {"version": "3.9.1-r1", "file": "py3-asgiref-3.9.1-r1.apk", "sha256": "b186cf2300fb15c7f88de60da64ae408aae6b3c1e6320b536d60389104ff7f9a", "repo": "community"},
       "py3-asn1": {"version": "0.6.3-r0", "file": "py3-asn1-0.6.3-r0.apk", "sha256": "60bc6aa819b0f779943f08bd017f47bc5e4a48c98c2a38fa0688eb595b865caf", "repo": "community"},

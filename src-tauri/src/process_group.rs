@@ -283,13 +283,20 @@ impl ManagedChild {
         }
 
         if self.child.is_none() {
+            // A vfkit leader can exit before a child it created has left its
+            // process group. Keep the group id until that owned group is
+            // confirmed gone so a retry can still finish the cleanup.
+            if self.role == "vfkit" && self.process_group_id.is_some() {
+                return self.finish_owned_group_until(deadline);
+            }
             return Ok(());
         }
 
-        // vfkit may place helper-created descendants in a process group with
-        // a different ownership boundary. Darwin can reject a group signal
-        // with EPERM even when the vfkit leader itself is ours, so terminate
-        // only the child we spawned and let its supervisor reap descendants.
+        // vfkit may place helper-created descendants in a different process
+        // group. Stop the owned leader first, then reap the process group we
+        // created for it. If Darwin rejects that group signal, retain the
+        // ownership marker and let the caller retry instead of pretending the
+        // Gateway is fully stopped.
         if self.role == "vfkit" {
             return self.finish_leader_stop_until(deadline);
         }
@@ -362,19 +369,71 @@ impl ManagedChild {
     }
 
     fn finish_leader_stop_until(&mut self, deadline: Instant) -> io::Result<()> {
-        let Some(child) = self.child.as_mut() else {
-            return Ok(());
-        };
-        while child.try_wait()?.is_none() && Instant::now() < deadline {
+        if self.child.is_none() {
+            return self.finish_owned_group_until(deadline);
+        }
+        let mut force_kill = false;
+        while self
+            .child
+            .as_mut()
+            .expect("child checked above")
+            .try_wait()?
+            .is_none()
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(10));
         }
-        if child.try_wait()?.is_none() {
-            child.kill()?;
+        if self
+            .child
+            .as_mut()
+            .expect("child checked above")
+            .try_wait()?
+            .is_none()
+        {
+            force_kill = true;
         }
-        let _ = child.wait()?;
+
+        if force_kill {
+            // The group was created by pre_exec/setpgid immediately before
+            // vfkit was spawned, so every member still in it is runtime-owned.
+            // Prefer the group kill to avoid leaving a vfkit child behind.
+            if self.signal_group(libc::SIGKILL).is_err() {
+                if let Some(child) = self.child.as_mut() {
+                    child.kill()?;
+                }
+            }
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.wait()?;
+        }
         self.child = None;
-        self.process_group_id = None;
         self.collect_output();
+        self.finish_owned_group_until(deadline)
+    }
+
+    fn finish_owned_group_until(&mut self, deadline: Instant) -> io::Result<()> {
+        let Some(process_group_id) = self.process_group_id else {
+            return Ok(());
+        };
+        if self.group_exists()? {
+            if let Err(error) = self.signal_group(libc::SIGKILL) {
+                return Err(error);
+            }
+        }
+        let confirm_deadline = std::cmp::min(
+            deadline + FORCE_STOP_CONFIRM_GRACE,
+            Instant::now() + FORCE_STOP_CONFIRM_GRACE,
+        );
+        while self.group_exists()? && Instant::now() < confirm_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if self.group_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("vfkit owned process group {process_group_id} still exists"),
+            ));
+        }
+        self.process_group_id = None;
         Ok(())
     }
 
@@ -827,6 +886,14 @@ mod tests {
     #[test]
     fn vfkit_stop_targets_only_the_owned_leader() {
         let spec = ManagedCommandSpec::new("vfkit", "/bin/sleep").with_args(["30"]);
+        let mut child = ManagedChild::spawn(&spec).unwrap();
+        child.stop_group(Duration::from_millis(100)).unwrap();
+        assert!(!child.test_group_exists().unwrap());
+    }
+
+    #[test]
+    fn vfkit_stop_reaps_owned_process_group_descendants() {
+        let spec = ManagedCommandSpec::new("vfkit", "/bin/sh").with_args(["-c", "sleep 30"]);
         let mut child = ManagedChild::spawn(&spec).unwrap();
         child.stop_group(Duration::from_millis(100)).unwrap();
         assert!(!child.test_group_exists().unwrap());

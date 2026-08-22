@@ -20,20 +20,15 @@ rg -q 'guest_agent::query_status' src-tauri/src/lib.rs
 rg -q 'guest_agent::query_connections' src-tauri/src/lib.rs
 rg -q '"connections" => respond' src-tauri/guest-agent/main.rs
 rg -q 'GUEST_CLASH_API_ADDR.*127\.0\.0\.1:9090' src-tauri/guest-agent/main.rs
-rg -q 'GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE' src-tauri/src/lib.rs
-rg -q 'const GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE: bool = true;' src-tauri/src/lib.rs
-rg -q 'fn gateway_runtime_release_gate_is_open_and_not_a_prelaunch_readiness_probe' src-tauri/src/lib.rs
 rg -q 'pub\(crate\) fn runtime_blockers' src-tauri/src/packet_path.rs
 rg -q 'pub\(crate\) fn runtime_ready' src-tauri/src/packet_path.rs
 rg -q 'default_readiness_is_not_a_valid_prelaunch_runtime_gate' src-tauri/src/packet_path.rs
-rg -q 'manual_packet_path_acceptance_is_separate_from_runtime_readiness' src-tauri/src/packet_path.rs
+rg -q 'packet_counters_are_observational_not_a_forwarding_gate' src-tauri/src/packet_path.rs
+rg -q 'guest_packet_path = ComponentReadiness::Ready;' src-tauri/src/packet_path.rs
 rg -q 'guest_agent_status_diagnostic' src-tauri/src/lib.rs
 rg -q 'status_is_bootstrap_ready' src-tauri/src/lib.rs src-tauri/src/guest_agent.rs
 rg -q 'status_is_ready' src-tauri/src/lib.rs src-tauri/src/guest_agent.rs
-rg -q 'mark_guest_packet_path_not_ready' src-tauri/src/lib.rs
-rg -q 'Guest packet path 已验收' src-tauri/src/lib.rs
-rg -q '等待验收' src-tauri/src/lib.rs
-rg -q 'LAN 与 tun0' src-tauri/src/lib.rs
+! rg -q 'observe_gateway_packet_path|等待局域网验收|等待真实 LAN packet path 验收' src-tauri/src src/App.tsx
 test -x src-tauri/resources/vmnet-helper
 test -x scripts/prepare_vmnet_helper.sh
 test -x scripts/build_gateway_guest.sh
@@ -86,10 +81,10 @@ for item_name in ("minirootfs", "apkIndex"):
         raise SystemExit(f"invalid Alpine lock: {item_name}")
 expected_packages = {
     "musl-dev", "iproute2-minimal", "libcap2", "libelf", "libmnl",
-    "libnftnl", "libxtables", "iptables", "zstd-libs",
+    "libnftnl", "nftables", "gmp", "jansson", "libxtables", "iptables", "zstd-libs",
     "mitmproxy", "python3", "tzdata", "ca-certificates-bundle",
     "libcrypto3", "libexpat", "libffi", "libgcc", "gdbm", "libssl3",
-    "libstdc++", "mpdecimal", "ncurses-libs", "readline", "sqlite-libs",
+    "libstdc++", "mpdecimal", "ncurses-libs", "libncursesw", "ncurses-terminfo-base", "readline", "sqlite-libs",
     "xz-libs", "zlib", "bzip2",
 }
 if not expected_packages.issubset(alpine["packages"]):
@@ -164,11 +159,12 @@ gateway = gateway_conf["Gateway"]
 general = gateway_conf["General"]
 assert gateway["enabled"].lower() == "true"
 assert gateway["dhcp"].lower() == "false"
-assert gateway["ipv6"].lower() == "false"
+assert gateway["ipv6"].lower() == "true"
 assert gateway["client-policy"].lower() == "all"
 assert gateway["interface"]
 assert gateway["gateway-ip"]
 assert gateway["cidr"]
+assert gateway["gateway-ipv6"] == "auto"
 lan_selector = general["gateway-guest-lan-selector"].strip().strip('"')
 host_selector = general["gateway-guest-host-selector"].strip().strip('"')
 assert lan_selector.startswith(("if:", "mac:"))
@@ -202,7 +198,8 @@ assert guest_tun["type"] == "tun"
 assert guest_tun["interface_name"] == "tun0"
 assert guest_tun["auto_route"] is True
 assert guest_tun["strict_route"] is True
-assert guest_tun["route_address"] == ["0.0.0.0/1", "128.0.0.0/1"]
+assert guest_tun["address"] == ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+assert guest_tun["route_address"] == ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]
 assert guest_tun["iproute2_table_index"] == 2022
 assert guest_tun["iproute2_rule_index"] == 9000
 assert gateway_config["dns"]["servers"][0]["type"] == "fakeip"
@@ -210,6 +207,7 @@ assert gateway_config["dns"]["servers"][0]["inet4_range"] == "198.18.0.0/15"
 assert gateway_config["dns"]["servers"][0]["inet6_range"] == "fc00::/18"
 assert gateway_config["route"]["default_domain_resolver"] == "system-dns"
 assert "223.86.225.0/24" in gateway_config["inbounds"][0]["route_exclude_address"]
+assert "fe80::/10" in gateway_config["inbounds"][0]["route_exclude_address"]
 
 redacted = (root / "config/surge-default-adapted.redacted.conf").read_text()
 for forbidden in ("MII", "-----BEGIN", "eyJ", "p12", "<REDACTED_POLICY_URL>"):

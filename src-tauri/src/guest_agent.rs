@@ -51,6 +51,8 @@ pub(crate) struct GuestAgentStatus {
     #[serde(default)]
     pub gateway_lan_ip: Option<String>,
     #[serde(default)]
+    pub gateway_lan_ipv6: Option<String>,
+    #[serde(default)]
     pub upstream_interface: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -180,7 +182,19 @@ impl GuestAgentEndpoint {
         if cancellation() {
             return Err("启动已取消".into());
         }
+        // Keep the TCP connect probe short so cancellation remains responsive,
+        // but do not carry that probe timeout into the request itself.  The
+        // guest agent is intentionally single-threaded; a 250 ms request
+        // timeout can make the host abandon a valid stage response while the
+        // guest is still scheduling, leaving the guest stuck waiting for the
+        // abandoned upload and causing every retry to queue behind it.
         let stream = self.connect(timeout.min(STARTUP_IO_SLICE))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("无法设置 guest agent 读取超时：{error}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| format!("无法设置 guest agent 写入超时：{error}"))?;
         if cancellation() {
             return Err("启动已取消".into());
         }
@@ -195,6 +209,7 @@ fn wait_for_session_ready(
     deadline: Instant,
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<GuestSessionResult, String> {
+    let mut last_status = None;
     loop {
         if cancellation() {
             return Err("启动已取消".into());
@@ -206,6 +221,7 @@ fn wait_for_session_ready(
         match request(endpoint, &mut stream, &json!({ "method": "status" })) {
             Ok(response) if response.ok => {
                 if let Some(status) = response.status {
+                    last_status = Some(status.clone());
                     let config_matches = status.config_sha256.as_deref() == Some(&config.sha256);
                     let module_plan_matches =
                         status.module_plan_sha256.as_deref() == Some(&module_plan.sha256);
@@ -219,6 +235,17 @@ fn wait_for_session_ready(
                             packet_stats: status.packet_stats,
                         });
                     }
+                    if (!config_matches || !module_plan_matches)
+                        && status
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Gateway session"))
+                    {
+                        return Err(format!(
+                            "guest agent 已回滚目标 session：{}",
+                            status.last_error.as_deref().unwrap_or("未知原因")
+                        ));
+                    }
                 }
             }
             Ok(_) => {}
@@ -226,7 +253,11 @@ fn wait_for_session_ready(
             Err(error) => return Err(format!("等待 guest Gateway session 就绪失败：{error}")),
         }
         if remaining_timeout(deadline).is_err() {
-            return Err("等待 guest Gateway session 就绪超时".into());
+            let detail = last_status
+                .as_ref()
+                .map(session_status_diagnostic)
+                .unwrap_or_else(|| "尚未取得 guest status 响应".into());
+            return Err(format!("等待 guest Gateway session 就绪超时：{detail}"));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -254,39 +285,41 @@ pub(crate) fn sync_session_with_cancellation(
         if cancellation() {
             return Err("启动已取消".into());
         }
-        match stage_config_and_upload(
-            endpoint,
-            config_path,
-            &config,
-            remaining_timeout(deadline)?,
-            cancellation,
-        ) {
+        let stage_timeout = remaining_timeout(deadline)
+            .map_err(|error| format!("guest sing-box 配置上传阶段超时：{error}"))?;
+        match stage_config_and_upload(endpoint, config_path, &config, stage_timeout, cancellation) {
             Ok(()) => break,
             Err(error) if is_retryable_io_timeout(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(format!("上传 guest sing-box 配置失败：{error}")),
         }
     }
     loop {
         if cancellation() {
             return Err("启动已取消".into());
         }
+        let stage_timeout = remaining_timeout(deadline)
+            .map_err(|error| format!("guest 模块运行计划上传阶段超时：{error}"))?;
         match stage_module_plan_and_upload(
             endpoint,
             plan_path,
             &module_plan,
-            remaining_timeout(deadline)?,
+            stage_timeout,
             cancellation,
         ) {
             Ok(()) => break,
             Err(error) if is_retryable_io_timeout(&error) => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(format!("上传 guest 模块运行计划失败：{error}")),
         }
     }
 
     if cancellation() {
         return Err("启动已取消".into());
     }
-    let mut stream = endpoint.connect_cancellable(remaining_timeout(deadline)?, cancellation)?;
+    let activation_timeout = remaining_timeout(deadline)
+        .map_err(|error| format!("guest Gateway session 激活阶段超时：{error}"))?;
+    let mut stream = endpoint
+        .connect_cancellable(activation_timeout, cancellation)
+        .map_err(|error| format!("连接 guest Gateway session 激活阶段失败：{error}"))?;
     let activation = request_cancellable(
         endpoint,
         &mut stream,
@@ -311,6 +344,7 @@ pub(crate) fn sync_session_with_cancellation(
             if response.ok && (response.state == "active" || response.state == "activating") =>
         {
             wait_for_session_ready(endpoint, &config, &module_plan, deadline, cancellation)
+                .map_err(|error| format!("等待 guest Gateway session 就绪阶段失败：{error}"))
         }
         Ok(response) => Err(if response.message.is_empty() {
             "guest Gateway session 激活失败".into()
@@ -323,7 +357,7 @@ pub(crate) fn sync_session_with_cancellation(
             &module_plan,
             deadline,
             cancellation,
-            error,
+            format!("guest Gateway session 激活请求失败：{error}"),
         ),
     }
 }
@@ -359,6 +393,20 @@ fn resolve_session_activation_failure(
                         packet_stats: status.packet_stats,
                     });
                 }
+                if (!config_matches || !module_plan_matches)
+                    && status
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Gateway session"))
+                {
+                    return Err(format!(
+                        "{message}；guest agent 报告：{}",
+                        status
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("Gateway session 已回滚")
+                    ));
+                }
             }
             Err(_) => {}
         }
@@ -368,6 +416,18 @@ fn resolve_session_activation_failure(
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!("{message}；guest session 未激活目标配置和模块计划"))
+}
+
+fn session_status_diagnostic(status: &GuestAgentStatus) -> String {
+    format!(
+        "healthy={} ready={} networkReady={} mitmHealthy={} mitmReady={} lastError={}",
+        status.healthy,
+        status.ready,
+        status.network_ready,
+        status.mitm_healthy,
+        status.mitm_ready,
+        status.last_error.as_deref().unwrap_or("<none>")
+    )
 }
 
 fn remaining_timeout(deadline: Instant) -> Result<Duration, String> {
@@ -1064,6 +1124,7 @@ mod tests {
             ready: false,
             network_ready: false,
             gateway_lan_ip: None,
+            gateway_lan_ipv6: None,
             upstream_interface: None,
             last_error: None,
             config_sha256: None,
@@ -1094,6 +1155,7 @@ mod tests {
             ready: false,
             network_ready: true,
             gateway_lan_ip: Some("192.168.1.2".into()),
+            gateway_lan_ipv6: Some("fe80::8e1f:64ff:fe47:22b8".into()),
             upstream_interface: Some("eth0".into()),
             last_error: Some("sing-box 配置文件不存在".into()),
             config_sha256: None,

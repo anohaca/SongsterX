@@ -70,6 +70,55 @@ validate_cidr() {
     [ "$prefix" -ge 1 ] 2>/dev/null && [ "$prefix" -le 30 ] 2>/dev/null
 }
 
+validate_ipv6_cidr() {
+    value=$1
+    case "$value" in auto|AUTO|Auto|aUto) return 0 ;; esac
+    case "$value" in */*) ;; *) return 1 ;; esac
+    address=${value%/*}
+    prefix=${value##*/}
+    case "$address" in
+        fe80:*|FE80:*|Fe80:*|fE80:* ) ;;
+        * ) return 1 ;;
+    esac
+    case "$address" in *[!0-9A-Fa-f:]* ) return 1 ;; *:* ) : ;; *) return 1 ;; esac
+    case "$prefix" in 64) ;; *) return 1 ;; esac
+}
+
+validate_ipv6_global_cidr() {
+    value=$1
+    case "$value" in */*) ;; *) return 1 ;; esac
+    address=${value%/*}
+    prefix=${value##*/}
+    case "$address" in
+        fe80:*|FE80:*|Fe80:*|fE80:*|ff*|FF*|Ff*|fF*|::|::1) return 1 ;;
+        *:* ) : ;;
+        * ) return 1 ;;
+    esac
+    case "$prefix" in 64) ;; *) return 1 ;; esac
+}
+
+validate_ipv6_gateway() {
+    value=$1
+    case "$value" in
+        [fF][eE]80:* ) ;;
+        * ) return 1 ;;
+    esac
+    case "$value" in *[!0-9A-Fa-f:]* ) return 1 ;; esac
+    case "$value" in *:* ) : ;; * ) return 1 ;; esac
+}
+
+link_local_from_mac() {
+    iface=$1
+    mac=$(normalize_mac "$(cat "$SYS_CLASS_NET/$iface/address")")
+    validate_mac "$mac" || return 1
+    old_ifs=$IFS
+    IFS=:
+    set -- $mac
+    IFS=$old_ifs
+    first=$(printf '%02x' $((0x$1 ^ 2)))
+    printf 'fe80::%s%s:%sff:fe%s:%s%s/64\n' "$first" "$2" "$3" "$4" "$5" "$6"
+}
+
 cidr_prefix() { printf '%s\n' "${1##*/}"; }
 
 validate_ifname() {
@@ -179,18 +228,35 @@ load_state() {
     LAN_ADDR=$(state_value LAN_ADDR) || return 1
     HOST_ADDR=$(state_value HOST_ADDR) || return 1
     LAN_CIDR=$(state_value LAN_CIDR) || return 1
+    LAN_IPV6=
+    LAN_IPV6=$(state_value LAN_IPV6 2>/dev/null) || LAN_IPV6=
+    LAN_IPV6_GLOBAL=
+    LAN_IPV6_GLOBAL=$(state_value LAN_IPV6_GLOBAL 2>/dev/null) || LAN_IPV6_GLOBAL=
     UPSTREAM_GATEWAY=$(state_value UPSTREAM_GATEWAY) || return 1
+    UPSTREAM_GATEWAY_IPV6=
+    UPSTREAM_GATEWAY_IPV6=$(state_value UPSTREAM_GATEWAY_IPV6 2>/dev/null) || UPSTREAM_GATEWAY_IPV6=
     AGENT_PORT=$(state_value AGENT_PORT) || return 1
     FIREWALL_BACKEND=$(state_value FIREWALL_BACKEND) || return 1
     ADDR_LAN=$(state_value ADDR_LAN) || return 1
     ADDR_HOST=$(state_value ADDR_HOST) || return 1
+    ADDR_LAN_IPV6=0
+    ADDR_LAN_IPV6=$(state_value ADDR_LAN_IPV6 2>/dev/null) || ADDR_LAN_IPV6=0
+    ADDR_LAN_IPV6_GLOBAL=0
+    ADDR_LAN_IPV6_GLOBAL=$(state_value ADDR_LAN_IPV6_GLOBAL 2>/dev/null) || ADDR_LAN_IPV6_GLOBAL=0
     ROUTE_ADDED=$(state_value ROUTE_ADDED) || return 1
+    IPV6_ROUTE_ADDED=0
+    IPV6_ROUTE_ADDED=$(state_value IPV6_ROUTE_ADDED 2>/dev/null) || IPV6_ROUTE_ADDED=0
     FIREWALL_ADDED=$(state_value FIREWALL_ADDED) || return 1
     IP_FORWARD_OLD=$(state_value IP_FORWARD_OLD) || return 1
+    IPV6_FORWARDING_OLD=0
+    IPV6_FORWARDING_OLD=$(state_value IPV6_FORWARDING_OLD 2>/dev/null) || IPV6_FORWARDING_OLD=0
     DNS_SERVER=$(state_value DNS_SERVER) || return 1
     RESOLV_BACKED_UP=$(state_value RESOLV_BACKED_UP) || return 1
     validate_ifname "$LAN_IF" && validate_ifname "$HOST_IF" || return 1
     validate_cidr "$LAN_ADDR" && validate_cidr "$HOST_ADDR" && validate_cidr "$LAN_CIDR" || return 1
+    [ -z "$LAN_IPV6" ] || validate_ipv6_cidr "$LAN_IPV6" || return 1
+    [ -z "$LAN_IPV6_GLOBAL" ] || validate_ipv6_global_cidr "$LAN_IPV6_GLOBAL" || return 1
+    [ -z "$UPSTREAM_GATEWAY_IPV6" ] || validate_ipv6_gateway "$UPSTREAM_GATEWAY_IPV6" || return 1
     valid_ipv4 "$UPSTREAM_GATEWAY" || return 1
     case "$DNS_SERVER" in
         ''|*[!A-Za-z0-9:._-]*) return 1 ;;
@@ -198,8 +264,9 @@ load_state() {
     case "$AGENT_PORT" in ''|*[!0-9]*) return 1 ;; esac
     [ "$AGENT_PORT" -ge 1 ] 2>/dev/null && [ "$AGENT_PORT" -le 65535 ] 2>/dev/null || return 1
     case "$FIREWALL_BACKEND" in nft|iptables) ;; *) return 1 ;; esac
-    case "$ADDR_LAN$ADDR_HOST$ROUTE_ADDED$FIREWALL_ADDED" in *[!01]*) return 1 ;; esac
+    case "$ADDR_LAN$ADDR_HOST$ADDR_LAN_IPV6$ADDR_LAN_IPV6_GLOBAL$ROUTE_ADDED$IPV6_ROUTE_ADDED$FIREWALL_ADDED" in *[!01]*) return 1 ;; esac
     case "$IP_FORWARD_OLD" in 0|1) ;; *) return 1 ;; esac
+    case "$IPV6_FORWARDING_OLD" in 0|1) ;; *) return 1 ;; esac
     case "$RESOLV_BACKED_UP" in 0|1) ;; *) return 1 ;; esac
 }
 
@@ -207,20 +274,27 @@ write_state() {
     tmp="$STATE_FILE.tmp.$$"
     mkdir -p "$RUN_DIR"
     {
-        printf 'VERSION=2\n'
+        printf 'VERSION=3\n'
         printf 'LAN_IF=%s\n' "$LAN_IF"
         printf 'HOST_IF=%s\n' "$HOST_IF"
         printf 'LAN_ADDR=%s\n' "$LAN_ADDR"
         printf 'HOST_ADDR=%s\n' "$HOST_ADDR"
         printf 'LAN_CIDR=%s\n' "$LAN_CIDR"
+        printf 'LAN_IPV6=%s\n' "$LAN_IPV6"
+        printf 'LAN_IPV6_GLOBAL=%s\n' "$LAN_IPV6_GLOBAL"
         printf 'UPSTREAM_GATEWAY=%s\n' "$UPSTREAM_GATEWAY"
+        printf 'UPSTREAM_GATEWAY_IPV6=%s\n' "$UPSTREAM_GATEWAY_IPV6"
         printf 'AGENT_PORT=%s\n' "$AGENT_PORT"
         printf 'FIREWALL_BACKEND=%s\n' "$FIREWALL_BACKEND"
         printf 'ADDR_LAN=%s\n' "$ADDR_LAN"
         printf 'ADDR_HOST=%s\n' "$ADDR_HOST"
+        printf 'ADDR_LAN_IPV6=%s\n' "$ADDR_LAN_IPV6"
+        printf 'ADDR_LAN_IPV6_GLOBAL=%s\n' "$ADDR_LAN_IPV6_GLOBAL"
         printf 'ROUTE_ADDED=%s\n' "$ROUTE_ADDED"
+        printf 'IPV6_ROUTE_ADDED=%s\n' "$IPV6_ROUTE_ADDED"
         printf 'FIREWALL_ADDED=%s\n' "$FIREWALL_ADDED"
         printf 'IP_FORWARD_OLD=%s\n' "$IP_FORWARD_OLD"
+        printf 'IPV6_FORWARDING_OLD=%s\n' "$IPV6_FORWARDING_OLD"
         printf 'DNS_SERVER=%s\n' "$DNS_SERVER"
         printf 'RESOLV_BACKED_UP=%s\n' "$RESOLV_BACKED_UP"
     } > "$tmp"
@@ -327,6 +401,9 @@ stop_forwarding() {
     [ "$FIREWALL_ADDED" = 1 ] && cleanup_firewall || true
     FIREWALL_ADDED=0
     restore_forwarding
+    if [ -w "$PROC_SYS_NET/ipv6/conf/all/forwarding" ]; then
+        printf '%s\n' "$IPV6_FORWARDING_OLD" > "$PROC_SYS_NET/ipv6/conf/all/forwarding"
+    fi
     write_state
 }
 
@@ -336,8 +413,14 @@ stop_all() {
     load_state || die "network.state 无效，拒绝按不可信状态清理"
     [ "$FIREWALL_ADDED" = 1 ] && cleanup_firewall || true
     restore_forwarding
+    if [ -w "$PROC_SYS_NET/ipv6/conf/all/forwarding" ]; then
+        printf '%s\n' "$IPV6_FORWARDING_OLD" > "$PROC_SYS_NET/ipv6/conf/all/forwarding"
+    fi
     [ "$ROUTE_ADDED" = 1 ] && "$IP_BIN" route del default via "$UPSTREAM_GATEWAY" dev "$LAN_IF" >/dev/null 2>&1 || true
+    [ "$IPV6_ROUTE_ADDED" = 1 ] && "$IP_BIN" -6 route del default via "$UPSTREAM_GATEWAY_IPV6" dev "$LAN_IF" >/dev/null 2>&1 || true
     [ "$ADDR_LAN" = 1 ] && "$IP_BIN" addr del "$LAN_ADDR" dev "$LAN_IF" >/dev/null 2>&1 || true
+    [ "$ADDR_LAN_IPV6" = 1 ] && "$IP_BIN" -6 addr del "$LAN_IPV6" dev "$LAN_IF" >/dev/null 2>&1 || true
+    [ "$ADDR_LAN_IPV6_GLOBAL" = 1 ] && "$IP_BIN" -6 addr del "$LAN_IPV6_GLOBAL" dev "$LAN_IF" >/dev/null 2>&1 || true
     [ "$ADDR_HOST" = 1 ] && "$IP_BIN" addr del "$HOST_ADDR" dev "$HOST_IF" >/dev/null 2>&1 || true
     restore_resolv_conf
     rm -f "$STATE_FILE" "$STATE_FILE.tmp.$$" "$RESOLV_BACKUP"
@@ -349,9 +432,12 @@ setup() {
     have_command "$IP_BIN" || die "找不到 ip 命令：$IP_BIN"
     LAN_IP=$(required_cmdline_value songsterx.lan_ip)
     LAN_CIDR=$(required_cmdline_value songsterx.lan_cidr)
+    LAN_IPV6_REQUEST=$(required_cmdline_value songsterx.lan_ipv6)
+    LAN_IPV6_GLOBAL=$(cmdline_value songsterx.lan_ipv6_global)
     HOST_IP=$(required_cmdline_value songsterx.host_ip)
     HOST_CIDR=$(required_cmdline_value songsterx.host_cidr)
     UPSTREAM_GATEWAY=$(required_cmdline_value songsterx.upstream_gateway)
+    UPSTREAM_GATEWAY_IPV6=$(cmdline_value songsterx.upstream_gateway_ipv6)
     DNS_SERVER=$(required_cmdline_value songsterx.dns_server)
     AGENT_PORT=$(required_cmdline_value songsterx.agent_port)
     LAN_IF_REQUEST=$(cmdline_value songsterx.lan_if)
@@ -360,9 +446,14 @@ setup() {
     HOST_MAC_REQUEST=$(cmdline_value songsterx.host_mac)
     valid_ipv4 "$LAN_IP" || die "songsterx.lan_ip 不是有效 IPv4"
     validate_cidr "$LAN_CIDR" || die "songsterx.lan_cidr 不是 IPv4 CIDR"
+    validate_ipv6_cidr "$LAN_IPV6_REQUEST" || die "songsterx.lan_ipv6 不是有效的链路本地 IPv6/64 或 auto"
+    [ -z "$LAN_IPV6_GLOBAL" ] || validate_ipv6_global_cidr "$LAN_IPV6_GLOBAL" ||
+        die "songsterx.lan_ipv6_global 必须是有效的全局 IPv6/64"
     valid_ipv4 "$HOST_IP" || die "songsterx.host_ip 不是有效 IPv4"
     validate_cidr "$HOST_CIDR" || die "songsterx.host_cidr 不是 IPv4 CIDR"
     valid_ipv4 "$UPSTREAM_GATEWAY" || die "songsterx.upstream_gateway 不是有效 IPv4"
+    [ -z "$UPSTREAM_GATEWAY_IPV6" ] || validate_ipv6_gateway "$UPSTREAM_GATEWAY_IPV6" ||
+        die "songsterx.upstream_gateway_ipv6 必须是 fe80::/64 链路本地地址"
     case "$DNS_SERVER" in
         ''|*[!A-Za-z0-9:._-]*) die "songsterx.dns_server 无效" ;;
     esac
@@ -372,15 +463,28 @@ setup() {
     LAN_IF=$(resolve_interface LAN "$LAN_IF_REQUEST" "$LAN_MAC_REQUEST")
     HOST_IF=$(resolve_interface host-only "$HOST_IF_REQUEST" "$HOST_MAC_REQUEST")
     [ "$LAN_IF" != "$HOST_IF" ] || die "LAN 与 host-only 不能绑定同一张 guest 网卡"
+    if [ "$LAN_IPV6_REQUEST" = auto ] || [ "$LAN_IPV6_REQUEST" = AUTO ] || [ "$LAN_IPV6_REQUEST" = Auto ] || [ "$LAN_IPV6_REQUEST" = aUto ]; then
+        LAN_IPV6=$(link_local_from_mac "$LAN_IF") || die "无法根据 LAN 网卡 MAC 生成 IPv6 网关地址"
+        LAN_IPV6_AUTO=1
+    else
+        LAN_IPV6=$LAN_IPV6_REQUEST
+        LAN_IPV6_AUTO=0
+    fi
+    validate_ipv6_cidr "$LAN_IPV6" || die "生成的 songsterx.lan_ipv6 无效：$LAN_IPV6"
     LAN_ADDR="$LAN_IP/$(cidr_prefix "$LAN_CIDR")"
     HOST_ADDR="$HOST_IP/$(cidr_prefix "$HOST_CIDR")"
     FIREWALL_BACKEND=$(choose_firewall_backend)
     ADDR_LAN=0
     ADDR_HOST=0
+    ADDR_LAN_IPV6=0
+    ADDR_LAN_IPV6_GLOBAL=0
     ROUTE_ADDED=0
+    IPV6_ROUTE_ADDED=0
     FIREWALL_ADDED=0
     IP_FORWARD_OLD=$(cat "$PROC_SYS_NET/ipv4/ip_forward" 2>/dev/null || printf '0')
     case "$IP_FORWARD_OLD" in 0|1) ;; *) die "ip_forward 状态无效" ;; esac
+    IPV6_FORWARDING_OLD=$(cat "$PROC_SYS_NET/ipv6/conf/all/forwarding" 2>/dev/null || printf '0')
+    case "$IPV6_FORWARDING_OLD" in 0|1) ;; *) die "IPv6 forwarding 状态无效" ;; esac
     mkdir -p "$RUN_DIR"
     RESOLV_BACKED_UP=0
     if [ -e "$RESOLV_CONF" ] || [ -L "$RESOLV_CONF" ]; then
@@ -390,12 +494,80 @@ setup() {
     write_state
     cleanup_on_error=1
     trap 'if [ "${cleanup_on_error:-1}" -ne 0 ]; then stop_all || true; fi' 0
+    if [ -n "$LAN_IPV6" ]; then
+        # Linux normally creates the EUI-64 link-local address as soon as the
+        # interface is brought up. Enable IPv6 before that transition so the
+        # automatic address exists when the guest is booted with
+        # songsterx.lan_ipv6=auto.
+        write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/all/disable_ipv6" 0
+        write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/default/disable_ipv6" 0
+        write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$LAN_IF/disable_ipv6" 0
+        write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$HOST_IF/disable_ipv6" 0
+        # Linux only accepts Router Advertisements while forwarding when
+        # accept_ra is set to 2. This lets the bridged guest learn the real
+        # global prefix and upstream router without DHCPv6.
+        write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$LAN_IF/accept_ra" 2
+    fi
     "$IP_BIN" link set dev lo up
     "$IP_BIN" link set dev "$LAN_IF" up
     "$IP_BIN" link set dev "$HOST_IF" up
+    # Keep multicast reception enabled explicitly. Some virtio-net/vmnet
+    # combinations restore the default filter when the interface is brought
+    # up, before allmulticast/promisc are applied below.
+    if ! "$IP_BIN" link set dev "$LAN_IF" multicast on; then
+        log "无法为 LAN 网卡启用 multicast，IPv6 NDP 可能无法从远端 LAN 设备到达"
+    fi
+    # NDP neighbor solicitations from another LAN device arrive as IPv6
+    # multicast (33:33:ff:xx:xx:xx).  vmnet bridged does not always preserve
+    # the guest's dynamically learned multicast filter, so explicitly ask the
+    # virtio-net device to accept multicast frames.  This is best-effort: a
+    # platform/driver that rejects the flag can still run IPv4 Gateway mode.
+    if ! "$IP_BIN" link set dev "$LAN_IF" allmulticast on; then
+        log "无法为 LAN 网卡启用 allmulticast，IPv6 NDP 可能无法从远端 LAN 设备到达"
+    fi
+    # Some vmnet/virtio combinations still apply a stale multicast filter to
+    # bridged ingress. Promiscuous mode makes the LAN NIC receive the physical
+    # segment's NDP frames as well. The guest firewall and sing-box remain the
+    # packet policy authority; this flag only changes NIC reception.
+    if ! "$IP_BIN" link set dev "$LAN_IF" promisc on; then
+        log "无法为 LAN 网卡启用 promisc，IPv6 NDP 可能无法从远端 LAN 设备到达"
+    fi
     "$IP_BIN" addr add "$LAN_ADDR" dev "$LAN_IF"
     ADDR_LAN=1
     write_state
+    if [ -n "$LAN_IPV6" ] && [ "$LAN_IPV6_AUTO" -eq 1 ]; then
+        # Do not rely on the kernel's implicit link-local address.  The
+        # address is derived from the pinned vfkit MAC, so make that exact
+        # address explicit and skip DAD; otherwise a bridged guest can report
+        # the calculated address before it is usable for external NDP.
+        if "$IP_BIN" -6 addr flush dev "$LAN_IF" scope link &&
+            "$IP_BIN" -6 addr add "$LAN_IPV6" dev "$LAN_IF" nodad; then
+            ADDR_LAN_IPV6=1
+            write_state
+        else
+            log "IPv6 LAN 地址配置失败，继续以 IPv4 网关运行：$LAN_IPV6"
+            LAN_IPV6=
+            LAN_IPV6_AUTO=0
+            write_state
+        fi
+    elif [ -n "$LAN_IPV6" ]; then
+        if "$IP_BIN" -6 addr add "$LAN_IPV6" dev "$LAN_IF"; then
+            ADDR_LAN_IPV6=1
+            write_state
+        else
+            log "IPv6 LAN 地址配置失败，继续以 IPv4 网关运行：$LAN_IPV6"
+            LAN_IPV6=
+            write_state
+        fi
+    fi
+    if [ -n "$LAN_IPV6_GLOBAL" ]; then
+        if "$IP_BIN" -6 addr add "$LAN_IPV6_GLOBAL" dev "$LAN_IF" nodad; then
+            ADDR_LAN_IPV6_GLOBAL=1
+            write_state
+        else
+            die "无法配置 guest IPv6 出站地址：$LAN_IPV6_GLOBAL"
+        fi
+    fi
     "$IP_BIN" addr add "$HOST_ADDR" dev "$HOST_IF"
     ADDR_HOST=1
     write_state
@@ -403,8 +575,19 @@ setup() {
     "$IP_BIN" route add default via "$UPSTREAM_GATEWAY" dev "$LAN_IF"
     ROUTE_ADDED=1
     write_state
+    if [ -n "$UPSTREAM_GATEWAY_IPV6" ]; then
+        if "$IP_BIN" -6 route show default dev "$LAN_IF" | grep -q .; then
+            log "IPv6 upstream default route already exists on $LAN_IF"
+        elif "$IP_BIN" -6 route add default via "$UPSTREAM_GATEWAY_IPV6" dev "$LAN_IF"; then
+            IPV6_ROUTE_ADDED=1
+        else
+            log "IPv6 upstream 默认路由添加失败，IPv6 仅保持局域网可达：$UPSTREAM_GATEWAY_IPV6"
+        fi
+        write_state
+    fi
     write_resolv_conf
     write_required_sysctl "$PROC_SYS_NET/ipv4/ip_forward" 1
+    write_required_sysctl "$PROC_SYS_NET/ipv6/conf/all/forwarding" 1
     write_optional_sysctl "$PROC_SYS_NET/ipv4/conf/all/rp_filter" 0
     write_optional_sysctl "$PROC_SYS_NET/ipv4/conf/$LAN_IF/rp_filter" 0
     write_optional_sysctl "$PROC_SYS_NET/ipv4/conf/$HOST_IF/rp_filter" 0
@@ -420,12 +603,8 @@ setup() {
     write_optional_sysctl "$PROC_SYS_NET/ipv4/conf/$HOST_IF/arp_announce" 2
     write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/all/accept_ra" 0
     write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/default/accept_ra" 0
-    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$LAN_IF/accept_ra" 0
+    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$LAN_IF/accept_ra" 2
     write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$HOST_IF/accept_ra" 0
-    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/all/disable_ipv6" 1
-    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/default/disable_ipv6" 1
-    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$LAN_IF/disable_ipv6" 1
-    write_optional_sysctl "$PROC_SYS_NET/ipv6/conf/$HOST_IF/disable_ipv6" 1
     case "$FIREWALL_BACKEND" in
         nft) setup_nft ;;
         iptables) setup_iptables ;;
@@ -435,7 +614,7 @@ setup() {
     : > "$READY_FILE"
     cleanup_on_error=0
     trap - 0
-    log "network ready: LAN=$LAN_IF $LAN_ADDR, host-only=$HOST_IF $HOST_ADDR, upstream=$UPSTREAM_GATEWAY, firewall=$FIREWALL_BACKEND"
+    log "network ready: LAN=$LAN_IF $LAN_ADDR${LAN_IPV6:+ $LAN_IPV6}${LAN_IPV6_GLOBAL:+ $LAN_IPV6_GLOBAL}, host-only=$HOST_IF $HOST_ADDR, upstream=$UPSTREAM_GATEWAY, firewall=$FIREWALL_BACKEND"
 }
 
 case "${1:-}" in
@@ -444,7 +623,7 @@ case "${1:-}" in
     stop) stop_all ;;
     status)
         if [ -f "$READY_FILE" ] && [ -f "$STATE_FILE" ] && load_state; then
-            printf 'ready lan_if=%s host_if=%s upstream=%s\n' "$LAN_IF" "$HOST_IF" "$UPSTREAM_GATEWAY"
+            printf 'ready lan_if=%s lan_ipv6=%s host_if=%s upstream=%s\n' "$LAN_IF" "$LAN_IPV6" "$HOST_IF" "$UPSTREAM_GATEWAY"
         else
             exit 1
         fi

@@ -5,6 +5,7 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin
 export PATH
 
 NETCTL=${SONGSTERX_NETCTL:-/usr/lib/songsterx/songsterx-gateway-net.sh}
+NDP=${SONGSTERX_NDP:-/usr/lib/songsterx/songsterx-gateway-ndp.py}
 AGENT=${SONGSTERX_AGENT:-/usr/bin/songsterx-gateway-agent}
 STATE_DIR=${SONGSTERX_STATE_DIR:-/var/lib/songsterx}
 RUN_DIR=${SONGSTERX_RUN_DIR:-/run/songsterx}
@@ -13,6 +14,7 @@ NETWORK_READY="$RUN_DIR/network.ready"
 AGENT_READY="$STATE_DIR/ready"
 AUTH_TOKEN_FILE="$STATE_DIR/agent.token"
 agent_pid=
+ndp_pid=
 
 log() { printf '%s\n' "songsterx-guest-init: $*" >&2; }
 die() { log "$*"; exit 1; }
@@ -30,6 +32,10 @@ state_value() {
 }
 
 on_signal() {
+    if [ -n "$ndp_pid" ]; then
+        kill "$ndp_pid" >/dev/null 2>&1 || true
+        wait "$ndp_pid" >/dev/null 2>&1 || true
+    fi
     if [ -n "$agent_pid" ]; then
         kill "$agent_pid" >/dev/null 2>&1 || true
         wait "$agent_pid" >/dev/null 2>&1 || true
@@ -40,6 +46,11 @@ on_signal() {
 }
 
 cleanup() {
+    if [ -n "$ndp_pid" ]; then
+        kill "$ndp_pid" >/dev/null 2>&1 || true
+        wait "$ndp_pid" >/dev/null 2>&1 || true
+        ndp_pid=
+    fi
     if [ -n "$agent_pid" ]; then
         kill "$agent_pid" >/dev/null 2>&1 || true
         wait "$agent_pid" >/dev/null 2>&1 || true
@@ -86,6 +97,14 @@ rm -f "$AGENT_READY"
 [ -f "$NETWORK_READY" ] || die "network controller 未产生 network.ready"
 HOST_IP=$(state_value HOST_ADDR | sed 's#/.*##') || die "network.state 缺少 HOST_ADDR"
 AGENT_PORT=$(state_value AGENT_PORT) || die "network.state 缺少 AGENT_PORT"
+LAN_IPV6=$(state_value LAN_IPV6) || LAN_IPV6=
+LAN_IF=$(state_value LAN_IF) || die "network.state 缺少 LAN_IF"
+if [ -n "$LAN_IPV6" ]; then
+    [ -x "$NDP" ] || die "NDP responder 不可执行：$NDP"
+    LAN_MAC=$(cat "/sys/class/net/$LAN_IF/address") || die "无法读取 LAN MAC"
+    "$NDP" --interface "$LAN_IF" --address "$LAN_IPV6" --mac "$LAN_MAC" &
+    ndp_pid=$!
+fi
 
 # Token 只来自文件，绝不从 kernel cmdline 传入。
 "$AGENT" \

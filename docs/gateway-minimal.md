@@ -1,13 +1,13 @@
 # macOS Surge 局域网网关最小方案（不含 DHCP）
 
-本方案把已提供的 `Default.conf` 和 `Untitled-1.md` 适配为 SongsterX 的最小 M0 链路。目标是：Mac 通过 VMNET Bridged Mode 接入物理局域网，为同一局域网内的其他设备提供三层网关；客户端保留现有 IP，只手工把默认网关和 DNS 指向 SongsterX；系统不启动 DHCP，也不启动 IPv6 Router Advertisement。
+本方案把已提供的 `Default.conf` 和 `Untitled-1.md` 适配为 SongsterX 的最小 M0 链路。目标是：Mac 通过 VMNET Bridged Mode 接入物理局域网，为同一局域网内的其他设备提供三层网关；客户端保留现有 IP，只手工把默认网关和 DNS 指向 SongsterX；系统不启动 DHCP 或 IPv6 Router Advertisement，LAN 网关提供稳定的链路本地 IPv6 地址，并在上游有稳定前缀时提供 IPv6 出站地址。
 
 当前实现状态：Gateway 使用 `vfkit + 极简 Linux guest`，双 virtio-net、guest 网络脚本、
-guest-agent 控制通道、最终 authenticated status 和 supervisor readiness 已接通。应用不会把
-“配置同步成功”冒充为实体 LAN 已验收：supervisor 启动后状态保持“等待局域网验收”，后台持续读取
-guest LAN 与 `tun0` 计数器，只有实体客户端产生两侧新增流量才标记 packet path 已验收。该观测不是
-完整的 ARP、TCP、UDP、DNS 或 MITM 协议测试；客户端仍由用户手工配置并做现场验证。DHCP、IPv6/RA
-明确不在本模式范围内。vfkit 契约详见 `docs/vfkit-gateway.md`。
+guest-agent 控制通道、最终 authenticated status 和 supervisor readiness 已接通。配置同步和
+guest 数据面就绪后，supervisor 立即发布运行状态；后台持续读取 guest LAN 与 `tun0` 计数器仅供
+活动页观察，不要求先有客户端流量。真实客户端的 ARP、TCP、UDP、DNS 或 MITM 协议测试仍需
+单独现场验证。DHCP、IPv6 RA/DHCPv6 明确不在本模式范围内；IPv6 TCP/UDP 由 guest
+sing-box TUN 接管，ICMPv6 由 guest 内核直接转发。vfkit 契约详见 `docs/vfkit-gateway.md`。
 
 这里的“网关 IP”是局域网内未占用、由客户端使用的网关地址；它必须和物理局域网处于同一网段。物理网卡由设置页指定，例如 `en0`，不能再使用独立的 `192.168.88.0/24` 虚拟网段。SongsterX 不修改本机默认路由，也不把本机 Enhanced Mode 冒充成局域网网关。
 
@@ -30,7 +30,7 @@ gateway-ip = 192.168.88.2
 cidr = 192.168.88.0/24
 dns-ip = 198.18.0.2
 dhcp = false
-ipv6 = false
+ipv6 = true
 client-policy = all
 clients = ""
 ```
@@ -59,7 +59,7 @@ sing-box FakeIP DNS + route/policy
   └─ tcp/8000 → reject
 ```
 
-仓库包含 `vmnet-helper` 的源码、构建脚本及 arm64 资源；Release `.app` 打包 helper、vfkit 和 Linux guest 镜像。`scripts/run_gateway_minimal.sh --check` 只验证 Gateway 契约，不能代替真实 LAN 客户端现场验证。当前 supervisor 的无特权 vmnet-helper 路径要求 macOS 26 或更高版本；macOS 15 及更早版本必须先实现受信任的 root-owned privileged helper，应用会在启动前 fail-fast，不会把权限问题伪装成 `VMNET_FAILURE`。应用启动时会检查 guest runtime readiness，UI 另以当前会话的 LAN/`tun0` 计数器验收 packet path；防火墙对未被 `tun0` 接管的 LAN forwarding 仍保持 fail-closed。
+仓库包含 `vmnet-helper` 的源码、构建脚本及 arm64 资源；Release `.app` 打包 helper、vfkit 和 Linux guest 镜像。`scripts/run_gateway_minimal.sh --check` 只验证 Gateway 契约，不能代替真实 LAN 客户端现场验证。当前 supervisor 的无特权 vmnet-helper 路径要求 macOS 26 或更高版本；macOS 15 及更早版本必须先实现受信任的 root-owned privileged helper，应用会在启动前 fail-fast，不会把权限问题伪装成 `VMNET_FAILURE`。应用启动时会检查 guest runtime readiness，UI 另以当前会话的 LAN/`tun0` 计数器作为观察信息；防火墙对未被 `tun0` 接管的 LAN forwarding 仍保持 fail-closed。
 
 ## 2. 输入配置的适配关系
 
@@ -93,12 +93,17 @@ IP：      保留现有地址（例如 192.168.1.20）
 掩码：    保留现有掩码（例如 255.255.255.0）
 网关：    <SONGSTERX_LAN_GATEWAY_IP>
 DNS：     198.18.0.2
-IPv6：    关闭或不配置
+IPv6：    默认网关填写 LAN 网关的 `fe80::/64` 地址；不提供 RA/DHCPv6。guest 会从物理网卡
+          的稳定全局 `/64` 自动生成出站 IPv6；没有稳定前缀时仅保证 IPv4 和链路本地 IPv6
 ```
 
-SongsterX 设置页保存物理网卡、网关 IP 和客户端策略字段；启动 Gateway 后这些字段会生成 guest 网络配置。macOS host 不创建网关 TUN，Linux guest 使用 `tun0`；客户端仍需手工配置，UI 只有在观察到 LAN/`tun0` 两侧新增计数后才显示 packet path 已验收。
+SongsterX 设置页保存物理网卡、网关 IP 和客户端策略字段；启动 Gateway 后这些字段会生成 guest 网络配置。macOS host 不创建网关 TUN，Linux guest 使用 `tun0`；客户端仍需手工配置，UI 会显示 LAN/`tun0` 当前计数，但计数不影响运行状态。
 
-网关本机需要接入上游网络，并由 `vmnet-helper` 持有物理网卡的 VMNET/L2 bridged 附件。仓库中的尖括号值不是可用凭据或网络地址。旧的 standalone runner 已移除；Gateway supervisor 在 vmnet/vfkit/guest-agent runtime readiness 失败时 fail-closed，runtime 成功后 UI 仍等待当前会话的实体流量验收，防火墙会拒绝未被 `tun0` 接管的 LAN forwarding，避免启动后静默放行旁路流量。
+Gateway guest 内的 Mixed 代理监听在 `gateway-ip:port`，例如
+`192.168.88.252:2080`，供局域网设备直接连接；macOS 本机仍保留
+`127.0.0.1:2080`。因此局域网客户端使用代理时填写网关 IP 和 2080 端口，使用三层网关接管时则把默认网关填写为该 IP。
+
+网关本机需要接入上游网络，并由 `vmnet-helper` 持有物理网卡的 VMNET/L2 bridged 附件。仓库中的尖括号值不是可用凭据或网络地址。旧的 standalone runner 已移除；Gateway supervisor 在 vmnet/vfkit/guest-agent runtime readiness 失败时 fail-closed，runtime 成功后立即发布运行状态，防火墙仍负责实际转发路径。
 
 网关模式使用 sing-box 1.12+ 的 FakeIP DNS server：A/AAAA 查询映射到 `198.18.0.0/15` 和 `fc00::/18`，`lan`、`local`、`localhost` 仍走系统 DNS；TUN 流量先执行 `resolve`，再按恢复出的域名匹配规则。FakeIP 只在网关模式启用，Mixed 模式继续使用系统 DNS，不修改本机 DNS 或系统路由。
 
@@ -140,13 +145,13 @@ brew install sing-box jq mitmproxy
 scripts/run_gateway_minimal.sh --check
 ```
 
-`scripts/run_gateway_minimal.sh --check` 只验证配置、资源闭包和 fail-closed 不变量。实际 Gateway 进程由应用 supervisor 按 bridged vmnet-helper、host-only vmnet-helper、vfkit、guest-agent 的顺序管理；UI 会在当前会话的 guest packet path gate 通过前保持“等待局域网验收”，guest 防火墙只允许 LAN 与 `tun0` 之间的转发。
+`scripts/run_gateway_minimal.sh --check` 只验证配置、资源闭包和 fail-closed 不变量。实际 Gateway 进程由应用 supervisor 按 bridged vmnet-helper、host-only vmnet-helper、vfkit、guest-agent 的顺序管理；UI 在 guest runtime readiness 完成后立即显示运行中，guest 防火墙负责 LAN 与 `tun0` 之间的实际转发。
 
 第一次做 HTTPS MITM 时，还要把 mitmproxy 的 M0 CA 安装到需要测试的客户端；生产环境应改成受控的 macOS Keychain CA，并只信任明确的 MITM 主机。
 
 ## 6. 已知未覆盖项
 
-M0 不是完整 Surge 替代品，明确未覆盖：DHCP、IPv6/RA、原生 Snell（由外部 bridge 提供）、旧版 macOS 的 vmnet-helper root/sudoers 自动配置、Surge JS runtime、模块脚本/Body Rewrite/binary body、GeoIP CN、远程客户端的进程名识别、完整 Host 映射、基于多策略的 MITM policy preservation、Dashboard/Controller API、UDP 高性能 fast path。IPv4 guest packet path 只有在当前会话观察到 LAN 与 `tun0` 两侧新增计数后才标记为已验收；这不代替协议级测试，实体客户端接入仍需现场验证。
+M0 不是完整 Surge 替代品，明确未覆盖：DHCP、IPv6 RA/DHCPv6、原生 Snell（由外部 bridge 提供）、旧版 macOS 的 vmnet-helper root/sudoers 自动配置、Surge JS runtime、模块脚本/Body Rewrite/binary body、GeoIP CN、远程客户端的进程名识别、完整 Host 映射、基于多策略的 MITM policy preservation、Dashboard/Controller API、UDP 高性能 fast path。IPv4/IPv6 guest packet path 的 LAN/`tun0` 计数只用于运行时观察，不代替协议级测试；ICMPv6 不进入 sing-box 连接列表；实体客户端接入仍需现场验证。
 
 ## 7. 安全要求
 

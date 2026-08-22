@@ -30,7 +30,6 @@ import {
 import {
   AppsListRegular,
   ChevronDownRegular,
-  ChevronRightRegular,
   CircleRegular,
   DocumentTextRegular,
   FlowRegular,
@@ -80,6 +79,7 @@ type GuestAgentStatus = {
   ready: boolean;
   networkReady: boolean;
   gatewayLanIp?: string | null;
+  gatewayLanIpv6?: string | null;
   upstreamInterface?: string | null;
   lastError?: string | null;
   packetStats?: GuestPacketStats | null;
@@ -450,9 +450,8 @@ function snapshotToConnection(snapshot: RuntimeConnectionSnapshot, lastSeen: num
 }
 
 function connectionRuntimeLabel(runtime: ConnectionInfo["runtime"]): string {
-  if (runtime === "guest") return "Gateway guest";
   if (runtime === "system") return "系统网络";
-  return "Host sing-box";
+  return "sing-box";
 }
 
 function connectionOutboundLabel(outbound: string): string {
@@ -798,15 +797,13 @@ type RuntimeSettings = {
   gatewayLanInterface: string;
   gatewayIp: string;
   gatewayCidr: string;
+  gatewayIpv6: string;
   gatewayDnsIp: string;
   gatewayClients: string;
   gatewayClientPolicy: "all" | "allowlist";
-  gatewayPolicyMode: "shared" | "separate";
   mitmCaDir: string;
   logLevel: "trace" | "debug" | "info" | "warn" | "error";
 };
-
-type ProxyConfigTarget = "host" | "guest";
 
 type AppearanceMode = "system" | "light" | "dark";
 
@@ -850,7 +847,7 @@ const defaultSettings: RuntimeSettings = {
   gatewayGuestInitrdPath: "",
   gatewayGuestCmdline: "console=hvc0 quiet",
   gatewayGuestCpus: 1,
-  gatewayGuestMemoryMib: 512,
+  gatewayGuestMemoryMib: 768,
   gatewayHostIp: "192.168.250.1",
   gatewayGuestHostIp: "192.168.250.2",
   gatewayHostCidr: "192.168.250.0/24",
@@ -861,10 +858,10 @@ const defaultSettings: RuntimeSettings = {
   gatewayLanInterface: "",
   gatewayIp: "",
   gatewayCidr: "",
+  gatewayIpv6: "auto",
   gatewayDnsIp: "",
   gatewayClients: "",
   gatewayClientPolicy: "all",
-  gatewayPolicyMode: "shared",
   mitmCaDir: "",
   logLevel: "info",
 };
@@ -914,8 +911,6 @@ function App() {
   const [metrics, setMetrics] = useState<RuntimeMetrics>({ uploadTotal: 0, downloadTotal: 0, activeConnections: 0, memory: 0, connections: [], hostSnapshotValid: true, hostSnapshotError: null, guestSnapshotValid: true, guestSnapshotError: null, systemSnapshotValid: true, systemSnapshotError: null });
   const [connectionHistory, setConnectionHistory] = useState<ConnectionInfo[]>([]);
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
-  const [guestProxyConfig, setGuestProxyConfig] = useState<ProxyConfig>({ nodes: [], groups: [], rules: [], ruleSets: [] });
-  const [proxyConfigTarget, setProxyConfigTarget] = useState<ProxyConfigTarget>("host");
   const [proxies, setProxies] = useState<ProxyInfo[]>([]);
   const [modules, setModules] = useState<ModuleInfo[]>([]);
   const [mitmCertificate, setMitmCertificate] = useState<MitmCertificateInfo | null>(null);
@@ -1100,12 +1095,7 @@ function App() {
 
   async function refreshProxyConfig() {
     try {
-      const [host, guest] = await Promise.all([
-        invoke<ProxyConfig>("get_proxy_config"),
-        invoke<ProxyConfig>("get_gateway_guest_proxy_config"),
-      ]);
-      setProxyConfig(host);
-      setGuestProxyConfig(guest);
+      setProxyConfig(await invoke<ProxyConfig>("get_proxy_config"));
     } catch (error) {
       addLocalLog("error", String(error));
     }
@@ -1210,8 +1200,7 @@ function App() {
 
   async function refreshProxies(quiet = false) {
     try {
-      const target = settings.gatewayPolicyMode === "separate" ? proxyConfigTarget : "host";
-      setProxies(await invoke<ProxyInfo[]>("get_proxies", { target }));
+      setProxies(await invoke<ProxyInfo[]>("get_proxies"));
     } catch (error) {
       if (!quiet) addLocalLog("error", String(error));
     }
@@ -1219,8 +1208,7 @@ function App() {
 
   async function selectProxy(group: string, name: string) {
     try {
-      const target = settings.gatewayPolicyMode === "separate" ? proxyConfigTarget : "host";
-      await invoke("select_proxy", { group, name, target });
+      await invoke("select_proxy", { group, name });
       await refreshProxies();
     } catch (error) {
       addLocalLog("error", String(error));
@@ -1228,8 +1216,7 @@ function App() {
   }
 
   async function testProxyDelay(name: string): Promise<number> {
-    const target = settings.gatewayPolicyMode === "separate" ? proxyConfigTarget : "host";
-    return invoke<number>("test_proxy_delay", { name, url: "http://www.gstatic.com/generate_204", timeoutMs: 5_000, target });
+    return invoke<number>("test_proxy_delay", { name, url: "http://www.gstatic.com/generate_204", timeoutMs: 5_000 });
   }
 
   async function waitForRuntimeState(expected: RuntimeStatus["state"], timeoutMs = 30_000): Promise<RuntimeStatus> {
@@ -1253,7 +1240,7 @@ function App() {
     throw new Error(`等待运行时进入${expected}状态超时`);
   }
 
-  async function saveProxyConfig(config: ProxyConfig, target: ProxyConfigTarget = "host"): Promise<ProxyConfig> {
+  async function saveProxyConfig(config: ProxyConfig): Promise<ProxyConfig> {
     if (runtimeOperationInFlight.current) {
       throw new Error("运行时操作进行中，请稍后重试");
     }
@@ -1266,10 +1253,8 @@ function App() {
         setStatus(await invoke<RuntimeStatus>("stop_runtime"));
         await waitForRuntimeState("stopped");
       }
-      const command = target === "guest" ? "save_gateway_guest_proxy_config" : "save_proxy_config";
-      const saved = await invoke<ProxyConfig>(command, { config });
-      if (target === "guest") setGuestProxyConfig(saved);
-      else setProxyConfig(saved);
+      const saved = await invoke<ProxyConfig>("save_proxy_config", { config });
+      setProxyConfig(saved);
       if (wasRunning) {
         setStatus(await invoke<RuntimeStatus>("start_mix_direct"));
         await waitForRuntimeState("running");
@@ -1357,7 +1342,6 @@ function App() {
       const reset = await invoke<RuntimeSettings>("reset_runtime_settings");
       setSettings(reset);
       setPersistedSettings(reset);
-      setProxyConfigTarget("host");
       await refreshProxyConfig();
       setSettingsMessage("已恢复默认设置。");
     } catch (error) {
@@ -1372,7 +1356,7 @@ function App() {
     void refreshProxies(true);
     const timer = window.setInterval(() => void refreshProxies(true), 3000);
     return () => window.clearInterval(timer);
-  }, [view, isActive, testingProxy, proxyConfigTarget, settings.gatewayPolicyMode]);
+  }, [view, isActive, testingProxy]);
 
   useEffect(() => {
     if (!isActive || !status.mode.includes("gateway")) {
@@ -1443,9 +1427,9 @@ function App() {
             </header>
 
             {view === "overview" && <OverviewPage status={status} settings={settings} settingsDirty={settingsDirty} metrics={metrics} running={isRunning} guestStatus={guestStatus} guestStatusError={guestStatusError} onNavigate={setView} />}
-            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} hostSnapshotValid={metrics.hostSnapshotValid} hostSnapshotError={metrics.hostSnapshotError} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} systemSnapshotValid={metrics.systemSnapshotValid} systemSnapshotError={metrics.systemSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
-            {view === "strategy" && <StrategyPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} proxies={proxies} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
-            {view === "rules" && <RulesPage config={proxyConfigTarget === "guest" && settings.gatewayPolicyMode === "separate" ? guestProxyConfig : proxyConfig} running={isActive} policyMode={settings.gatewayPolicyMode} target={proxyConfigTarget} onTargetChange={setProxyConfigTarget} onSave={async (config, target) => { await saveProxyConfig(config, target); }} />}
+            {view === "activity" && <ActivityPage connections={connectionHistory} connectionEvents={connectionEvents} running={isActive} logs={logs} hostSnapshotValid={metrics.hostSnapshotValid} hostSnapshotError={metrics.hostSnapshotError} guestSnapshotValid={metrics.guestSnapshotValid} guestSnapshotError={metrics.guestSnapshotError} onClear={() => { setLogs([]); setConnectionEvents([]); }} />}
+            {view === "strategy" && <StrategyPage config={proxyConfig} proxies={proxies} running={isActive} onSelect={(group, name) => void selectProxy(group, name)} onTestDelay={testProxyDelay} onTestingChange={setTestingProxy} onSave={async (config) => { await saveProxyConfig(config); }} />}
+            {view === "rules" && <RulesPage config={proxyConfig} running={isActive} onSave={async (config) => { await saveProxyConfig(config); }} />}
             {view === "modules" && <ModulesPage modules={modules} mitmCertificate={mitmCertificate} mitmCertificateMessage={mitmCertificateMessage} onOpenMitmCertificate={openMitmCertificate} onInstallMitmCertificate={installMitmCertificate} onToggleModule={toggleModule} onSetModuleArgument={setModuleArgument} onImportModule={importModules} onImportModuleUrl={importModuleUrl} />}
             {view === "config" && <div className="page-content page-stack"><ConfigViewer documents={configDocuments} error={configError} onRefresh={refreshConfigDocuments} onReload={reloadConfigDocuments} /></div>}
             {view === "settings" && <SettingsPage settings={settings} settingsDirty={settingsDirty} running={isActive} runtimeBusy={busy} busy={settingsBusy} message={settingsMessage} appearanceMode={appearanceMode} onAppearanceChange={setAppearanceMode} onChange={setSettings} onSave={() => void saveSettings()} onReset={() => void resetSettings()} onStop={() => void toggleRuntime()} />}
@@ -1507,10 +1491,11 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
   const runtimeActive = status.canStop || status.state === "starting" || status.state === "stopping";
   const runtimeName = gatewayMode ? "Mixed + 局域网网关" : "Mixed 代理";
   const gatewayIp = status.vmGatewayIp || settings.gatewayIp;
+  const gatewayIpv6 = guestStatus?.gatewayLanIpv6 || settings.gatewayIpv6;
   const mixedListen = running ? status.listen : `${settings.listen}:${settings.port}`;
   const gatewayDnsIp = status.vmGatewayDnsIp || (settings.dnsMode === "fakeip" ? "198.18.0.2" : settings.gatewayDnsIp);
   const gatewayState = running
-    ? (gatewayMode && !status.gatewayPacketPathReady ? "等待局域网验收" : "运行中")
+    ? "运行中"
     : status.state === "running" && !status.healthy ? "启动异常，可停止"
     : status.state === "error" ? "暂不可用" : settingsDirty ? "待应用" : "未启动";
   const runtimePresentation = {
@@ -1543,7 +1528,7 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
               {mixedListen}
               {copyMessage && <span className="hero-copied">{copyMessage}</span>}
             </button>
-            <Text className="hero-message" size={200}>{runtimeActive ? status.message : gatewayMode ? "vfkit 双 virtio-net、guest 网络和 guest-agent 已配置；实体 LAN 流量仍需现场验证。" : status.message}</Text>
+            <Text className="hero-message" size={200}>{runtimeActive ? status.message : gatewayMode ? "vfkit 双 virtio-net、guest 网络、guest-agent 和 guest 数据面已配置。" : status.message}</Text>
           </div>
         </div>
         <div className="hero-actions">
@@ -1559,32 +1544,28 @@ function OverviewPage({ status, settings, settingsDirty, metrics, running, guest
       </section>
 
       <Card className="panel gateway-overview-panel">
-        <div className="gateway-overview-heading"><div><Text as="h2" size={400} weight="semibold">入口</Text><Text size={200}>本机 Mixed 代理始终可用；局域网网关通过 vfkit guest 接管实体 LAN 流量，二者可同时运行。</Text></div><Badge appearance="tint" color={running && (!gatewayMode || status.gatewayPacketPathReady) ? "success" : status.state === "error" || (status.state === "running" && !status.healthy) ? "danger" : running ? "warning" : settingsDirty ? "warning" : "subtle"}>{gatewayState}</Badge></div>
+        <div className="gateway-overview-heading"><div><Text as="h2" size={400} weight="semibold">入口</Text><Text size={200}>{gatewayMode ? "Gateway 只运行一个 VM 内 sing-box 数据面，负责局域网 Mixed 入口和模块链路。" : "本机运行一个 sing-box Mixed 数据面，提供 HTTP / SOCKS5 代理入口。"}</Text></div><Badge appearance="tint" color={running ? "success" : status.state === "error" || (status.state === "running" && !status.healthy) ? "danger" : settingsDirty ? "warning" : "subtle"}>{gatewayState}</Badge></div>
         <div className="gateway-overview-grid">
-          <DefinitionRow label="本机 Mixed" value={mixedListen} mono />
+          <DefinitionRow label={gatewayMode ? "Gateway Mixed" : "本机 Mixed"} value={mixedListen} mono />
           <DefinitionRow label="DNS" value={status.dns || "系统 DNS"} />
           {gatewayMode && <DefinitionRow label="物理网卡" value={settings.gatewayLanInterface || "未填写"} mono />}
           {gatewayMode && <DefinitionRow label="网关 IP" value={gatewayIp || "未填写"} mono />}
+          {gatewayMode && <DefinitionRow label="IPv6 网关地址" value={gatewayIpv6 === "auto" ? "启动后按 MAC 自动生成" : gatewayIpv6 || "未填写"} mono />}
           {gatewayMode && <DefinitionRow label="客户端 DNS" value={gatewayDnsIp || "未填写"} mono />}
         </div>
-        {gatewayMode && <GatewayPacketPath guestStatus={guestStatus} error={guestStatusError} running={running} verified={status.gatewayPacketPathReady} />}
+        {gatewayMode && <GatewayPacketPath guestStatus={guestStatus} error={guestStatusError} running={running} />}
         {!running && <div className="gateway-overview-note"><Text size={200}>{settingsDirty ? "当前选择尚未保存；点击设置页的“应用更改”，或直接点击顶部“启动”自动保存。" : "Gateway 启动时会检查 vmnet、vfkit、guest-agent 和 sing-box readiness；客户端需手工配置网关和 DNS。"}</Text><Button appearance="subtle" onClick={() => onNavigate("settings")}>查看网关设置</Button></div>}
       </Card>
 
-      <section className="overview-live-section">
-        <SectionHeading title="实时连接" description="当前仍在传输且已经进入 SongsterX 的连接；已完成请求请前往活动查看。" action={<Badge appearance="outline" color={running ? "success" : "subtle"}>{metrics.activeConnections} 个</Badge>} />
-        <Card className="panel overview-live-panel"><LiveConnections metrics={metrics} running={running} /></Card>
-      </section>
     </div>
   );
 }
 
-function GatewayPacketPath({ guestStatus, error, running, verified }: { guestStatus: GuestAgentStatus | null; error: string; running: boolean; verified: boolean }) {
+function GatewayPacketPath({ guestStatus, error, running }: { guestStatus: GuestAgentStatus | null; error: string; running: boolean }) {
   const lan = guestStatus?.packetStats?.lan ?? null;
   const tun = guestStatus?.packetStats?.tun ?? null;
-  const pathReady = Boolean(lan && tun && (lan.rxPackets > 0 || lan.txPackets > 0) && (tun.rxPackets > 0 || tun.txPackets > 0));
-  const state = !running ? "未运行" : error ? "探测失败" : !guestStatus ? "探测中…" : !lan || !tun ? "接口不可见" : verified ? "已验收" : pathReady ? "观察到流量，确认中" : "等待流量";
-  const badgeColor = state === "已验收" ? "success" : state === "探测失败" || state === "接口不可见" ? "danger" : state === "等待流量" || state === "观察到流量，确认中" ? "warning" : "subtle";
+  const state = !running ? "未运行" : error ? "状态读取失败" : "运行中";
+  const badgeColor = state === "运行中" ? "success" : state === "状态读取失败" ? "danger" : "subtle";
 
   return <div className="gateway-packet-path">
     <div className="gateway-packet-heading"><div><Text as="h3" size={300} weight="semibold">Guest packet path</Text><Text size={200}>LAN RX/TX 和 tun0 RX/TX 来自 guest 内核计数，不代表本机 Mixed 入口的请求记录。</Text></div><Badge appearance="tint" color={badgeColor as "success" | "danger" | "warning" | "subtle"}>{state}</Badge></div>
@@ -1592,7 +1573,7 @@ function GatewayPacketPath({ guestStatus, error, running, verified }: { guestSta
       <PacketStatsRow label="LAN" stats={lan} />
       <PacketStatsRow label="TUN" stats={tun} />
     </div>
-    <Text className="gateway-packet-note" size={200}>{error || (running ? (verified ? "LAN 客户端流量已通过 guest LAN → tun0 数据面。" : "让客户端把网关设为上方 IP 后访问一次网络；启动后的 LAN 和 TUN 计数都增加后才会标记为已验收。") : "启动 Gateway 后，这里会显示 guest 内核接口计数。")}</Text>
+    <Text className="gateway-packet-note" size={200}>{error || (running ? "LAN 和 tun0 计数仅用于观察 guest 数据面流量，不影响网关启动状态。" : "启动 Gateway 后，这里会显示 guest 内核接口计数。")}</Text>
   </div>;
 }
 
@@ -1622,11 +1603,6 @@ function DefinitionRow({ label, value, mono = false }: { label: string; value: s
 
 function ActivityRow({ log }: { log: RuntimeLog }) {
   return <div className="activity-row"><span className={`activity-level-dot log-${log.level}`} /><div className="activity-row-main"><Text className="activity-message" size={200}>{log.message}</Text></div><Text className="activity-time mono-value" size={200}>{formatPreciseTimestamp(log.timestamp, log.timestampUs)}</Text></div>;
-}
-
-function LogLevelBadge({ level }: { level: RuntimeLog["level"] }) {
-  const labels: Record<RuntimeLog["level"], string> = { debug: "调试", info: "信息", warn: "警告", error: "错误" };
-  return <span className={`log-level log-${level}`}><span className="log-level-dot" />{labels[level]}</span>;
 }
 
 function formatConnectionTime(value: string, explicitTimestampUs?: number): string {
@@ -1774,8 +1750,11 @@ function ConnectionTraffic({ connection }: { connection: ConnectionInfo }) {
   return <div className="activity-traffic"><span className={connection.upload == null ? "activity-muted" : undefined}>↑ {formatBytes(connection.upload)}</span><span className={connection.download == null ? "activity-muted" : undefined}>↓ {formatBytes(connection.download)}</span></div>;
 }
 
-function ActivityPage({ connections, connectionEvents, running, logs, hostSnapshotValid, hostSnapshotError, guestSnapshotValid, guestSnapshotError, systemSnapshotValid, systemSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; hostSnapshotValid: boolean; hostSnapshotError?: string | null; guestSnapshotValid: boolean; guestSnapshotError?: string | null; systemSnapshotValid: boolean; systemSnapshotError?: string | null; onClear: () => void }) {
+function ActivityPage({ connections, connectionEvents, running, logs, hostSnapshotValid, hostSnapshotError, guestSnapshotValid, guestSnapshotError, onClear }: { connections: ConnectionInfo[]; connectionEvents: ConnectionEvent[]; running: boolean; logs: RuntimeLog[]; hostSnapshotValid: boolean; hostSnapshotError?: string | null; guestSnapshotValid: boolean; guestSnapshotError?: string | null; onClear: () => void }) {
   const [connectionQuery, setConnectionQuery] = useState("");
+  const [connectionStatus, setConnectionStatus] = useState("all");
+  const [connectionRuntime, setConnectionRuntime] = useState("all");
+  const [connectionOrder, setConnectionOrder] = useState("newest");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [activityTab, setActivityTab] = useState("requests");
   const [eventQuery, setEventQuery] = useState("");
@@ -1784,8 +1763,16 @@ function ActivityPage({ connections, connectionEvents, running, logs, hostSnapsh
   const toggleConnection = (id: string) => setExpandedId((current) => current === id ? null : id);
   const filteredConnections = connections
     .slice()
-    .sort((left, right) => Date.parse(right.start) - Date.parse(left.start))
-    .filter((connection) => `${connection.id} ${connection.runtime} ${connection.logId ?? ""} ${connection.clashId ?? ""} ${connection.source} ${connection.destination} ${connection.host} ${connection.outbound} ${connection.network} ${connection.process ?? ""} ${connection.pid ?? ""} ${connection.state ?? ""}`.toLowerCase().includes(connectionQuery.toLowerCase()));
+    .filter((connection) => connectionStatus === "all" || connection.status === connectionStatus)
+    .filter((connection) => connectionRuntime === "all" || connection.runtime === connectionRuntime)
+    .filter((connection) => `${connection.id} ${connection.runtime} ${connection.logId ?? ""} ${connection.clashId ?? ""} ${connection.source} ${connection.destination} ${connection.host} ${connection.outbound} ${connection.network} ${connection.process ?? ""} ${connection.pid ?? ""} ${connection.state ?? ""}`.toLowerCase().includes(connectionQuery.toLowerCase()))
+    .sort((left, right) => {
+      // 正在查看的连接始终置顶，新连接插入其下方，不会被刷下去。
+      if (expandedId === left.id) return -1;
+      if (expandedId === right.id) return 1;
+      const delta = Date.parse(right.start) - Date.parse(left.start);
+      return connectionOrder === "newest" ? delta : -delta;
+    });
   const filteredLogs = logs
     .slice()
     .reverse()
@@ -1798,14 +1785,14 @@ function ActivityPage({ connections, connectionEvents, running, logs, hostSnapsh
       <Tab value="logs">运行日志</Tab>
     </TabList>
     {activityTab === "requests" && <Card className="panel activity-connections-panel">
-      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>仅显示已经进入 Host sing-box 或 Gateway guest 的连接：何时 → 去哪里 → 当前状态 → 使用策略 → 流量和时长。</Text>{running && !hostSnapshotValid && <Text className="activity-warning-note" size={200}>Host 连接观察暂时不可用，已保留上一批记录{hostSnapshotError ? `：${hostSnapshotError}` : ""}。</Text>}{running && !guestSnapshotValid && <Text className="activity-warning-note" size={200}>Gateway guest 连接观察暂时不可用，已保留上一批记录{guestSnapshotError ? `：${guestSnapshotError}` : ""}。</Text>}</div><Badge appearance="outline" color={running && (!hostSnapshotValid || !guestSnapshotValid) ? "warning" : running ? "warning" : "subtle"}>{running && !hostSnapshotValid ? "Host 观察不可用" : running && !guestSnapshotValid ? "Guest 观察不可用" : `${connections.length} 条记录`}</Badge></div>
-      <div className="activity-toolbar"><Input contentBefore={<SearchRegular />} value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} placeholder="搜索地址、客户端、策略或 ID" /></div>
+      <div className="activity-panel-heading"><div><Text as="h2" size={400} weight="semibold">请求记录</Text><Text size={200}>已进入 sing-box 的连接：时间、目标、状态、策略、流量与时长。</Text></div><Badge appearance="outline" color={running ? "warning" : "subtle"}>{`${connections.length} 条记录`}</Badge></div>
+      <div className="activity-toolbar"><Input contentBefore={<SearchRegular />} value={connectionQuery} onChange={(event) => setConnectionQuery(event.target.value)} placeholder="搜索地址、客户端、策略或 ID" /><Select value={connectionStatus} onChange={(event) => setConnectionStatus(event.target.value)} aria-label="状态筛选"><option value="all">全部状态</option><option value="active">活跃</option><option value="completed">已完成</option><option value="observed">已记录</option></Select><Select value={connectionRuntime} onChange={(event) => setConnectionRuntime(event.target.value)} aria-label="运行位置筛选"><option value="all">全部位置</option><option value="system">系统网络</option></Select><Select value={connectionOrder} onChange={(event) => setConnectionOrder(event.target.value)} aria-label="排序方向"><option value="newest">最新在前</option><option value="oldest">最早在前</option></Select></div>
       {filteredConnections.length === 0 ? <EmptyState title={running ? "暂无请求记录" : "暂无请求历史"} description={running ? "让应用通过 Mixed 代理访问网络后，请求会显示在这里。" : "启动代理接入后，请求记录会显示在这里。"} /> : <>
         <div className="activity-table-scroll" tabIndex={0} aria-label="代理请求记录">
           <Table size="small" className="data-table activity-connection-table">
             <TableHeader><TableRow><TableHeaderCell>时间</TableHeaderCell><TableHeaderCell>请求</TableHeaderCell><TableHeaderCell>来源</TableHeaderCell><TableHeaderCell>状态</TableHeaderCell><TableHeaderCell>策略</TableHeaderCell><TableHeaderCell>流量</TableHeaderCell><TableHeaderCell>时长</TableHeaderCell><TableHeaderCell>协议</TableHeaderCell></TableRow></TableHeader>
             <TableBody>{filteredConnections.map((connection) => <Fragment key={connection.id}>
-              <TableRow className="activity-request-row" tabIndex={0} aria-expanded={expandedId === connection.id} onClick={() => toggleConnection(connection.id)} onKeyDown={(event) => { if (event.key === "Escape" && expandedId === connection.id) { event.preventDefault(); setExpandedId(null); } else if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleConnection(connection.id); } }}>
+              <TableRow className={`activity-request-row ${expandedId === connection.id ? "is-pinned" : ""}`} tabIndex={0} aria-expanded={expandedId === connection.id} onClick={() => toggleConnection(connection.id)} onKeyDown={(event) => { if (event.key === "Escape" && expandedId === connection.id) { event.preventDefault(); setExpandedId(null); } else if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleConnection(connection.id); } }}>
                 <TableCell className="activity-time-cell mono-cell">{formatConnectionTime(connection.start, connection.startUs)}</TableCell>
                 <TableCell className="activity-request-cell"><div className="activity-request-address" title={connectionDisplayAddress(connection)}>{connectionDisplayAddress(connection)}</div><div className="activity-request-meta"><span className="activity-request-client" title={connection.process || connection.source || undefined}>{connection.process ? `${connection.process}${connection.pid ? ` (${connection.pid})` : ""}` : connection.source || "未知客户端"}</span><span aria-hidden="true"> · </span><span>#{connectionDisplayId(connection)}</span></div></TableCell>
                 <TableCell>{connectionRuntimeLabel(connection.runtime)}</TableCell>
@@ -1980,28 +1967,14 @@ function createDefaultProxyNode(index: number): ProxyNode {
   };
 }
 
-function ProxyPolicyTargetBar({ mode, target, onChange }: { mode: RuntimeSettings["gatewayPolicyMode"]; target: ProxyConfigTarget; onChange: (target: ProxyConfigTarget) => void }) {
-  if (mode !== "separate") return null;
-  return <section className="proxy-policy-target" aria-label="策略配置目标">
-    <div className="proxy-policy-target-copy"><Text weight="semibold">策略配置目标</Text><Text size={200}>Host 与 Gateway guest 使用独立的节点、策略组、规则和规则集，请分别编辑。</Text></div>
-    <TabList className="proxy-policy-target-tabs" selectedValue={target} onTabSelect={(_, data) => onChange(String(data.value) as ProxyConfigTarget)} aria-label="策略配置目标">
-      <Tab value="host">Host · macOS</Tab>
-      <Tab value="guest">Guest · Linux VM</Tab>
-    </TabList>
-  </section>;
-}
-
-function StrategyPage({ config, proxies, running, policyMode, target, onTargetChange, onSelect, onTestDelay, onTestingChange, onSave }: {
+function StrategyPage({ config, proxies, running, onSelect, onTestDelay, onTestingChange, onSave }: {
   config: ProxyConfig;
   proxies: ProxyInfo[];
   running: boolean;
-  policyMode: RuntimeSettings["gatewayPolicyMode"];
-  target: ProxyConfigTarget;
-  onTargetChange: (target: ProxyConfigTarget) => void;
   onSelect: (group: string, name: string) => void;
   onTestDelay: (name: string) => Promise<number>;
   onTestingChange: (testing: boolean) => void;
-  onSave: (config: ProxyConfig, target: ProxyConfigTarget) => Promise<void>;
+  onSave: (config: ProxyConfig) => Promise<void>;
 }) {
   const [draft, setDraft] = useState<ProxyConfig>(config);
   const [message, setMessage] = useState("");
@@ -2025,7 +1998,7 @@ function StrategyPage({ config, proxies, running, policyMode, target, onTargetCh
     setMessage("");
     setSaving(true);
     try {
-      await onSave(next, target);
+      await onSave(next);
       setMessage(running ? "已立即应用。" : "已保存，下次启动时生效。");
       return true;
     } catch (error) {
@@ -2089,8 +2062,6 @@ function StrategyPage({ config, proxies, running, policyMode, target, onTargetCh
   return (
     <div className="page-content page-stack">
       <div className="page-actions"><Text className={`save-message ${message.includes("失败") ? "error" : ""}`} size={200}>{message}</Text></div>
-      <ProxyPolicyTargetBar mode={policyMode} target={target} onChange={onTargetChange} />
-
       {selectors.length > 0 && (
         <section className="page-section">
           <SectionHeading title="实时策略组" description="运行中的策略组，点击可立即切换出站。" />
@@ -2527,7 +2498,7 @@ function createLogicalConditionFrom(condition: RuleCondition): RuleCondition {
   return { id: newEditorId("group"), type: "logical", mode: "and", invert: false, rules: [condition, createFieldCondition()] };
 }
 
-function RulesPage({ config, running, policyMode, target, onTargetChange, onSave }: { config: ProxyConfig; running: boolean; policyMode: RuntimeSettings["gatewayPolicyMode"]; target: ProxyConfigTarget; onTargetChange: (target: ProxyConfigTarget) => void; onSave: (config: ProxyConfig, target: ProxyConfigTarget) => Promise<void> }) {
+function RulesPage({ config, running, onSave }: { config: ProxyConfig; running: boolean; onSave: (config: ProxyConfig) => Promise<void> }) {
   const [draft, setDraft] = useState<ProxyConfig>(config);
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
@@ -2543,7 +2514,7 @@ function RulesPage({ config, running, policyMode, target, onTargetChange, onSave
     setMessage("");
     setSaving(true);
     try {
-      await onSave(next, target);
+      await onSave(next);
       setMessage(running ? "已立即应用。" : "已保存，下次启动时生效。");
       return true;
     } catch (error) {
@@ -2614,7 +2585,6 @@ function RulesPage({ config, running, policyMode, target, onTargetChange, onSave
 
   return <div className="page-content page-stack">
     <div className="page-actions"><Text className={`save-message ${message.startsWith("应用失败") ? "error" : ""}`} size={200}>{message}</Text></div>
-    <ProxyPolicyTargetBar mode={policyMode} target={target} onChange={onTargetChange} />
     <section className="page-section"><SectionHeading title="规则" description="从上到下按优先级匹配，命中后停止继续匹配；未命中的流量交给默认出站。" action={<Button appearance="primary" onClick={openNewRule} disabled={saving}>添加规则</Button>} />{draft.rules.length === 0 ? <Card className="panel"><EmptyState title="尚未添加规则" description="点击上方「添加规则」开始配置。" /></Card> : <Card className="panel rule-list">{draft.rules.map((rule, index) => {
       const outboundExists = outbounds.includes(rule.outbound);
       return <div key={rule.id} className={`rule-list-row ${draggedRuleIndex === index ? "is-dragging" : ""}`} draggable onDragStart={() => setDraggedRuleIndex(index)} onDragEnd={() => setDraggedRuleIndex(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => dropRule(index)}>
@@ -2728,20 +2698,20 @@ function EntrySettingsPanel({ settings, settingsDirty, running, runtimeBusy, bus
   const disabled = running || busy;
   const gatewayMode = settings.mode === "gateway";
     return <Card className="panel settings-panel">
-    <div className="surge-settings-heading"><div><Text as="h2" size={500} weight="semibold">代理入口</Text><Text size={300}>{gatewayMode ? "Mixed 本机代理仍保留；Gateway 使用 vfkit + 极简 Linux guest，实体 LAN packet path 等待流量验证。" : "本机应用通过 Mixed 代理连接 SongsterX；局域网 Gateway 需要额外的 Linux guest 资源。"}</Text></div><span className="settings-direct-icon"><SettingsRegular /></span></div>
+    <div className="surge-settings-heading"><div><Text as="h2" size={500} weight="semibold">代理入口</Text><Text size={300}>{gatewayMode ? "Gateway 只运行一个 VM 内 sing-box；macOS 负责 supervisor、网络和 guest-agent。" : "本机应用通过一个 Mixed sing-box 代理连接 SongsterX；局域网 Gateway 需要额外的 Linux guest 资源。"}</Text></div><span className="settings-direct-icon"><SettingsRegular /></span></div>
     {running && <div className="settings-notice"><span className="status-dot running-dot" /><Text size={300}>服务运行时不能修改入口配置。</Text><Button appearance="secondary" onClick={onStop} disabled={runtimeBusy}>{runtimeBusy ? "处理中…" : "停止服务"}</Button></div>}
     <div className="settings-fields">
-      <SettingSection title="入口" description="Mixed 是本机代理入口；局域网网关是额外入口，二者可以同时运行。">
-        <SettingRow label="本机 Mixed 代理" description="始终保留本地 HTTP / SOCKS5 入口；网关开启后也不会关闭。" control={<Switch checked disabled label={`启用 · ${settings.listen}:${settings.port}`} />} />
-        <SettingRow label="局域网网关" description="使用 vfkit 启动极简 Linux guest；启动后用 LAN/TUN 包计数确认实体流量，客户端需手工配置网关和 DNS。" control={<Switch disabled={disabled} checked={gatewayMode} onChange={(event) => changeGateway(event.target.checked)} label={gatewayMode ? "已选择 · 待配置" : "未启用"} />} />
+      <SettingSection title="入口" description={gatewayMode ? "Gateway 只保留一个 VM 内 sing-box 入口；不会再启动第二个 host sing-box。" : "本机使用一个 Mixed sing-box 入口；Gateway 开启后会切换为 VM 内数据面。"}>
+        <SettingRow label={gatewayMode ? "Gateway sing-box" : "本机 Mixed sing-box"} description={gatewayMode ? `VM 内入口为 ${settings.gatewayIp || "网关 IP"}:${settings.port}，负责局域网流量和模块链路。` : `本机入口为 ${settings.listen}:${settings.port}，提供 HTTP / SOCKS5 代理。`} control={<Switch checked disabled label={gatewayMode ? "启用 · VM 数据面" : `启用 · ${settings.listen}:${settings.port}`} />} />
+        <SettingRow label="局域网网关" description="使用 vfkit 启动包含 sing-box 与 Module Engine 的极简 Linux guest；客户端需手工配置网关和 DNS。" control={<Switch disabled={disabled} checked={gatewayMode} onChange={(event) => changeGateway(event.target.checked)} label={gatewayMode ? "已选择 · 待配置" : "未启用"} />} />
       </SettingSection>
       {gatewayMode && <SettingSection title="局域网网关接入（vfkit）" description="只需填写三个必填项，其余留空即可使用内置默认值。">
         <SettingRow label="物理网卡" description="承载局域网的 macOS 接口名称，例如 en0；不是 host-only 虚拟地址。" control={<Input disabled={disabled} value={settings.gatewayLanInterface} onChange={(event) => update({ gatewayLanInterface: event.target.value })} placeholder="例如 en0" />} />
         <SettingRow label="局域网网关 IP" description="客户端要填写的默认网关地址；必须在物理局域网内，且不能与现有设备冲突。" control={<Input disabled={disabled} value={settings.gatewayIp} onChange={(event) => update({ gatewayIp: event.target.value })} placeholder="例如 192.168.1.2" />} />
+        <SettingRow label="IPv6 网关地址" description="默认 auto：按 guest LAN 网卡 MAC 生成完整的 fe80:: EUI‑64 地址，例如 fe80::8e1f:64ff:fe47:22b8。当前不提供 DHCPv6/RA。" control={<Input disabled={disabled} value={settings.gatewayIpv6} onChange={(event) => update({ gatewayIpv6: event.target.value })} placeholder="auto 或 fe80::8e1f:64ff:fe47:22b8/64" />} />
         <SettingRow label="上游网关" description="物理 LAN 当前的真实上游路由器地址；必须与局域网网关 IP 位于同一网段且不能相同。" control={<Input disabled={disabled} value={settings.gatewayUpstreamGateway} onChange={(event) => update({ gatewayUpstreamGateway: event.target.value })} placeholder="例如 192.168.1.1" />} />
         <SettingRow label="客户端接入策略" description="当前只支持动态学习局域网设备的 IP/MAC；指定设备策略尚未接入 Linux guest。" control={<Select disabled={disabled} value={settings.gatewayClientPolicy} onChange={(event) => update({ gatewayClientPolicy: event.target.value as RuntimeSettings["gatewayClientPolicy"] })}><option value="all">允许局域网所有设备</option><option value="allowlist" disabled>仅允许指定设备（尚未实现）</option></Select>} />
         {settings.gatewayClientPolicy === "allowlist" && <SettingRow label="指定客户端" description="每行一个 IP,MAC；只允许这些设备通过网关，例如 192.168.1.20,aa:bb:cc:dd:ee:ff。" control={<Textarea disabled={disabled} value={settings.gatewayClients} onChange={(event) => update({ gatewayClients: event.target.value })} rows={4} placeholder="192.168.1.20,aa:bb:cc:dd:ee:ff\n192.168.1.21,11:22:33:44:55:66" />} />}
-        <SettingRow label="代理策略同步" description="共享：代理节点、策略组、路由规则和规则集由 Host 同步到 Gateway。分开：Gateway 使用独立策略文件，Host 修改不会覆盖它。" control={<Select disabled={disabled} value={settings.gatewayPolicyMode} onChange={(event) => update({ gatewayPolicyMode: event.target.value as RuntimeSettings["gatewayPolicyMode"] })}><option value="shared">共享策略 · Host 同步到 Gateway</option><option value="separate">Host / Gateway 分开配置</option></Select>} />
         <details className="setting-advanced-section">
           <summary><ChevronDownRegular className="setting-advanced-chevron" /><span>高级 · 虚拟机与数据面</span></summary>
           <div className="setting-advanced-body">
@@ -2752,17 +2722,17 @@ function EntrySettingsPanel({ settings, settingsDirty, running, runtimeBusy, bus
             <SettingRow label="Linux initrd" description="留空使用应用内包含 sing-box 与 gateway-agent 的极简 initrd；填写路径可覆盖内置版本。" control={<Input disabled={disabled} value={settings.gatewayGuestInitrdPath} onChange={(event) => update({ gatewayGuestInitrdPath: event.target.value })} placeholder="留空：使用应用内 initrd" />} />
             <SettingRow label="guest kernel cmdline" description="会追加 LAN/host-only 网络参数；不要填写 songsterx.* 保留参数或换行。" control={<Input disabled={disabled} value={settings.gatewayGuestCmdline} onChange={(event) => update({ gatewayGuestCmdline: event.target.value })} />} />
             <SettingRow label="vmnet-helper 可执行文件" description="留空使用应用内版本；旧版 macOS 仍需按 helper 文档配置权限。" control={<Input disabled={disabled} value={settings.vmnetHelperPath} onChange={(event) => update({ vmnetHelperPath: event.target.value })} placeholder="留空：使用应用内 vmnet-helper" />} />
-            <SettingRow label="guest CPU / 内存" description="轻量默认 1 vCPU / 512 MiB；限制范围为 1-8 vCPU、256-16384 MiB。" control={<div className="setting-inline-controls"><Input disabled={disabled} type="number" min={1} max={8} value={String(settings.gatewayGuestCpus)} onChange={(event) => update({ gatewayGuestCpus: Number(event.target.value) })} /><Input disabled={disabled} type="number" min={256} max={16384} value={String(settings.gatewayGuestMemoryMib)} onChange={(event) => update({ gatewayGuestMemoryMib: Number(event.target.value) })} /></div>} />
+            <SettingRow label="guest CPU / 内存" description="默认 1 vCPU / 768 MiB；内置 initrd 最低需要 768 MiB，限制范围为 1-8 vCPU、768-16384 MiB。" control={<div className="setting-inline-controls"><Input disabled={disabled} type="number" min={1} max={8} value={String(settings.gatewayGuestCpus)} onChange={(event) => update({ gatewayGuestCpus: Number(event.target.value) })} /><Input disabled={disabled} type="number" min={768} max={16384} value={String(settings.gatewayGuestMemoryMib)} onChange={(event) => update({ gatewayGuestMemoryMib: Number(event.target.value) })} /></div>} />
             <SettingRow label="host-only 网段" description="第二张 virtio-net 只连接 macOS host 与 guest，用于 MITM/agent；默认 192.168.250.0/24。" control={<Input disabled={disabled} value={settings.gatewayHostCidr} onChange={(event) => update({ gatewayHostCidr: event.target.value })} />} />
             <SettingRow label="host / guest host-only IP" description="host IP 只绑定 host-only 网络，guest IP 由极简系统静态配置；不要填物理 LAN 地址。" control={<div className="setting-inline-controls"><Input disabled={disabled} value={settings.gatewayHostIp} onChange={(event) => update({ gatewayHostIp: event.target.value })} /><Input disabled={disabled} value={settings.gatewayGuestHostIp} onChange={(event) => update({ gatewayGuestHostIp: event.target.value })} /></div>} />
             <SettingRow label="guest LAN 网卡 selector" description="默认使用第一张 virtio-net（if:eth0）；只有需要按 MAC 或自定义接口名绑定时才修改。" control={<Input disabled={disabled} value={settings.gatewayGuestLanSelector} onChange={(event) => update({ gatewayGuestLanSelector: event.target.value })} placeholder="默认 if:eth0" />} />
             <SettingRow label="guest host-only selector" description="默认使用第二张 virtio-net（if:eth1）；只有需要按 MAC 或自定义接口名绑定时才修改，不能与 LAN selector 相同。" control={<Input disabled={disabled} value={settings.gatewayGuestHostSelector} onChange={(event) => update({ gatewayGuestHostSelector: event.target.value })} placeholder="默认 if:eth1" />} />
             <SettingRow label="guest agent 端口" description="用于下发配置、升级和 readiness；默认读取应用内 token，也可通过 SONGSTERX_GATEWAY_AGENT_TOKEN 或 *_TOKEN_FILE 覆盖。" control={<Input disabled={disabled} type="number" min={1} max={65535} value={String(settings.gatewayGuestAgentPort)} onChange={(event) => update({ gatewayGuestAgentPort: Number(event.target.value) })} />} />
-            <SettingRow label="始终独立的项目" description="Host Mixed 地址/端口、host sing-box 路径与日志；Guest 的 vfkit、kernel、initrd、LAN/TUN、VM 参数和 guest-agent。" control={<Input disabled value="运行参数不共享" />} />
+            <SettingRow label="运行边界" description="macOS 只负责 supervisor、网络和 guest-agent；sing-box、mitmdump 和 Module Engine 均在 VM 内运行。" control={<Input disabled value="单 VM 数据面" />} />
           </div>
         </details>
       </SettingSection>}
-        <SettingSection title="监听" description={gatewayMode ? "本地 Mixed 入口仍可供本机应用或模块链路使用；Gateway 启动时连接物理网卡数据面并检查 guest readiness。" : "本地 Mixed 代理入口的基本参数。"}>
+        <SettingSection title="监听" description={gatewayMode ? "Gateway 模式下使用上方填写的网关 IP；本页端口作为统一 Mixed 端口。" : "本机 Mixed 代理入口的基本参数。"}>
         <SettingRow label="监听地址" description="使用 127.0.0.1 仅允许本机访问。" control={<Input disabled={disabled} value={settings.listen} onChange={(event) => update({ listen: event.target.value })} />} />
         <SettingRow label="监听端口" description="修改后需要停止并重新启动服务。" control={<Input disabled={disabled} type="number" min={1} max={65535} value={String(settings.port)} onChange={(event) => update({ port: Number(event.target.value) })} />} />
       </SettingSection>
@@ -2783,10 +2753,6 @@ function EntrySettingsPanel({ settings, settingsDirty, running, runtimeBusy, bus
   </Card>;
 }
 
-function SurgeSettingRow({ title, description, value, onClick }: { title: string; description: string; value: string; onClick: () => void }) {
-  return <div className="surge-setting-row" role="button" tabIndex={0} onClick={onClick} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onClick(); } }}><div className="surge-setting-copy"><Text weight="semibold">{title}</Text><Text size={200}>{description}</Text></div><div className="surge-setting-value"><Text size={200}>{value}</Text><ChevronRightRegular /></div></div>;
-}
-
 function AppearanceSettingRow({ mode, onChange }: { mode: AppearanceMode; onChange: (mode: AppearanceMode) => void }) {
   return <div className="surge-setting-row appearance-setting-row"><div className="surge-setting-copy"><Text weight="semibold">外观</Text><Text size={200}>立即切换应用主题，并在下次启动时保留选择。</Text></div><div className="appearance-setting-control"><Select value={mode} aria-label="外观模式" onChange={(event) => onChange(event.target.value as AppearanceMode)}><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></Select></div></div>;
 }
@@ -2797,9 +2763,7 @@ function ConfigViewer({ documents, error, onRefresh, onReload }: { documents: Co
   const selected = documents.find((document) => document.id === selectedId) ?? documents[0];
   const documentDescription = (document: ConfigDocument) => {
     if (document.id === "songsterx-config") return "唯一用户配置源";
-    if (document.id === "sing-box-runtime") return "macOS host · Mixed 本机入口";
-    if (document.id === "sing-box-gateway-guest") return "Linux guest · LAN TUN 数据面";
-    return "自动生成的运行时输入";
+    return "由 SongsterX.conf 自动生成；Gateway 模式显示 guest 数据面";
   };
   const copy = async () => {
     if (!selected) return;
@@ -2807,7 +2771,7 @@ function ConfigViewer({ documents, error, onRefresh, onReload }: { documents: Co
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
   };
-  return <Card className="panel config-viewer"><div className="config-viewer-header"><div><Text as="h2" size={400} weight="semibold">配置来源</Text><Text size={300}>SongsterX.conf 保存 Host 策略；Gateway 模式会分别显示 host 和 Linux guest 两份 sing-box JSON。Guest 策略按设置选择共享或独立。</Text></div><div className="config-viewer-actions"><Button appearance="subtle" onClick={() => void onRefresh()}>刷新</Button><Button appearance="secondary" onClick={() => void onReload()}>从文件重载</Button><Button appearance="secondary" disabled={!selected} onClick={() => void copy()}>{copied ? "已复制" : "复制"}</Button></div></div>{documents.length === 0 ? <EmptyState title={error ? "配置加载失败" : "暂无配置"} description={error || "配置文件尚未生成，点击刷新后会自动创建。"} /> : <div className="config-viewer-body"><nav className="config-viewer-nav" aria-label="配置文档">{documents.map((document) => <button type="button" key={document.id} className={`config-viewer-nav-item ${document.id === selected?.id ? "is-selected" : ""}`} aria-current={document.id === selected?.id ? "page" : undefined} aria-controls="config-viewer-content" onClick={() => setSelectedId(document.id)}><span className="config-viewer-nav-mark" /><span className="config-viewer-nav-copy"><Text weight="semibold">{document.title}</Text><Text size={200}>{documentDescription(document)}</Text></span></button>)}</nav>{selected && <div id="config-viewer-content" className="config-viewer-main"><Text className="config-document-path" size={200}>{selected.path}</Text><pre>{selected.content}</pre></div>}</div>}</Card>;
+  return <Card className="panel config-viewer"><div className="config-viewer-header"><div><Text as="h2" size={400} weight="semibold">配置来源</Text><Text size={300}>只显示一份用户配置和一份 sing-box 运行配置。策略、规则和模块均从 SongsterX.conf 生成；Gateway 模式下运行配置对应 guest 数据面。</Text></div><div className="config-viewer-actions"><Button appearance="subtle" onClick={() => void onRefresh()}>刷新</Button><Button appearance="secondary" onClick={() => void onReload()}>从文件重载</Button><Button appearance="secondary" disabled={!selected} onClick={() => void copy()}>{copied ? "已复制" : "复制"}</Button></div></div>{documents.length === 0 ? <EmptyState title={error ? "配置加载失败" : "暂无配置"} description={error || "配置文件尚未生成，点击刷新后会自动创建。"} /> : <div className="config-viewer-body"><nav className="config-viewer-nav" aria-label="配置文档">{documents.map((document) => <button type="button" key={document.id} className={`config-viewer-nav-item ${document.id === selected?.id ? "is-selected" : ""}`} aria-current={document.id === selected?.id ? "page" : undefined} aria-controls="config-viewer-content" onClick={() => setSelectedId(document.id)}><span className="config-viewer-nav-mark" /><span className="config-viewer-nav-copy"><Text weight="semibold">{document.title}</Text><Text size={200}>{documentDescription(document)}</Text></span></button>)}</nav>{selected && <div id="config-viewer-content" className="config-viewer-main"><Text className="config-document-path" size={200}>{selected.path}</Text><pre>{selected.content}</pre></div>}</div>}</Card>;
 }
 
 function ModuleArgumentsDialog({ module, onSave, onClose }: { module: ModuleInfo; onSave: (id: string, key: string, value: string) => Promise<void>; onClose: () => void }) {
@@ -2867,58 +2831,12 @@ function ModuleUrlImportDialog({ onImport, onClose }: { onImport: (url: string) 
   </div>;
 }
 
-function ConnectionPage({ settings, running, runtimeBusy, busy, message, metrics, onChange, onSave, onReset, onStop }: { settings: RuntimeSettings; running: boolean; runtimeBusy: boolean; busy: boolean; message: string; metrics: RuntimeMetrics; onChange: (next: RuntimeSettings) => void; onSave: () => void; onReset: () => void; onStop: () => void }) {
-  const [tab, setTab] = useState("live");
-  const update = (patch: Partial<RuntimeSettings>) => onChange({ ...settings, ...patch });
-  const disabled = running || busy;
-  return <div className="page-content page-stack">
-    <Card className="panel settings-panel">
-      {running && <div className="settings-notice"><span className="status-dot running-dot" /><Text size={300}>服务运行时不能修改运行配置。</Text><Button appearance="secondary" onClick={onStop} disabled={runtimeBusy}>{runtimeBusy ? "处理中…" : "停止服务"}</Button></div>}
-      <div className="page-intent-note"><Text weight="semibold">这里管理代理接入</Text><Text size={200}>“实时连接”只显示当前仍在传输的连接；请求历史和短请求请前往“活动”。</Text></div>
-      <TabList selectedValue={tab} onTabSelect={(_, data) => setTab(String(data.value))} className="settings-tabs">
-        <Tab value="live">实时连接</Tab><Tab value="connection">入口设置</Tab><Tab value="remote">远程访问</Tab><Tab value="advanced">高级</Tab>
-      </TabList>
-      {tab === "live" && <LiveConnections metrics={metrics} running={running} />}
-      {tab === "connection" && <div className="settings-fields">
-        <SettingSection title="代理入口" description="本地 Mixed 代理入口的基本参数。">
-          <SettingRow label="监听地址" description="使用 127.0.0.1 仅允许本机访问。" control={<Input disabled={disabled} value={settings.listen} onChange={(event) => update({ listen: event.target.value })} />} />
-          <SettingRow label="监听端口" description="修改后需要停止并重新启动服务。" control={<Input disabled={disabled} type="number" min={1} max={65535} value={String(settings.port)} onChange={(event) => update({ port: Number(event.target.value) })} />} />
-        </SettingSection>
-        <SettingSection title="DNS" description="不劫持系统 DNS，只影响 sing-box 运行时配置。">
-          <SettingRow label="解析模式" description="默认跟随系统 DNS。" control={<Select disabled={disabled} value={settings.dnsMode} onChange={(event) => update({ dnsMode: event.target.value as RuntimeSettings["dnsMode"] })}><option value="system">系统 DNS</option><option value="custom">自定义 UDP DNS</option></Select>} />
-          {settings.dnsMode === "custom" && <SettingRow label="DNS 服务器" description="填写 IPv4、IPv6 或 DNS 地址。" control={<Input disabled={disabled} value={settings.dnsServer} onChange={(event) => update({ dnsServer: event.target.value })} />} />}
-        </SettingSection>
-        <SettingSection title="运行时" description="sing-box 进程和日志行为。">
-          <SettingRow label="sing-box 可执行文件" description="留空时从当前 PATH 查找。" control={<Input disabled={disabled} value={settings.singBoxPath} onChange={(event) => update({ singBoxPath: event.target.value })} placeholder="留空：使用 PATH" />} />
-          <SettingRow label="日志等级" description="下次启动 sing-box 时生效。" control={<Select disabled={disabled} value={settings.logLevel} onChange={(event) => update({ logLevel: event.target.value as RuntimeSettings["logLevel"] })}>{["trace", "debug", "info", "warn", "error"].map((level) => <option key={level} value={level}>{level}</option>)}</Select>} />
-        </SettingSection>
-      </div>}
-      {tab === "remote" && <FeatureUnavailable title="远程访问尚未接入" description="远程访问和局域网控制需要网关模式接入后开放。" compact />}
-      {tab === "advanced" && <FeatureUnavailable title="高级配置尚未接入" description="高级配置编辑器将在规则引擎和模块系统稳定后开放。" compact />}
-      <Divider />
-      <div className="settings-footer"><Text className={`save-message ${message.startsWith("设置") || message.startsWith("已恢复") ? "" : "error"}`} size={200}>{message}</Text><Button appearance="secondary" disabled={disabled} onClick={onReset}>恢复默认</Button><Button appearance="primary" disabled={disabled} onClick={onSave}>{busy ? "保存中…" : "应用更改"}</Button></div>
-    </Card>
-  </div>;
-}
-
-function LiveConnections({ metrics, running }: { metrics: RuntimeMetrics; running: boolean }) {
-  if (!running) {
-    return <div className="settings-fields"><FeatureUnavailable title="服务未运行" description="启动服务后，这里只显示当前仍在传输的连接；请求历史请查看“活动”。" compact /></div>;
-  }
-  const connections = metrics.connections;
-  return <div className="settings-fields"><div className="live-summary"><div className="live-stat"><Text className="stat-label" size={200}>当前连接</Text><Text className="stat-value" weight="semibold">{metrics.activeConnections}</Text></div><div className="live-stat"><Text className="stat-label" size={200}>下行</Text><Text className="stat-value mono-value" weight="semibold">{formatBytes(metrics.downloadTotal)}</Text></div><div className="live-stat"><Text className="stat-label" size={200}>上行</Text><Text className="stat-value mono-value" weight="semibold">{formatBytes(metrics.uploadTotal)}</Text></div><div className="live-stat"><Text className="stat-label" size={200}>内存</Text><Text className="stat-value mono-value" weight="semibold">{formatBytes(metrics.memory)}</Text></div></div>{connections.length === 0 ? <EmptyState title="暂无当前连接" description="通过代理访问网络后，当前仍在传输的连接会显示在这里；已完成请求请查看“活动”。" /> : <Table size="small" className="data-table"><TableHeader><TableRow><TableHeaderCell>来源</TableHeaderCell><TableHeaderCell>目标</TableHeaderCell><TableHeaderCell>主机</TableHeaderCell><TableHeaderCell>网络</TableHeaderCell><TableHeaderCell>出站</TableHeaderCell><TableHeaderCell>下行</TableHeaderCell><TableHeaderCell>上行</TableHeaderCell></TableRow></TableHeader><TableBody>{connections.map((conn) => <TableRow key={conn.id}><TableCell>{connectionRuntimeLabel(conn.runtime)}</TableCell><TableCell className="mono-cell">{conn.destination}</TableCell><TableCell>{conn.host || "—"}</TableCell><TableCell>{conn.network}</TableCell><TableCell>{conn.outbound || "—"}</TableCell><TableCell className="mono-cell">{formatBytes(conn.download)}</TableCell><TableCell className="mono-cell">{formatBytes(conn.upload)}</TableCell></TableRow>)}</TableBody></Table>}</div>;
-}
-
 function SettingSection({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return <section className="setting-section"><div className="setting-section-heading"><Text as="h2" size={400} weight="semibold">{title}</Text><Text size={200}>{description}</Text></div>{children}</section>;
 }
 
 function SettingRow({ label, description, control }: { label: string; description: string; control: ReactNode }) {
   return <Field className="setting-row" label={label} hint={description}>{control}</Field>;
-}
-
-function FeatureIcon({ icon }: { icon: ReactElement }) {
-  return <span className="feature-icon">{icon}</span>;
 }
 
 function FeatureUnavailable({ title, description, compact = false }: { title: string; description: string; compact?: boolean }) {

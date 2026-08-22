@@ -15,13 +15,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
-// The supervisor owns the Gateway process graph. The data-plane acceptance
-// state is tracked separately and only becomes ready after post-start LAN and
-// tun0 counter deltas are observed.
+// The supervisor owns the Gateway process graph. Guest LAN/tun0 counters are
+// observational metrics and never delay publishing a ready runtime.
 #[allow(dead_code)]
 mod gateway_runtime;
 mod guest_agent;
-// Readiness dimensions include the guest packet-path acceptance state.
+// Readiness dimensions include the guest packet-path state for compatibility;
+// it is marked ready when the authenticated guest runtime is ready.
 #[allow(dead_code)]
 mod packet_path;
 // Process-group ownership is exercised by unit tests before real Gateway launch is enabled.
@@ -32,7 +32,6 @@ mod vfkit;
 const SONGSTERX_CONFIG_FILE: &str = "songsterx.conf";
 const RUNTIME_CONFIG_FILE: &str = "sing-box.runtime.json";
 const GATEWAY_GUEST_RUNTIME_CONFIG_FILE: &str = "sing-box.gateway-guest.json";
-const GATEWAY_GUEST_PROXY_CONFIG_FILE: &str = "proxy-config.gateway-guest.json";
 const MODULE_RUNTIME_PLAN_FILE: &str = "module-runtime-plan.json";
 const IMPORTED_MODULES_FILE: &str = "imported-modules.json";
 const IMPORTED_ASSETS_FILE: &str = "imported-module-assets.json";
@@ -42,17 +41,13 @@ const DEFAULT_MODULE_PROXY_PORT: u16 = 8080;
 const FALLBACK_MODULE_PROXY_PORT_START: u16 = 18080;
 const FALLBACK_MODULE_PROXY_PORT_END: u16 = 18089;
 const GATEWAY_AGENT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const GATEWAY_CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+// First-time guest mitmdump startup can include Python import and CA
+// generation. Keep the whole atomic upload/activation transaction bounded,
+// but do not fail a healthy VM simply because the initial 15-second window
+// was consumed by Module Engine initialization.
+const GATEWAY_CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_AGENT_STOP_TIMEOUT: Duration = Duration::from_millis(250);
 const MITM_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Release gate for the IPv4 VM guest packet path.
-///
-/// The supervisor may start after validating its runtime prerequisites. The
-/// runtime status remains in a waiting state until a real LAN client produces
-/// traffic through both the guest LAN interface and tun0.
-const GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE: bool = true;
-const GATEWAY_PACKET_PATH_UNAVAILABLE: &str =
-    "局域网 Gateway 数据面等待验收：请让 LAN 客户端访问一次网络，确认 LAN 与 tun0 都出现新增流量";
 
 pub struct RuntimeState {
     child: Mutex<Option<Child>>,
@@ -62,11 +57,11 @@ pub struct RuntimeState {
     lifecycle_generation: Arc<AtomicU64>,
     gateway_runtime: Mutex<Option<gateway_runtime::GatewayRuntime>>,
     gateway_readiness: Mutex<packet_path::GatewayReadiness>,
-    gateway_packet_baseline: Mutex<Option<guest_agent::GuestPacketStats>>,
     system_connections: Mutex<SystemConnectionSample>,
     metrics_session: Mutex<Option<MetricsSession>>,
     status: Mutex<RuntimeStatus>,
     metrics_generation: Arc<AtomicU64>,
+    exit_cleanup_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RuntimeState {
@@ -79,11 +74,11 @@ impl Default for RuntimeState {
             lifecycle_generation: Arc::new(AtomicU64::new(0)),
             gateway_runtime: Mutex::new(None),
             gateway_readiness: Mutex::new(packet_path::GatewayReadiness::default()),
-            gateway_packet_baseline: Mutex::new(None),
             system_connections: Mutex::new(SystemConnectionSample::default()),
             metrics_session: Mutex::new(None),
             status: Mutex::new(RuntimeStatus::default()),
             metrics_generation: Arc::new(AtomicU64::new(0)),
+            exit_cleanup_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -156,6 +151,8 @@ pub struct RuntimeSettings {
     pub gateway_lan_interface: String,
     pub gateway_ip: String,
     pub gateway_cidr: String,
+    #[serde(default = "default_gateway_ipv6")]
+    pub gateway_ipv6: String,
     pub gateway_dns_ip: String,
     #[serde(default)]
     pub gateway_clients: String,
@@ -196,6 +193,10 @@ fn default_gateway_host_cidr() -> String {
     vfkit::DEFAULT_GATEWAY_HOST_CIDR.into()
 }
 
+fn default_gateway_ipv6() -> String {
+    vfkit::DEFAULT_GATEWAY_IPV6.into()
+}
+
 fn default_gateway_guest_agent_port() -> u16 {
     vfkit::DEFAULT_GATEWAY_GUEST_AGENT_PORT
 }
@@ -226,6 +227,7 @@ impl Default for RuntimeSettings {
             gateway_lan_interface: String::new(),
             gateway_ip: String::new(),
             gateway_cidr: String::new(),
+            gateway_ipv6: default_gateway_ipv6(),
             gateway_dns_ip: String::new(),
             gateway_clients: String::new(),
             gateway_client_policy: default_gateway_client_policy(),
@@ -2038,12 +2040,21 @@ fn module_mitm_route_rules(plan: &ModuleRuntimePlan) -> Vec<serde_json::Value> {
         } else {
             ("domain", hostname.clone())
         };
-        let rendered = serde_json::json!({
+        let mut rendered = serde_json::json!({
             field: [value],
             "network": ["tcp"],
             "action": "route",
             "outbound": "module-mitm"
         });
+        // A FakeIP/TUN flow may already carry a resolved IPv4/IPv6 address
+        // when it reaches the HTTP MITM outbound.  Keep the client-side
+        // FakeIP untouched, but force the MITM's upstream CONNECT target back
+        // to the exact module hostname so CDN/IP authorities cannot cause a
+        // second-hop TLS failure. Wildcard hosts cannot be safely mapped to a
+        // single replacement address and therefore retain the sniffed host.
+        if field == "domain" {
+            rendered["override_address"] = serde_json::Value::String(hostname);
+        }
         rules.push(rendered);
     }
     rules
@@ -2055,10 +2066,6 @@ fn runtime_config_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn gateway_guest_runtime_config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join(GATEWAY_GUEST_RUNTIME_CONFIG_FILE))
-}
-
-fn gateway_guest_proxy_config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_data_dir(app)?.join(GATEWAY_GUEST_PROXY_CONFIG_FILE))
 }
 
 fn songsterx_config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2584,11 +2591,18 @@ fn render_songsterx_config(
     );
     let _ = writeln!(
         output,
+        "gateway-ipv6 = {}",
+        surge_config_value(&settings.gateway_ipv6)
+    );
+    let _ = writeln!(
+        output,
         "dns-ip = {}",
         surge_config_value(&settings.gateway_dns_ip)
     );
     output.push_str("dhcp = false\n");
-    output.push_str("ipv6 = false\n");
+    // Gateway mode now carries IPv6 through the guest data plane. Mixed mode
+    // remains host-only, so its exported profile keeps IPv6 disabled there.
+    let _ = writeln!(output, "ipv6 = {}", settings.mode == "gateway");
     let _ = writeln!(
         output,
         "client-policy = {}",
@@ -2599,8 +2613,6 @@ fn render_songsterx_config(
         "clients = {}\n",
         surge_config_value(&settings.gateway_clients)
     );
-    let _ = writeln!(output, "policy-mode = {}\n", settings.gateway_policy_mode);
-
     output.push_str("[Proxy]\n");
     if config.nodes.is_empty() {
         output.push_str("# tag = type, server, port, options…\n");
@@ -3154,6 +3166,7 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                     }
                     "vm-gateway-ip" | "gateway-ip" => settings.gateway_ip = value,
                     "vm-gateway-cidr" | "gateway-cidr" => settings.gateway_cidr = value,
+                    "vm-gateway-ipv6" | "gateway-ipv6" => settings.gateway_ipv6 = value,
                     "fakeip-dns-ip" | "gateway-dns-ip" => settings.gateway_dns_ip = value,
                     "mitm-ca-dir" => settings.mitm_ca_dir = value,
                     "log-level" => settings.log_level = value,
@@ -3178,6 +3191,7 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                     }
                     "gateway-ip" | "ip" => settings.gateway_ip = value,
                     "cidr" | "gateway-cidr" => settings.gateway_cidr = value,
+                    "ipv6-ip" | "gateway-ipv6" => settings.gateway_ipv6 = value,
                     "dns-ip" | "gateway-dns-ip" => settings.gateway_dns_ip = value,
                     "client-policy" => settings.gateway_client_policy = value,
                     "clients" | "static-clients" => settings.gateway_clients = value,
@@ -3190,14 +3204,6 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                         ) =>
                     {
                         return Err("[Gateway] dhcp 必须为 false；SongsterX 网关不提供 DHCP".into())
-                    }
-                    "ipv6"
-                        if matches!(
-                            value.to_ascii_lowercase().as_str(),
-                            "true" | "1" | "yes" | "on"
-                        ) =>
-                    {
-                        return Err("[Gateway] ipv6 必须为 false；当前网关不提供 IPv6 RA/NDP".into())
                     }
                     "dhcp" | "ipv6" => {}
                     _ => return Err(format!("[Gateway] 第 {line_number} 行不支持字段：{key}")),
@@ -3331,6 +3337,14 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
     if settings.gateway_guest_host_selector.trim().is_empty() {
         settings.gateway_guest_host_selector = vfkit::DEFAULT_GATEWAY_GUEST_HOST_SELECTOR.into();
     }
+    if settings.gateway_ipv6.trim().is_empty() {
+        settings.gateway_ipv6 = default_gateway_ipv6();
+    }
+    // The user configuration has one policy source. Older files may still
+    // contain policy-mode=separate, but that legacy split is intentionally
+    // ignored and normalized to the shared source below.
+    settings.gateway_policy_mode = default_gateway_policy_mode();
+    normalize_gateway_guest_memory(&mut settings);
     validate_settings(&settings)?;
     Ok(SongsterXUserConfig {
         settings,
@@ -3358,6 +3372,28 @@ fn parse_ipv4_cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
         return Err("VM Gateway 网段的 prefix 必须在 1-30 之间".into());
     }
     Ok((address, prefix))
+}
+
+fn validate_gateway_ipv6(value: &str) -> Result<(), String> {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let (address, prefix) = value.trim().split_once('/').ok_or_else(|| {
+        "VM Gateway 本地 IPv6 必须使用 IPv6/prefix 格式，例如 fe80::252/64".to_string()
+    })?;
+    let address = address
+        .parse::<Ipv6Addr>()
+        .map_err(|_| format!("VM Gateway 本地 IPv6 无效：{address}"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| format!("VM Gateway 本地 IPv6 prefix 无效：{prefix}"))?;
+    if prefix != 64 {
+        return Err("VM Gateway 本地 IPv6 prefix 必须为 64".into());
+    }
+    if address.segments()[0] != 0xfe80 {
+        return Err("VM Gateway 本地 IPv6 必须是非空的链路本地地址（fe80::/64）".into());
+    }
+    Ok(())
 }
 
 fn detect_interface_cidr(interface: &str) -> Result<String, String> {
@@ -3396,8 +3432,112 @@ fn detect_interface_cidr(interface: &str) -> Result<String, String> {
     ))
 }
 
+fn detect_default_ipv6_gateway(interface: &str) -> Option<Ipv6Addr> {
+    let interface = interface.trim();
+    if interface.is_empty() {
+        return None;
+    }
+    // `route -n get -inet6 default` can wait for a route lookup while the
+    // interface is changing state. Read the installed table instead so
+    // Gateway startup is not coupled to that lookup timeout.
+    let output = Command::new("netstat")
+        .args(["-rn", "-f", "inet6"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[0] != "default" || fields.last().copied() != Some(interface) {
+            continue;
+        }
+        let gateway = fields[1].split('%').next().unwrap_or(fields[1]);
+        if let Ok(address) = gateway.parse::<Ipv6Addr>() {
+            if address.segments()[0] == 0xfe80 {
+                return Some(address);
+            }
+        }
+    }
+    None
+}
+
+fn detect_gateway_global_ipv6(interface: &str, guest_lan_selector: &str) -> Option<Ipv6Addr> {
+    let interface = interface.trim();
+    if interface.is_empty() {
+        return None;
+    }
+    let output = Command::new("ifconfig").arg(interface).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gateway_global_ipv6(&String::from_utf8_lossy(&output.stdout), guest_lan_selector)
+}
+
+fn parse_gateway_global_ipv6(ifconfig: &str, guest_lan_selector: &str) -> Option<Ipv6Addr> {
+    let mac = guest_lan_mac(guest_lan_selector)?;
+    for line in ifconfig.lines() {
+        if !line.contains("inet6 ") || line.contains("deprecated") || line.contains("temporary") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(address_text) = fields
+            .windows(2)
+            .find(|pair| pair[0] == "inet6")
+            .map(|pair| pair[1].split('%').next().unwrap_or(pair[1]))
+        else {
+            continue;
+        };
+        let Ok(address) = address_text.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        let first = address.segments()[0];
+        if address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || (first & 0xffc0) == 0xfe80
+        {
+            continue;
+        }
+        let segments = address.segments();
+        return Some(Ipv6Addr::new(
+            segments[0],
+            segments[1],
+            segments[2],
+            segments[3],
+            u16::from(mac[0] ^ 0x02) << 8 | u16::from(mac[1]),
+            u16::from(mac[2]) << 8 | 0x00ff,
+            0xfe00 | u16::from(mac[3]),
+            u16::from(mac[4]) << 8 | u16::from(mac[5]),
+        ));
+    }
+    None
+}
+
+fn guest_lan_mac(selector: &str) -> Option<[u8; 6]> {
+    let selector = selector.trim();
+    let value = if selector.is_empty() || selector.starts_with("if:") {
+        vfkit::DEFAULT_GATEWAY_GUEST_LAN_MAC
+    } else {
+        selector.strip_prefix("mac:")?
+    };
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        if part.len() != 2 {
+            return None;
+        }
+        mac[index] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
 fn ensure_gateway_ip_is_not_in_use(settings: &RuntimeSettings) -> Result<(), String> {
     let gateway_ip = parse_ipv4(&settings.gateway_ip, "VM Gateway IP")?;
+    validate_gateway_ipv6(&settings.gateway_ipv6)?;
     let gateway_ip_text = gateway_ip.to_string();
     let interface = settings.gateway_lan_interface.trim();
     let ifconfig = Command::new("ifconfig")
@@ -3498,6 +3638,7 @@ fn validate_gateway_network(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.gateway_ip.trim().is_empty() {
         return Err("VM Gateway 模式必须填写局域网网关 IP".into());
     }
+    validate_gateway_ipv6(&settings.gateway_ipv6)?;
     let gateway_ip = parse_ipv4(&settings.gateway_ip, "VM Gateway IP")?;
     parse_ipv4(&settings.dns_server, "Gateway guest DNS")?;
     let gateway_cidr = gateway_cidr_for_runtime(settings)?;
@@ -3544,8 +3685,12 @@ fn validate_vfkit_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.gateway_guest_cpus == 0 || settings.gateway_guest_cpus > 8 {
         return Err("vfkit guest CPU 数必须在 1-8 之间".into());
     }
-    if !(256..=16_384).contains(&settings.gateway_guest_memory_mib) {
-        return Err("vfkit guest 内存必须在 256-16384 MiB 之间".into());
+    if !(vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB..=16_384).contains(&settings.gateway_guest_memory_mib)
+    {
+        return Err(format!(
+            "vfkit guest 内存必须在 {}-16384 MiB 之间；内置 Gateway initrd 在更低内存下可能解包失败",
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        ));
     }
     if settings.gateway_guest_agent_port == 0 {
         return Err("vfkit guest agent 端口无效".into());
@@ -3576,6 +3721,12 @@ fn validate_vfkit_settings(settings: &RuntimeSettings) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_gateway_guest_memory(settings: &mut RuntimeSettings) {
+    if settings.gateway_guest_memory_mib < vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB {
+        settings.gateway_guest_memory_mib = vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB;
+    }
+}
+
 fn validate_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.mode != "mixed" && settings.mode != "gateway" {
         return Err("运行模式只能是 mixed 或 gateway".into());
@@ -3595,8 +3746,8 @@ fn validate_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.dns_mode == "fakeip" && settings.mode != "gateway" {
         return Err("FakeIP 只允许在网关模式使用".into());
     }
-    if settings.gateway_policy_mode != "shared" && settings.gateway_policy_mode != "separate" {
-        return Err("Gateway 策略模式只能是 shared 或 separate".into());
+    if settings.gateway_policy_mode != "shared" {
+        return Err("Gateway 只支持共享 SongsterX.conf 策略".into());
     }
     if settings.mode == "gateway" {
         validate_gateway_network(settings)?;
@@ -3721,16 +3872,14 @@ fn persist_settings(
     if settings.gateway_guest_host_selector.trim().is_empty() {
         settings.gateway_guest_host_selector = vfkit::DEFAULT_GATEWAY_GUEST_HOST_SELECTOR.into();
     }
+    if settings.gateway_ipv6.trim().is_empty() {
+        settings.gateway_ipv6 = default_gateway_ipv6();
+    }
+    normalize_gateway_guest_memory(&mut settings);
     validate_settings(&settings)?;
     let current = current_songsterx_user_config(app)?;
     let modules = load_modules(app)?;
     write_songsterx_config(app, &settings, &current.proxy_config, &modules)?;
-    if settings.mode == "gateway" && settings.gateway_policy_mode == "separate" {
-        let path = gateway_guest_proxy_config_path(app)?;
-        if !path.is_file() {
-            write_gateway_guest_proxy_config_file(app, &current.proxy_config)?;
-        }
-    }
     Ok(settings)
 }
 
@@ -3761,60 +3910,15 @@ fn load_proxy_config(app: &AppHandle) -> Result<ProxyConfig, String> {
     Ok(current_songsterx_user_config(app)?.proxy_config)
 }
 
-fn write_gateway_guest_proxy_config_file(
-    app: &AppHandle,
-    config: &ProxyConfig,
-) -> Result<(), String> {
-    let directory = app_data_dir(app)?;
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    let path = gateway_guest_proxy_config_path(app)?;
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|error| format!("无法序列化 Gateway guest 策略：{error}"))?;
-    write_private_file(&path, format!("{content}\n").as_bytes()).map_err(|error| {
-        format!(
-            "无法写入 Gateway guest 独立策略 {}：{error}",
-            path.display()
-        )
-    })
-}
-
 fn load_gateway_guest_proxy_config(app: &AppHandle) -> Result<ProxyConfig, String> {
-    let current = current_songsterx_user_config(app)?;
-    if current.settings.mode != "gateway" || current.settings.gateway_policy_mode == "shared" {
-        return Ok(current.proxy_config);
-    }
-    let path = gateway_guest_proxy_config_path(app)?;
-    if !path.is_file() {
-        write_gateway_guest_proxy_config_file(app, &current.proxy_config)?;
-        return Ok(current.proxy_config);
-    }
-    let content = fs::read_to_string(&path).map_err(|error| {
-        format!(
-            "无法读取 Gateway guest 独立策略 {}：{error}",
-            path.display()
-        )
-    })?;
-    let mut config: ProxyConfig = serde_json::from_str(&content).map_err(|error| {
-        format!(
-            "Gateway guest 独立策略 {} 不是有效 JSON：{error}",
-            path.display()
-        )
-    })?;
-    Ok(normalize_proxy_config(&mut config))
+    load_proxy_config(app)
 }
 
 fn persist_gateway_guest_proxy_config(
     app: &AppHandle,
     config: &ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    let settings = load_settings(app)?;
-    if settings.mode != "gateway" || settings.gateway_policy_mode != "separate" {
-        return Err("只有 Gateway 的“Host / Gateway 分开”模式可以单独保存 guest 策略".into());
-    }
-    let mut config = config.clone();
-    let normalized = normalize_proxy_config(&mut config);
-    write_gateway_guest_proxy_config_file(app, &normalized)?;
-    Ok(normalized)
+    persist_proxy_config(app, config)
 }
 
 fn normalize_proxy_config(config: &mut ProxyConfig) -> ProxyConfig {
@@ -4933,10 +5037,20 @@ fn render_runtime_config_for(
         route["rule_set"] = serde_json::Value::Array(rendered_rule_sets);
     }
 
+    let mixed_listen = if guest && settings.mode == "gateway" {
+        // Bind the guest LAN Mixed server to the IPv6 wildcard. On Linux a
+        // dual-stack wildcard listener accepts both the LAN IPv6 gateway
+        // address and the IPv4 gateway address, while binding only to the
+        // IPv4 address makes clients that select the advertised fe80:: gateway
+        // fail with connection refused.
+        "::"
+    } else {
+        settings.listen.trim()
+    };
     let mut inbounds = vec![serde_json::json!({
         "type": "mixed",
         "tag": "mixed-in",
-        "listen": settings.listen.trim(),
+        "listen": mixed_listen,
         "listen_port": settings.port
     })];
     if guest && settings.mode == "gateway" {
@@ -4992,13 +5106,79 @@ fn apply_module_runtime_plan(
     module_plan: &ModuleRuntimePlan,
     guest: bool,
 ) -> Result<(), String> {
+    let mut needs_direct_module_inbound = false;
+    if module_plan_requires_mitm(module_plan) && guest && settings.mode == "gateway" {
+        let direct_port = settings
+            .port
+            .checked_add(1)
+            .ok_or_else(|| "网关代理端口 65535 无法分配 Module Engine 上游端口".to_string())?;
+        let inbounds = rendered["inbounds"]
+            .as_array_mut()
+            .ok_or_else(|| "sing-box inbounds 不是数组".to_string())?;
+        if !inbounds
+            .iter()
+            .any(|inbound| inbound["tag"].as_str() == Some("mixed-in-direct"))
+        {
+            inbounds.push(serde_json::json!({
+                "type": "mixed",
+                "tag": "mixed-in-direct",
+                "listen": "127.0.0.1",
+                "listen_port": direct_port
+            }));
+        }
+        needs_direct_module_inbound = true;
+    }
     if let Some(rules) = rendered["route"]["rules"].as_array_mut() {
         let mut module_rules = module_route_rules(module_plan);
         if module_plan_requires_mitm(module_plan) {
+            if needs_direct_module_inbound {
+                module_rules.insert(
+                    0,
+                    serde_json::json!({
+                        "inbound": ["mixed-in-direct"],
+                        "action": "route",
+                        "outbound": "direct"
+                    }),
+                );
+            }
             module_rules.extend(module_mitm_route_rules(module_plan));
         }
-        module_rules.append(rules);
-        *rules = module_rules;
+
+        // Gateway TUN traffic needs to be sniffed before domain-based module
+        // rules can match it. With FakeIP, however, `resolve` must not run
+        // before the module rule: resolve intentionally replaces the original
+        // hostname with the FakeIP address, and the HTTP MITM would then see a
+        // CDN/IP URL instead of the hostname declared by the module. Keep the
+        // sniff action first, apply module/static rules next, and only then run
+        // the remaining gateway preamble (`resolve`/`hijack-dns`) for traffic
+        // that did not match a module rule.
+        let mut existing_rules = std::mem::take(rules);
+        if guest && settings.mode == "gateway" {
+            let sniff_index = if settings.dns_mode == "fakeip" {
+                1 // resolve, sniff, hijack-dns
+            } else {
+                0 // sniff, hijack-dns
+            };
+            if sniff_index < existing_rules.len() {
+                let postponed_prefix = existing_rules[..sniff_index].to_vec();
+                let sniff_rule = existing_rules[sniff_index].clone();
+                let after_sniff = existing_rules.split_off(sniff_index + 1);
+                let mut reordered = Vec::with_capacity(
+                    1 + module_rules.len() + postponed_prefix.len() + after_sniff.len(),
+                );
+                reordered.push(sniff_rule);
+                reordered.extend(module_rules);
+                reordered.extend(postponed_prefix);
+                reordered.extend(after_sniff);
+                *rules = reordered;
+            } else {
+                existing_rules.extend(module_rules);
+                *rules = existing_rules;
+            }
+        } else {
+            existing_rules.extend(module_rules);
+            *rules = existing_rules;
+        }
     }
     if module_plan_requires_mitm(module_plan) {
         let module_proxy_host = if guest {
@@ -5041,13 +5221,17 @@ fn render_runtime_config_document(
             .ok_or_else(|| "Linux guest 配置缺少 tun-in 入站".to_string())?;
         // auto_redirect is Linux-only; the host-side macOS config deliberately omits it.
         tun["interface_name"] = serde_json::Value::String("tun0".into());
+        // Keep the guest TUN dual-stack. The LAN IPv6 gateway is link-local,
+        // while this private /126 is only the point-to-point address used by
+        // sing-box itself.
+        tun["address"] = serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
         tun["auto_route"] = serde_json::Value::Bool(true);
         tun["strict_route"] = serde_json::Value::Bool(true);
         tun["auto_redirect"] = serde_json::Value::Bool(true);
         // Keep the guest data plane independent from sing-box defaults. The
         // explicit split default route and marks are required for forwarded
         // LAN packets, which do not originate from a local process.
-        tun["route_address"] = serde_json::json!(["0.0.0.0/1", "128.0.0.0/1"]);
+        tun["route_address"] = serde_json::json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
         tun["iproute2_table_index"] = serde_json::json!(2022);
         tun["iproute2_rule_index"] = serde_json::json!(9000);
         tun["auto_redirect_input_mark"] = serde_json::json!("0x2023");
@@ -5067,6 +5251,8 @@ fn render_runtime_config_document(
             "223.86.225.0/24",
             settings.gateway_cidr.trim(),
             settings.gateway_host_cidr.trim(),
+            "fe80::/10",
+            "fdfe:dcba:9876::/126",
         ] {
             if !cidr.is_empty()
                 && !excluded_routes
@@ -5108,7 +5294,7 @@ fn write_gateway_guest_runtime_config(
     let directory = app_data_dir(app)?;
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
     let path = gateway_guest_runtime_config_path(app)?;
-    let proxy = load_gateway_guest_proxy_config(app)?;
+    let proxy = load_proxy_config(app)?;
     let content = render_runtime_config_document(settings, &proxy, module_plan, true)?;
     write_private_file(&path, content.as_bytes())
         .map_err(|error| format!("无法写入 Linux guest 运行配置 {}：{error}", path.display()))?;
@@ -5658,6 +5844,188 @@ fn resolve_vmnet_helper_binary(
     Ok((PathBuf::from("vmnet-helper"), false))
 }
 
+/// A Dock force-quit can terminate the Rust process before the normal Tauri
+/// `ExitRequested` cleanup runs.  vfkit and vmnet-helper are then reparented
+/// to launchd and can keep the old Gateway network alive, so the next guest
+/// boots against stale sockets or a stale `192.168.250.0/24` network and its
+/// guest-agent endpoint becomes unreachable.  Only reclaim orphaned processes
+/// that match SongsterX's own temporary socket and exact Gateway invocation;
+/// never scan or kill generic vfkit/vmnet processes owned by another app.
+#[cfg(target_os = "macos")]
+fn cleanup_orphaned_gateway_vfkit(vfkit_path: &Path) -> Result<usize, String> {
+    let output = Command::new("/bin/ps")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .args(["-axo", "pid=,ppid=,pgid=,command="])
+        .output()
+        .map_err(|error| format!("无法检查残留 vfkit：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法检查残留 vfkit：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let vfkit = vfkit_path
+        .canonicalize()
+        .unwrap_or_else(|_| vfkit_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut targets = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(ppid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(pgid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let command = fields.collect::<Vec<_>>().join(" ");
+        let is_gateway_vfkit = command.starts_with(&format!("{vfkit} "))
+            && command.contains(" --kernel ")
+            && command.contains("/gateway-guest/kernel ")
+            && command.contains(" --initrd ")
+            && command.contains("/gateway-guest/initrd ")
+            && command.contains(" --kernel-cmdline ")
+            && command.contains(" songsterx.agent_port=")
+            && command.contains(" --device virtio-net,unixSocketPath=/tmp/sxg-");
+        if ppid == 1 && is_gateway_vfkit && pid != std::process::id() as libc::pid_t && pgid > 1 {
+            targets.push((pid, pgid));
+        }
+    }
+
+    for (_, pgid) in &targets {
+        let result = unsafe { libc::kill(-*pgid, libc::SIGTERM) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("停止残留 vfkit 进程组 {pgid} 失败：{error}"));
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let any_running = targets
+            .iter()
+            .any(|(pid, _)| unsafe { libc::kill(*pid, 0) == 0 });
+        if !any_running {
+            return Ok(targets.len());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    for (pid, pgid) in &targets {
+        if unsafe { libc::kill(*pid, 0) == 0 } {
+            let result = unsafe { libc::kill(-*pgid, libc::SIGKILL) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("强制停止残留 vfkit 进程组 {pgid} 失败：{error}"));
+                }
+            }
+        }
+    }
+    Ok(targets.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_orphaned_gateway_vfkit(_vfkit_path: &Path) -> Result<usize, String> {
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_orphaned_gateway_vmnet_helpers(helper_path: &Path) -> Result<usize, String> {
+    let output = Command::new("/bin/ps")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .map_err(|error| format!("无法检查残留 vmnet-helper：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法检查残留 vmnet-helper：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let helper = helper_path
+        .canonicalize()
+        .unwrap_or_else(|_| helper_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(ppid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let command = fields.collect::<Vec<_>>().join(" ");
+        let is_gateway_helper = command.starts_with(&format!("{helper} "))
+            && command.contains(" --socket ")
+            && command.contains("/sxg-")
+            && (command.contains(" --operation-mode host ")
+                || command.contains(" --operation-mode bridged "));
+        if ppid == 1 && is_gateway_helper && pid != std::process::id() as libc::pid_t {
+            pids.push(pid);
+        }
+    }
+
+    for pid in &pids {
+        let result = unsafe { libc::kill(*pid, libc::SIGTERM) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("停止残留 vmnet-helper {pid} 失败：{error}"));
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let any_running = pids.iter().any(|pid| unsafe { libc::kill(*pid, 0) == 0 });
+        if !any_running {
+            return Ok(pids.len());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    for pid in &pids {
+        if unsafe { libc::kill(*pid, 0) == 0 } {
+            let result = unsafe { libc::kill(*pid, libc::SIGKILL) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("强制停止残留 vmnet-helper {pid} 失败：{error}"));
+                }
+            }
+        }
+    }
+    Ok(pids.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_orphaned_gateway_vmnet_helpers(_helper_path: &Path) -> Result<usize, String> {
+    Ok(0)
+}
+
 fn resolve_vfkit_binary(app: &AppHandle, settings: &RuntimeSettings) -> Result<PathBuf, String> {
     let configured = settings.vfkit_path.trim();
     if !configured.is_empty() {
@@ -5713,7 +6081,13 @@ fn build_vfkit_gateway_plan(
         bridge_interface: settings.gateway_lan_interface.trim().to_string(),
         gateway_ip,
         gateway_cidr,
+        gateway_ipv6: settings.gateway_ipv6.trim().to_string(),
+        gateway_ipv6_global: detect_gateway_global_ipv6(
+            &settings.gateway_lan_interface,
+            &settings.gateway_guest_lan_selector,
+        ),
         upstream_gateway,
+        upstream_gateway_ipv6: detect_default_ipv6_gateway(&settings.gateway_lan_interface),
         dns_server: settings.dns_server.trim().to_string(),
         guest_lan_selector: settings.gateway_guest_lan_selector.trim().to_string(),
         guest_host_selector: settings.gateway_guest_host_selector.trim().to_string(),
@@ -5727,8 +6101,9 @@ fn build_vfkit_gateway_plan(
     vfkit::build_plan(&config)
 }
 
-/// Start the Linux guest runtime. Entity LAN packet-path acceptance remains a
-/// separate fail-closed forwarding gate until a real client is verified.
+/// Start the Linux guest runtime. LAN/tun0 counters are collected after start
+/// for diagnostics only; no client traffic is required before publishing the
+/// runtime as ready.
 ///
 /// The caller holds `gateway_transition` for the whole runtime start. Keeping
 /// the slot assignment under that lock prevents stop/start races from leaving
@@ -5742,10 +6117,21 @@ fn start_gateway_runtime_supervisor(
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
     let startup_started_at = Instant::now();
-    if !GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE {
-        return Err(GATEWAY_PACKET_PATH_UNAVAILABLE.into());
-    }
     ensure_vmnet_launch_supported()?;
+    let vfkit_path = resolve_vfkit_binary(app, settings)?;
+    let (vmnet_helper, _) = resolve_vmnet_helper_binary(app, settings)?;
+    let reclaimed_vfkit = cleanup_orphaned_gateway_vfkit(&vfkit_path)?;
+    let reclaimed_helpers = cleanup_orphaned_gateway_vmnet_helpers(&vmnet_helper)?;
+    if reclaimed_vfkit > 0 || reclaimed_helpers > 0 {
+        emit_log(
+            app,
+            "warn",
+            format!(
+                "已回收上次异常退出遗留的 vfkit {} 个、vmnet-helper {} 个，正在重新创建 Gateway 网络",
+                reclaimed_vfkit, reclaimed_helpers
+            ),
+        );
+    }
     ensure_gateway_ip_is_not_in_use(settings)?;
 
     if state
@@ -5867,35 +6253,15 @@ fn start_gateway_runtime_supervisor(
             );
         }
     }
-    emit_log(
-        app,
-        "info",
-        format!(
-            "guest Gateway session 已原子激活（配置 + Module Engine 计划），耗时 {} ms",
-            startup_started_at.elapsed().as_millis()
-        ),
-    );
     if let Err(error) = commit_gateway_runtime(&state, runtime) {
         if let Ok(mut readiness) = state.gateway_readiness.lock() {
             readiness.mark_failed(error.clone());
         }
         return Err(error);
     }
-    if let Ok(mut baseline) = state.gateway_packet_baseline.lock() {
-        *baseline = session_result.packet_stats.clone();
-    }
     if let Ok(mut readiness) = state.gateway_readiness.lock() {
         readiness.mark_runtime_started();
-        readiness.mark_guest_packet_path_not_ready(GATEWAY_PACKET_PATH_UNAVAILABLE);
     }
-    emit_log(
-        app,
-        "info",
-        format!(
-            "vfkit Gateway supervisor 已启动：bridged LAN、host-only、vfkit 和 guest-agent 均就绪（配置已激活；实体 LAN packet path 尚未现场验收；总耗时 {} ms）",
-            startup_started_at.elapsed().as_millis()
-        ),
-    );
     Ok(())
 }
 
@@ -5937,116 +6303,6 @@ fn commit_gateway_runtime(
     }
     *slot = Some(runtime);
     Ok(())
-}
-
-fn interface_packet_progressed(
-    before: &guest_agent::GuestInterfaceStats,
-    after: &guest_agent::GuestInterfaceStats,
-) -> bool {
-    after.rx_packets > before.rx_packets
-        || after.tx_packets > before.tx_packets
-        || after.rx_bytes > before.rx_bytes
-        || after.tx_bytes > before.tx_bytes
-}
-
-fn guest_packet_path_progressed(
-    before: &guest_agent::GuestPacketStats,
-    after: &guest_agent::GuestPacketStats,
-) -> bool {
-    let Some(before_lan) = before.lan.as_ref() else {
-        return false;
-    };
-    let Some(after_lan) = after.lan.as_ref() else {
-        return false;
-    };
-    let Some(before_tun) = before.tun.as_ref() else {
-        return false;
-    };
-    let Some(after_tun) = after.tun.as_ref() else {
-        return false;
-    };
-    interface_packet_progressed(before_lan, after_lan)
-        && interface_packet_progressed(before_tun, after_tun)
-}
-
-fn observe_gateway_packet_path(
-    app: &AppHandle,
-    session: &MetricsSession,
-    generation: &AtomicU64,
-    expected: u64,
-) {
-    if generation.load(Ordering::SeqCst) != expected {
-        return;
-    }
-    let state = app.state::<RuntimeState>();
-    let baseline = match state.gateway_packet_baseline.lock() {
-        Ok(baseline) => baseline.clone(),
-        Err(_) => return,
-    };
-    let Some(baseline) = baseline else {
-        return;
-    };
-    let Some(endpoint) = session.guest_endpoint.clone() else {
-        return;
-    };
-    let current = match guest_agent::query_status(&endpoint, Duration::from_secs(1)) {
-        Ok(status) => status.packet_stats,
-        Err(_) => return,
-    };
-    if generation.load(Ordering::SeqCst) != expected {
-        return;
-    }
-    let Some(current) = current else {
-        return;
-    };
-    if !guest_packet_path_progressed(&baseline, &current) {
-        return;
-    }
-
-    let _transition = lock_gateway_transition(&state);
-    if generation.load(Ordering::SeqCst) != expected {
-        return;
-    }
-    let was_ready = state
-        .gateway_readiness
-        .lock()
-        .map(|mut readiness| {
-            if generation.load(Ordering::SeqCst) != expected {
-                return true;
-            }
-            if readiness.guest_packet_path.is_ready() {
-                true
-            } else {
-                readiness.mark_guest_packet_path_ready();
-                false
-            }
-        })
-        .unwrap_or(true);
-    if was_ready {
-        return;
-    }
-
-    if let Ok(mut status) = state.status.lock() {
-        if generation.load(Ordering::SeqCst) != expected {
-            return;
-        }
-        if status.mode.contains("gateway") {
-            status.state = "running".into();
-            status.healthy = true;
-            status.can_stop = true;
-            status.gateway_packet_path_ready = true;
-            status.message = if status.module_proxy.is_some() {
-                "Mixed 入口与 Linux guest 局域网网关已启动；实体 LAN packet path 已验收；模块 MITM 已挂接".into()
-            } else {
-                "Mixed 入口与 Linux guest 局域网网关已启动；实体 LAN packet path 已验收".into()
-            };
-        }
-    }
-    emit_log(
-        app,
-        "info",
-        "Guest packet path 已验收：LAN 与 tun0 均观察到启动后的新增流量",
-    );
 }
 
 fn runtime_failure_with_cleanup(
@@ -6116,15 +6372,6 @@ fn ensure_vmnet_launch_supported() -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn ensure_vmnet_launch_supported() -> Result<(), String> {
     Ok(())
-}
-
-fn vfkit_gateway_preflight_message(app: &AppHandle, settings: &RuntimeSettings) -> String {
-    let runtime_dir =
-        process_group::unique_runtime_dir(process_group::runtime_parent_dir(env::temp_dir()));
-    match build_vfkit_gateway_plan(app, settings, &runtime_dir) {
-        Ok(_) => "vfkit Gateway 启动计划有效；vmnet、vfkit 和 guest-agent readiness 将由 supervisor 在运行时检查；实体 LAN packet path 仍需手机/电脑现场验收".into(),
-        Err(error) => format!("vfkit Gateway 配置未就绪：{error}"),
-    }
 }
 
 #[tauri::command]
@@ -6490,11 +6737,6 @@ fn start_mix_direct_transaction(
     let gateway_mode = settings.mode == "gateway";
     if gateway_mode {
         validate_settings(&settings)?;
-        emit_log(
-            &app,
-            "info",
-            vfkit_gateway_preflight_message(&app, &settings),
-        );
     }
     let mut module_plan = write_module_runtime_plan(&app)?;
     if module_plan_requires_mitm(&module_plan) {
@@ -6508,7 +6750,13 @@ fn start_mix_direct_transaction(
         module_plan.proxy_port = Some(port);
     }
     persist_module_runtime_plan(&app, &module_plan)?;
-    let config = write_runtime_config(&app, &settings, &module_plan)?;
+    // Gateway uses the guest data plane only; do not create a second host
+    // sing-box runtime configuration for a process that is never started.
+    let config = if gateway_mode {
+        None
+    } else {
+        Some(write_runtime_config(&app, &settings, &module_plan)?)
+    };
     let gateway_config = if gateway_mode {
         Some(write_gateway_guest_runtime_config(
             &app,
@@ -6518,6 +6766,11 @@ fn start_mix_direct_transaction(
     } else {
         None
     };
+    let config_display = gateway_config
+        .as_deref()
+        .or(config.as_deref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "SongsterX.conf".into());
     let plan_path = module_runtime_plan_path(&app)?;
     let binary = resolve_sing_box_binary(&app, &settings);
     if lifecycle_cancelled(state, lifecycle_generation) {
@@ -6553,12 +6806,9 @@ fn start_mix_direct_transaction(
             pid: None,
             module_proxy: None,
             message: if gateway_mode {
-                format!(
-                    "正在启动 Mixed + 局域网网关（无 DHCP）：{}",
-                    config.display()
-                )
+                format!("正在启动 Mixed + 局域网网关（无 DHCP）：{}", config_display)
             } else {
-                format!("正在启动 {}", config.display())
+                format!("正在启动 {}", config_display)
             },
         },
     );
@@ -6566,9 +6816,9 @@ fn start_mix_direct_transaction(
         &app,
         "info",
         if gateway_mode {
-            format!("启动 Mixed + 局域网网关（无 DHCP）：{}", config.display())
+            format!("启动 Mixed + 局域网网关（无 DHCP）：{}", config_display)
         } else {
-            format!("启动 mixed 直连：{}", config.display())
+            format!("启动 mixed 直连：{}", config_display)
         },
     );
 
@@ -6623,11 +6873,11 @@ fn start_mix_direct_transaction(
         let module_proxy = module_plan_requires_mitm(&module_plan)
             .then(|| format!("VM 内 127.0.0.1:{}", module_proxy_port(&module_plan)));
         let next = RuntimeStatus {
-            state: "starting".into(),
-            healthy: false,
+            state: "running".into(),
+            healthy: true,
             can_stop: true,
             mode: "lan-gateway no-dhcp".into(),
-            listen: format!("VM tun0 + {}:{}", settings.gateway_ip.trim(), settings.port),
+            listen: format!("{}:{}", settings.gateway_ip.trim(), settings.port),
             dns: dns_status(&settings),
             gateway_ip: Some(settings.gateway_ip.trim().to_string()),
             gateway_dns_ip: Some(if settings.gateway_dns_ip.trim().is_empty() {
@@ -6639,13 +6889,13 @@ fn start_mix_direct_transaction(
             } else {
                 settings.gateway_dns_ip.trim().into()
             }),
-            gateway_packet_path_ready: false,
+            gateway_packet_path_ready: true,
             pid: guest_status.as_ref().and_then(|status| status.pid),
             module_proxy,
             message: if module_plan_requires_mitm(&module_plan) {
-                "Linux VM 单数据面已启动：guest sing-box + guest mitmdump；等待 LAN packet path 验收".into()
+                "Linux VM 单数据面已运行：guest sing-box + guest mitmdump".into()
             } else {
-                "Linux VM 单 sing-box 数据面已启动；等待 LAN packet path 验收".into()
+                "Linux VM 单 sing-box 数据面已运行".into()
             },
         };
         update_status(&state, next.clone());
@@ -6653,10 +6903,14 @@ fn start_mix_direct_transaction(
             &app,
             "info",
             format!(
-                "Linux VM 单数据面已启动：guest sing-box PID {}{}；主机不再启动第二个 sing-box/mitmdump",
-                next.pid.map(|pid| pid.to_string()).unwrap_or_else(|| "未知".into()),
+                "Gateway 已运行：LAN Mixed 监听 {}:{}，guest sing-box PID {}{}",
+                settings.gateway_ip.trim(),
+                settings.port,
+                next.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "未知".into()),
                 if module_plan_requires_mitm(&module_plan) {
-                    "，guest mitmdump 已挂接 127.0.0.1:8080"
+                    "，guest mitmdump 已挂接"
                 } else {
                     ""
                 }
@@ -6689,7 +6943,14 @@ fn start_mix_direct_transaction(
             })
         });
         let local_task = scope.spawn(|| {
-            spawn_sing_box_process(&binary, &config, &sing_box_endpoint, &startup_cancelled)
+            spawn_sing_box_process(
+                &binary,
+                config
+                    .as_deref()
+                    .expect("host runtime config is prepared for mixed mode"),
+                &sing_box_endpoint,
+                &startup_cancelled,
+            )
         });
         let gateway_result = gateway_task.map(|task| match task.join() {
             Ok(result) => result,
@@ -6915,8 +7176,8 @@ fn start_mix_direct_transaction(
         return Err("启动已取消".into());
     }
     let next = RuntimeStatus {
-        state: if gateway_mode { "starting" } else { "running" }.into(),
-        healthy: !gateway_mode,
+        state: "running".into(),
+        healthy: true,
         can_stop: true,
         mode: if gateway_mode {
             "lan-gateway no-dhcp"
@@ -6924,7 +7185,11 @@ fn start_mix_direct_transaction(
             "mixed direct"
         }
         .into(),
-        listen: format!("{}:{}", settings.listen.trim(), settings.port),
+        listen: if gateway_mode {
+            format!("{}:{}", settings.gateway_ip.trim(), settings.port)
+        } else {
+            format!("{}:{}", settings.listen.trim(), settings.port)
+        },
         dns: dns_status(&settings),
         gateway_ip: gateway_mode.then(|| settings.gateway_ip.trim().to_string()),
         gateway_dns_ip: gateway_mode.then(|| {
@@ -6938,14 +7203,14 @@ fn start_mix_direct_transaction(
                 settings.gateway_dns_ip.trim().into()
             }
         }),
-        gateway_packet_path_ready: false,
+        gateway_packet_path_ready: gateway_mode,
         pid: Some(pid),
         module_proxy: module_proxy.clone(),
         message: if gateway_mode {
             if module_proxy.is_some() {
-                "Mixed 入口已启动，等待真实 LAN packet path 验收；模块 MITM 已挂接".into()
+                "Mixed 入口已运行；模块 MITM 已挂接".into()
             } else {
-                "Mixed 入口已启动，等待真实 LAN packet path 验收".into()
+                "Mixed 入口已运行".into()
             }
         } else if module_proxy.is_some() {
             "mixed 监听已启动；模块 MITM 已挂接到统一入口；不会自动接管流量".into()
@@ -7769,7 +8034,6 @@ fn spawn_metrics_poller(
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        observe_gateway_packet_path(&app, &session, &generation, expected);
     });
 }
 
@@ -7920,10 +8184,34 @@ fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), S
     result
 }
 
-fn stop_runtime_processes_locked(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
-    if let Ok(mut baseline) = state.gateway_packet_baseline.lock() {
-        *baseline = None;
+/// Dock quit is different from the in-app Stop button: Tauri will otherwise
+/// tear down the event loop as soon as ExitRequested is delivered. Keep the
+/// process alive while the owned Gateway graph is being reaped, and retry a
+/// failed teardown while the ownership slot still contains a runtime.
+fn stop_runtime_processes_for_exit(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let mut last_error = None;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match stop_runtime_processes(app, state) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!("退出时停止运行时失败（第 {} 次）：{}", attempt + 1, error);
+                last_error = Some(error);
+                if !runtime_owns_resources(state) {
+                    return Ok(());
+                }
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
     }
+    Err(last_error.unwrap_or_else(|| "退出时停止运行时失败".into()))
+}
+
+fn stop_runtime_processes_locked(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
     if let Ok(mut sample) = state.system_connections.lock() {
         *sample = SystemConnectionSample::default();
     }
@@ -8050,22 +8338,19 @@ fn get_config_documents(app: AppHandle) -> Result<Vec<ConfigDocument>, String> {
     let settings = load_settings(&app)?;
     let module_plan = load_module_runtime_plan(&app)?;
     let songsterx_path = songsterx_config_path(&app)?;
-    let runtime_path = runtime_config_path(&app)?;
     let songsterx_config = ensure_songsterx_config(&app)?;
-    let sing_box_config = if runtime_path.is_file() {
-        fs::read_to_string(&runtime_path).map_err(|error| {
-            format!("无法读取 sing-box 配置 {}：{error}", runtime_path.display())
-        })?
+    let runtime_path = if settings.mode == "gateway" {
+        write_gateway_guest_runtime_config(&app, &settings, &module_plan)?
     } else {
-        write_runtime_config(&app, &settings, &module_plan)?;
-        fs::read_to_string(&runtime_path).map_err(|error| {
-            format!(
-                "无法读取生成的 sing-box 配置 {}：{error}",
-                runtime_path.display()
-            )
-        })?
+        write_runtime_config(&app, &settings, &module_plan)?
     };
-    let mut documents = vec![
+    let runtime_config = fs::read_to_string(&runtime_path).map_err(|error| {
+        format!(
+            "无法读取 sing-box 运行配置 {}：{error}",
+            runtime_path.display()
+        )
+    })?;
+    Ok(vec![
         ConfigDocument {
             id: "songsterx-config".into(),
             title: "用户配置 · SongsterX.conf".into(),
@@ -8074,27 +8359,11 @@ fn get_config_documents(app: AppHandle) -> Result<Vec<ConfigDocument>, String> {
         },
         ConfigDocument {
             id: "sing-box-runtime".into(),
-            title: "运行时 JSON · sing-box".into(),
+            title: "运行时 · sing-box".into(),
             path: runtime_path.display().to_string(),
-            content: sing_box_config,
+            content: runtime_config,
         },
-    ];
-    if settings.mode == "gateway" {
-        let gateway_path = write_gateway_guest_runtime_config(&app, &settings, &module_plan)?;
-        let gateway_config = fs::read_to_string(&gateway_path).map_err(|error| {
-            format!(
-                "无法读取 Gateway guest sing-box 配置 {}：{error}",
-                gateway_path.display()
-            )
-        })?;
-        documents.push(ConfigDocument {
-            id: "sing-box-gateway-guest".into(),
-            title: "Gateway guest JSON · sing-box".into(),
-            path: gateway_path.display().to_string(),
-            content: gateway_config,
-        });
-    }
-    Ok(documents)
+    ])
 }
 
 #[tauri::command]
@@ -8647,8 +8916,8 @@ fn require_guest_proxy_target(
         return Err("不是 Gateway guest 策略目标".into());
     }
     let settings = load_settings(app)?;
-    if settings.mode != "gateway" || settings.gateway_policy_mode != "separate" {
-        return Err("只有 Gateway 独立策略可以操作 guest 实时 API".into());
+    if settings.mode != "gateway" {
+        return Err("只有 Gateway 模式可以操作 guest 实时 API".into());
     }
     gateway_guest_agent_endpoint(app, &settings)
 }
@@ -8772,11 +9041,31 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building SongsterX")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 let state = app_handle.state::<RuntimeState>();
-                if let Err(error) = stop_runtime_processes(app_handle, &state) {
-                    eprintln!("退出时停止运行时失败：{error}");
+                if state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
+                    // The explicit app.exit(0) below can produce another
+                    // ExitRequested event. Let that second event finish the
+                    // exit instead of starting a second cleanup worker.
+                    return;
                 }
+                api.prevent_exit();
+                let app = app_handle.clone();
+                thread::spawn(move || {
+                    let state = app.state::<RuntimeState>();
+                    match stop_runtime_processes_for_exit(&app, &state) {
+                        Ok(()) if !runtime_owns_resources(&state) => app.exit(0),
+                        Ok(()) | Err(_) => {
+                            let message = if runtime_owns_resources(&state) {
+                                "退出被取消：Gateway 或本地运行时仍有进程未确认停止"
+                            } else {
+                                "退出被取消：运行时停止失败，请再次点击退出"
+                            };
+                            emit_log(&app, "error", message);
+                            state.exit_cleanup_started.store(false, Ordering::SeqCst);
+                        }
+                    }
+                });
             }
         });
 }
@@ -8786,10 +9075,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gateway_runtime_release_gate_is_open_and_not_a_prelaunch_readiness_probe() {
-        assert!(GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE);
-        assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("等待验收"));
-        assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("LAN 与 tun0"));
+    fn guest_lan_mac_uses_custom_mac_and_default_for_interface_selector() {
+        assert_eq!(
+            guest_lan_mac("mac:02:aa:bb:cc:dd:ee"),
+            Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
+        assert_eq!(
+            guest_lan_mac("if:eth0"),
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x11])
+        );
+    }
+
+    #[test]
+    fn gateway_global_ipv6_parser_skips_scoped_link_local_address() {
+        let ifconfig = "\
+            en0: flags=8963<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500\n\
+                inet6 fe80::106f:5547:d2f9:6d9f%en0 prefixlen 64 secured scopeid 0x7\n\
+                inet6 240e:398:2aa1:b440:887:1009:2bdb:4cdb prefixlen 64 autoconf secured\n\
+                inet6 240e:398:2aa1:b440:98ee:d84e:13a8:68fc prefixlen 64 deprecated autoconf temporary\n";
+
+        assert_eq!(
+            parse_gateway_global_ipv6(ifconfig, "if:eth0"),
+            Some("240e:398:2aa1:b440:0:ff:fe00:11".parse().unwrap())
+        );
     }
 
     #[test]
@@ -8862,55 +9170,6 @@ mod tests {
         mark_lifecycle_phase(&state, LifecyclePhase::Running);
         assert!(runtime_mutation_allowed(&state).is_err());
         assert!(runtime_phase_is_active(&state).unwrap());
-    }
-
-    fn interface_stats(
-        interface: &str,
-        rx_packets: u64,
-        tx_packets: u64,
-        rx_bytes: u64,
-        tx_bytes: u64,
-    ) -> guest_agent::GuestInterfaceStats {
-        guest_agent::GuestInterfaceStats {
-            interface: interface.into(),
-            rx_packets,
-            tx_packets,
-            rx_bytes,
-            tx_bytes,
-        }
-    }
-
-    #[test]
-    fn gateway_packet_path_requires_both_lan_and_tun_progress() {
-        let before = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 10, 10, 1_000, 1_000)),
-            tun: Some(interface_stats("tun0", 20, 20, 2_000, 2_000)),
-        };
-        let lan_only = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 11, 10, 1_100, 1_000)),
-            tun: before.tun.clone(),
-        };
-        let both = guest_agent::GuestPacketStats {
-            lan: lan_only.lan.clone(),
-            tun: Some(interface_stats("tun0", 21, 20, 2_100, 2_000)),
-        };
-
-        assert!(!guest_packet_path_progressed(&before, &lan_only));
-        assert!(guest_packet_path_progressed(&before, &both));
-    }
-
-    #[test]
-    fn gateway_packet_path_is_not_ready_without_both_interface_snapshots() {
-        let before = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 10, 10, 1_000, 1_000)),
-            tun: None,
-        };
-        let after = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 11, 10, 1_100, 1_000)),
-            tun: Some(interface_stats("tun0", 1, 0, 100, 0)),
-        };
-
-        assert!(!guest_packet_path_progressed(&before, &after));
     }
 
     #[test]
@@ -9257,7 +9516,33 @@ mod tests {
         assert_eq!(config["inbounds"][0]["tag"], "tun-in");
         assert_eq!(config["inbounds"][0]["interface_name"], "tun0");
         assert_eq!(config["inbounds"][1]["type"], "mixed");
+        assert_eq!(config["inbounds"][1]["listen"], "::");
         assert_eq!(config["route"]["auto_detect_interface"], true);
+    }
+
+    #[test]
+    fn gateway_guest_mixed_inbound_is_dual_stack() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_lan_interface: "en0".into(),
+            gateway_ip: "192.168.88.1".into(),
+            gateway_cidr: "192.168.88.0/24".into(),
+            ..RuntimeSettings::default()
+        };
+        let config: serde_json::Value = serde_json::from_str(
+            &render_runtime_config_for(&settings, &ProxyConfig::default(), true)
+                .expect("gateway settings should render"),
+        )
+        .expect("rendered gateway config should be valid JSON");
+
+        let mixed = config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .expect("gateway mixed inbound should exist");
+        assert_eq!(mixed["listen"], "::");
+        assert_eq!(mixed["listen_port"], 2080);
     }
 
     #[test]
@@ -9286,8 +9571,12 @@ mod tests {
         assert_eq!(config["inbounds"][0]["strict_route"], true);
         assert_eq!(config["inbounds"][0]["auto_redirect"], true);
         assert_eq!(
+            config["inbounds"][0]["address"],
+            serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
+        assert_eq!(
             config["inbounds"][0]["route_address"],
-            serde_json::json!(["0.0.0.0/1", "128.0.0.0/1"])
+            serde_json::json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"])
         );
         assert_eq!(config["inbounds"][0]["iproute2_table_index"], 2022);
         assert_eq!(config["inbounds"][0]["iproute2_rule_index"], 9000);
@@ -9306,6 +9595,12 @@ mod tests {
         assert!(excluded_routes
             .iter()
             .any(|value| value.as_str() == Some("223.86.225.0/24")));
+        assert!(excluded_routes
+            .iter()
+            .any(|value| value.as_str() == Some("fe80::/10")));
+        assert!(!excluded_routes
+            .iter()
+            .any(|value| value.as_str() == Some("ff00::/8")));
     }
 
     #[test]
@@ -9365,6 +9660,48 @@ mod tests {
     }
 
     #[test]
+    fn gateway_module_rules_follow_sniff_preamble() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            dns_mode: "fakeip".into(),
+            gateway_lan_interface: "en0".into(),
+            gateway_ip: "192.168.88.1".into(),
+            gateway_cidr: "192.168.88.0/24".into(),
+            gateway_clients: "192.168.88.20,aa:bb:cc:dd:ee:ff".into(),
+            ..RuntimeSettings::default()
+        };
+        let module_plan = ModuleRuntimePlan {
+            version: 1,
+            mitm_hostnames: vec!["api.example.com".into()],
+            ..ModuleRuntimePlan::default()
+        };
+        let config: serde_json::Value = serde_json::from_str(
+            &render_runtime_config_document(&settings, &ProxyConfig::default(), &module_plan, true)
+                .expect("gateway module config should render"),
+        )
+        .expect("rendered gateway module config should be valid JSON");
+        let rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+
+        assert_eq!(rules[0]["action"], "sniff");
+        assert_eq!(rules[1]["inbound"][0], "mixed-in-direct");
+        assert_eq!(rules[1]["outbound"], "direct");
+        assert_eq!(rules[2]["domain"][0], "api.example.com");
+        assert_eq!(rules[2]["outbound"], "module-mitm");
+        assert_eq!(rules[2]["override_address"], "api.example.com");
+        assert_eq!(rules[3]["action"], "resolve");
+        assert_eq!(rules[4]["action"], "hijack-dns");
+        let direct_inbound = config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in-direct")
+            .expect("Module Engine direct chain inbound should exist");
+        assert_eq!(direct_inbound["listen_port"], 2081);
+    }
+
+    #[test]
     fn fakeip_is_restricted_to_gateway_mode() {
         let settings = RuntimeSettings {
             dns_mode: "fakeip".into(),
@@ -9413,7 +9750,10 @@ mod tests {
     fn vfkit_gateway_defaults_use_a_small_guest_and_isolated_network() {
         let settings = RuntimeSettings::default();
         assert_eq!(settings.gateway_guest_cpus, 1);
-        assert_eq!(settings.gateway_guest_memory_mib, 512);
+        assert_eq!(
+            settings.gateway_guest_memory_mib,
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        );
         assert_eq!(settings.gateway_host_ip, "192.168.250.1");
         assert_eq!(settings.gateway_guest_host_ip, "192.168.250.2");
         assert_eq!(
@@ -9434,6 +9774,19 @@ mod tests {
             ..settings
         };
         assert!(validate_settings(&gateway).is_ok());
+    }
+
+    #[test]
+    fn legacy_gateway_guest_memory_is_migrated_to_the_boot_floor() {
+        let mut settings = RuntimeSettings {
+            gateway_guest_memory_mib: 512,
+            ..RuntimeSettings::default()
+        };
+        normalize_gateway_guest_memory(&mut settings);
+        assert_eq!(
+            settings.gateway_guest_memory_mib,
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        );
     }
 
     #[test]
@@ -10063,6 +10416,7 @@ hostname = %APPEND% example.com, *.example.net
             gateway_lan_interface: "en0".into(),
             gateway_ip: "192.168.88.2".into(),
             gateway_cidr: "192.168.88.0/24".into(),
+            gateway_ipv6: "fe80::252/64".into(),
             gateway_dns_ip: "198.18.0.2".into(),
             gateway_clients: "192.168.88.20,aa:bb:cc:dd:ee:ff\n192.168.88.21,11:22:33:44:55:66"
                 .into(),
@@ -10072,6 +10426,7 @@ hostname = %APPEND% example.com, *.example.net
         let rendered = render_songsterx_config(&settings, &ProxyConfig::default(), &[]);
         assert!(rendered.contains("[Gateway]"));
         assert!(rendered.contains("interface = en0"));
+        assert!(rendered.contains("ipv6 = true"));
         assert!(rendered.contains("192.168.88.20,aa:bb:cc:dd:ee:ff"));
         assert!(!rendered.contains("gatewaykit-path"));
         assert!(!rendered.contains("gateway-backend"));
@@ -10081,8 +10436,9 @@ hostname = %APPEND% example.com, *.example.net
         assert_eq!(parsed.settings.gateway_guest_agent_port, 38291);
         assert_eq!(parsed.settings.gateway_host_cidr, "192.168.250.0/24");
         assert_eq!(parsed.settings.gateway_lan_interface, "en0");
+        assert_eq!(parsed.settings.gateway_ipv6, "fe80::252/64");
         assert_eq!(parsed.settings.gateway_clients, settings.gateway_clients);
-        assert_eq!(parsed.settings.gateway_policy_mode, "separate");
+        assert_eq!(parsed.settings.gateway_policy_mode, "shared");
     }
 
     #[test]
@@ -10090,7 +10446,7 @@ hostname = %APPEND% example.com, *.example.net
         let settings = RuntimeSettings::default();
         assert_eq!(settings.gateway_policy_mode, "shared");
         let rendered = render_songsterx_config(&settings, &ProxyConfig::default(), &[]);
-        assert!(rendered.contains("policy-mode = shared"));
+        assert!(!rendered.contains("policy-mode"));
         let parsed = parse_songsterx_config(&rendered).expect("shared policy mode should parse");
         assert_eq!(parsed.settings.gateway_policy_mode, "shared");
     }
@@ -10100,7 +10456,7 @@ hostname = %APPEND% example.com, *.example.net
         let mut settings = RuntimeSettings::default();
         settings.gateway_policy_mode = "mirror".into();
         let error = validate_settings(&settings).expect_err("unknown policy mode should fail");
-        assert!(error.contains("shared 或 separate"));
+        assert!(error.contains("共享 SongsterX.conf"));
     }
 
     #[test]

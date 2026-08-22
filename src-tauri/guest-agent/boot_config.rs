@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs, net::Ipv4Addr, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    net::{Ipv4Addr, Ipv6Addr},
+    path::Path,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InterfaceSelector {
@@ -47,6 +52,7 @@ impl Ipv4Cidr {
 pub(crate) struct GuestBootConfig {
     pub(crate) lan_ip: Ipv4Addr,
     pub(crate) lan_cidr: Ipv4Cidr,
+    pub(crate) lan_ipv6: Option<Ipv6Addr>,
     pub(crate) host_ip: Ipv4Addr,
     pub(crate) host_cidr: Ipv4Cidr,
     pub(crate) upstream_gateway: Ipv4Addr,
@@ -67,6 +73,7 @@ pub(crate) struct ResolvedGuestNetwork {
     pub(crate) lan_interface: String,
     pub(crate) host_interface: String,
     pub(crate) lan_ip: Ipv4Addr,
+    pub(crate) lan_ipv6: Ipv6Addr,
     pub(crate) host_ip: Ipv4Addr,
     pub(crate) upstream_gateway: Ipv4Addr,
     pub(crate) agent_port: u16,
@@ -91,6 +98,7 @@ pub(crate) fn parse_cmdline(value: &str) -> Result<GuestBootConfig, String> {
 
     let lan_ip = required_ipv4(&values, "songsterx.lan_ip")?;
     let lan_cidr = Ipv4Cidr::parse(required(&values, "songsterx.lan_cidr")?, "LAN CIDR")?;
+    let lan_ipv6 = optional_ipv6_cidr(&values, "songsterx.lan_ipv6")?;
     let host_ip = required_ipv4(&values, "songsterx.host_ip")?;
     let host_cidr = Ipv4Cidr::parse(required(&values, "songsterx.host_cidr")?, "host-only CIDR")?;
     let upstream_gateway = required_ipv4(&values, "songsterx.upstream_gateway")?;
@@ -119,6 +127,7 @@ pub(crate) fn parse_cmdline(value: &str) -> Result<GuestBootConfig, String> {
     Ok(GuestBootConfig {
         lan_ip,
         lan_cidr,
+        lan_ipv6,
         host_ip,
         host_cidr,
         upstream_gateway,
@@ -170,10 +179,14 @@ pub(crate) fn resolve_interfaces(
     if lan_interface == host_interface {
         return Err("LAN 与 host-only selector 解析到了同一张网卡".into());
     }
+    let lan_ipv6 = config.lan_ipv6.unwrap_or(link_local_from_mac(
+        &interfaces_for_name(interfaces, &lan_interface)?.mac,
+    )?);
     Ok(ResolvedGuestNetwork {
         lan_interface,
         host_interface,
         lan_ip: config.lan_ip,
+        lan_ipv6,
         host_ip: config.host_ip,
         upstream_gateway: config.upstream_gateway,
         agent_port: config.agent_port,
@@ -193,6 +206,64 @@ fn required_ipv4(values: &BTreeMap<String, String>, key: &str) -> Result<Ipv4Add
     value
         .parse::<Ipv4Addr>()
         .map_err(|_| format!("{key} IPv4 无效：{value}"))
+}
+
+fn optional_ipv6_cidr(
+    values: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<Ipv6Addr>, String> {
+    let value = required(values, key)?;
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| format!("{key} 必须使用 IPv6/prefix 格式"))?;
+    let address = address
+        .parse::<Ipv6Addr>()
+        .map_err(|_| format!("{key} IPv6 无效：{address}"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| format!("{key} prefix 无效：{prefix}"))?;
+    if prefix != 64 {
+        return Err(format!("{key} prefix 必须为 64"));
+    }
+    if address.segments()[0] != 0xfe80 {
+        return Err(format!("{key} 必须是链路本地地址（fe80::/64）"));
+    }
+    Ok(Some(address))
+}
+
+fn interfaces_for_name<'a>(
+    interfaces: &'a [InterfaceIdentity],
+    name: &str,
+) -> Result<&'a InterfaceIdentity, String> {
+    interfaces
+        .iter()
+        .find(|interface| interface.name == name)
+        .ok_or_else(|| format!("无法读取 LAN 网卡 MAC：{name}"))
+}
+
+fn link_local_from_mac(mac: &str) -> Result<Ipv6Addr, String> {
+    let parts = mac.split(':').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Err(format!("MAC 地址无效：{mac}"));
+    }
+    let mut bytes = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        bytes[index] = u8::from_str_radix(part, 16).map_err(|_| format!("MAC 地址无效：{mac}"))?;
+    }
+    bytes[0] ^= 0x02;
+    Ok(Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([bytes[0], bytes[1]]),
+        u16::from_be_bytes([bytes[2], 0xff]),
+        u16::from_be_bytes([0xfe, bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+    ))
 }
 
 fn selector(values: &BTreeMap<String, String>, role: &str) -> Result<InterfaceSelector, String> {
@@ -283,6 +354,7 @@ mod tests {
             "console=hvc0",
             "songsterx.lan_ip=192.168.1.2",
             "songsterx.lan_cidr=192.168.1.0/24",
+            "songsterx.lan_ipv6=auto",
             "songsterx.host_ip=192.168.250.2",
             "songsterx.host_cidr=192.168.250.0/24",
             "songsterx.upstream_gateway=192.168.1.1",
@@ -298,6 +370,7 @@ mod tests {
         let parsed = parse_cmdline(&valid_cmdline()).unwrap();
         assert_eq!(parsed.lan_ip, "192.168.1.2".parse::<Ipv4Addr>().unwrap());
         assert_eq!(parsed.host_ip, "192.168.250.2".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(parsed.lan_ipv6, None);
         assert_eq!(
             parsed.upstream_gateway,
             "192.168.1.1".parse::<Ipv4Addr>().unwrap()
@@ -346,5 +419,13 @@ mod tests {
         assert!(resolve_interfaces(&config, &non_virtio)
             .unwrap_err()
             .contains("LAN selector"));
+    }
+
+    #[test]
+    fn derives_full_link_local_address_from_lan_mac() {
+        assert_eq!(
+            link_local_from_mac("8c:1f:64:47:22:b8").unwrap(),
+            "fe80::8e1f:64ff:fe47:22b8".parse::<Ipv6Addr>().unwrap()
+        );
     }
 }

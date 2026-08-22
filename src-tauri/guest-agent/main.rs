@@ -19,7 +19,12 @@ const MAX_MODULE_PLAN_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_UPGRADE_SIZE: u64 = 64 * 1024 * 1024;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SING_BOX_STARTUP_GRACE: Duration = Duration::from_millis(200);
-const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(14);
+const SING_BOX_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const MITM_RESTART_BACKOFF: Duration = Duration::from_secs(2);
+// Allow a cold mitmdump/CA start, but fail a wedged data plane promptly.  The
+// host has a larger transaction budget so it can still reconcile the final
+// guest status and report the actual readiness dimensions.
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const GUEST_CLASH_API_ADDR: &str = "127.0.0.1:9090";
 const CLASH_HTTP_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
 const AGENT_CONNECTIONS_RESPONSE_LIMIT: usize = 60 * 1024;
@@ -65,6 +70,7 @@ struct AgentRuntime {
     last_error: Option<String>,
     control_listening: bool,
     liveness_fault: bool,
+    next_mitm_restart: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,16 +165,37 @@ impl AgentRuntime {
         }
     }
 
-    fn refresh_mitm(&mut self, plan_path: &Path) {
+    fn refresh_mitm(&mut self, config: &AgentConfig) {
+        let plan_path = module_plan_path(config);
         let result = self.mitm.as_mut().map(|process| process.child.try_wait());
         match result {
             Some(Ok(Some(status))) => {
                 self.mitm = None;
-                self.last_error = Some(format!("mitmdump 已退出，状态码 {:?}", status.code()));
-                if module_plan_requires_mitm(plan_path) {
+                let exit_message = format!("mitmdump 已退出，状态码 {:?}", status.code());
+                self.last_error = Some(exit_message.clone());
+                if module_plan_requires_mitm(&plan_path)
+                    && self.sing_box.is_some()
+                    && !self.liveness_fault
+                    && self
+                        .next_mitm_restart
+                        .is_none_or(|deadline| Instant::now() >= deadline)
+                {
+                    self.next_mitm_restart = Some(Instant::now() + MITM_RESTART_BACKOFF);
+                    match start_mitm(config, self) {
+                        Ok(()) => {
+                            self.last_error = Some(format!(
+                                "{exit_message}；Module Engine 已自动重启，等待监听器就绪"
+                            ));
+                        }
+                        Err(error) => {
+                            self.last_error = Some(format!(
+                                "{exit_message}；Module Engine 自动重启失败：{error}"
+                            ));
+                        }
+                    }
+                } else if module_plan_requires_mitm(&plan_path) {
                     self.last_error = Some(format!(
-                        "mitmdump 已退出，状态码 {:?}；模块 MITM 仍需要运行",
-                        status.code()
+                        "{exit_message}；模块 MITM 仍需要运行，等待自动重启"
                     ));
                 }
             }
@@ -219,6 +246,7 @@ impl AgentRuntime {
             .expect("mitmdump exists");
         if result.is_ok() {
             self.mitm = None;
+            self.next_mitm_restart = None;
         } else {
             self.liveness_fault = true;
         }
@@ -254,6 +282,7 @@ impl AgentRuntime {
         remove_readiness_path(readiness_file);
         if failures.is_empty() {
             self.liveness_fault = false;
+            self.next_mitm_restart = None;
             Ok(())
         } else {
             self.liveness_fault = true;
@@ -1142,6 +1171,7 @@ fn activate_session(
     let candidate_plan_value: Value = serde_json::from_slice(&candidate_plan)
         .map_err(|error| format!("staged 模块运行计划不是有效 JSON：{error}"))?;
 
+    eprintln!("gateway-agent: activate_session validating staged configuration");
     let active = read_pointer(&active_path(&config.state_dir), "active")?
         .ok_or_else(|| "没有可运行的 sing-box 版本".to_string())?;
     let artifact = version_dir(&config.state_dir, &active)?.join("sing-box");
@@ -1158,6 +1188,7 @@ fn activate_session(
         write_atomic_bytes(&config_previous_path(config), previous)?;
     }
 
+    eprintln!("gateway-agent: activate_session stopping current data plane");
     if let Err(error) = runtime.stop(&config.readiness_file) {
         return respond(
             reader,
@@ -1165,6 +1196,7 @@ fn activate_session(
         );
     }
 
+    eprintln!("gateway-agent: activate_session starting candidate data plane");
     let activation = (|| {
         write_atomic_bytes(&config_path, &candidate_config)?;
         write_atomic_bytes(&plan_path, &candidate_plan)?;
@@ -1488,7 +1520,7 @@ fn rollback(
 
 fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<Value, String> {
     runtime.refresh(&config.readiness_file);
-    runtime.refresh_mitm(&module_plan_path(config));
+    runtime.refresh_mitm(config);
     progress_pending_session(config, runtime);
     let active_version =
         read_pointer(&active_path(&config.state_dir), "active")?.unwrap_or_default();
@@ -1517,6 +1549,10 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
         .guest_network
         .as_ref()
         .map(|network| network.lan_ip.to_string());
+    let gateway_lan_ipv6 = config
+        .guest_network
+        .as_ref()
+        .map(|network| network.lan_ipv6.to_string());
     let upstream_interface = config
         .guest_network
         .as_ref()
@@ -1539,6 +1575,7 @@ fn status_response(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<V
             "singBoxReady": sing_box_ready,
             "networkReady": network_ready,
             "gatewayLanIp": gateway_lan_ip,
+            "gatewayLanIpv6": gateway_lan_ipv6,
             "upstreamInterface": upstream_interface,
             "packetStats": packet_stats,
             "lastError": runtime.last_error,
@@ -1617,16 +1654,25 @@ fn progress_pending_session(config: &AgentConfig, runtime: &mut AgentRuntime) {
         .pending_session
         .take()
         .expect("pending session exists");
-    rollback_pending_session(
-        config,
-        runtime,
-        pending,
-        if child_failed {
-            "Gateway session data plane 在 ready 前退出"
-        } else {
-            "Gateway session 在 ready 前超时"
-        },
-    );
+    let reason = if child_failed {
+        "Gateway session data plane 在 ready 前退出".to_string()
+    } else {
+        "Gateway session 在 ready 前超时".to_string()
+    };
+    let diagnostic = session_readiness_diagnostic(config, runtime);
+    rollback_pending_session(config, runtime, pending, &format!("{reason}；{diagnostic}"));
+}
+
+fn session_readiness_diagnostic(config: &AgentConfig, runtime: &AgentRuntime) -> String {
+    format!(
+        "singBoxReady={} mitmHealthy={} mitmReady={} networkReady={} controlListening={} lastError={}",
+        runtime.sing_box_ready(),
+        runtime.mitm_healthy(),
+        runtime.mitm_ready(),
+        guest_network_ready(config),
+        runtime.control_listening,
+        runtime.last_error.as_deref().unwrap_or("<none>")
+    )
 }
 
 fn rollback_pending_session(
@@ -1635,6 +1681,7 @@ fn rollback_pending_session(
     pending: PendingSession,
     reason: &str,
 ) {
+    let had_previous_config = pending.previous_config.is_some();
     let stop_error = runtime.stop(&config.readiness_file).err();
     let config_path = sing_box_config_path(config);
     let plan_path = module_plan_path(config);
@@ -1665,6 +1712,13 @@ fn rollback_pending_session(
         );
         let _ = runtime.stop(&config.readiness_file);
         runtime.last_error = Some(message);
+        return;
+    }
+
+    if !had_previous_config {
+        runtime.last_error = Some(format!(
+            "{reason}；没有旧 Gateway session 可恢复，data plane 已保持停止"
+        ));
         return;
     }
 
@@ -1794,15 +1848,19 @@ fn start_version(
         ));
     }
     check_sing_box(&artifact, &config_path)?;
+    // The guest filesystem is an initramfs-backed writable layer.  Persisting
+    // sing-box INFO logs there makes a busy LAN client eventually exhaust the
+    // layer, after which mitmdump cannot even rewrite its small CA temp file
+    // and all module-routed requests start resetting.  Connection/activity
+    // metrics are collected through the Clash API; keep the data plane logs
+    // off the guest filesystem entirely.
     let mut child = Command::new(&artifact)
         .arg("run")
         .arg("-c")
         .arg(&config_path)
         .stdin(Stdio::null())
-        // Keep data-plane diagnostics on the guest console so a runtime
-        // failure is actionable instead of being reduced to exit code 1.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("启动 sing-box {version} 失败：{error}"))?;
     thread::sleep(SING_BOX_STARTUP_GRACE);
@@ -1876,7 +1934,8 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
     if !plan_path.is_file() {
         return Err(format!("guest 模块运行计划不存在：{}", plan_path.display()));
     }
-    let confdir = config.state_dir.join("mitmproxy");
+    let upstream_proxy = module_upstream_proxy(config)?;
+    let confdir = mitm_state_dir();
     fs::create_dir_all(&confdir)
         .map_err(|error| format!("无法创建 guest mitmproxy 配置目录：{error}"))?;
     let module_plan: Value = serde_json::from_slice(
@@ -1889,13 +1948,55 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
         }
         write_atomic_bytes(&confdir.join("mitmproxy-ca.pem"), ca_pem.as_bytes())?;
     }
-    let mut child = Command::new(binary)
+    // Gateway traffic can be intercepted by another proxy on the macOS host
+    // (for example Surge).  The guest cannot receive that proxy's private CA,
+    // so verifying that second hop would make every HTTPS module flow fail
+    // before the Module Engine sees a response.  The outer hop is still
+    // protected by the SongsterX CA installed on the client device.
+    //
+    // Run through a tiny shell wrapper so the guest mitmdump gets the highest
+    // nofile limit allowed by the guest kernel.  Mobile clients can create a
+    // burst of parallel HTTP/2 connections; leaving the Alpine default of
+    // 1024 descriptors lets mitmproxy die with Errno 24 under that burst.
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n 65535 2>/dev/null || ulimit -n 4096 2>/dev/null || true; exec \"$@\"")
+        .arg("songsterx-mitmdump")
+        .arg(binary)
+        // Keep FakeIP unchanged for clients. After Module Engine processing,
+        // chain the request back into sing-box's loopback mixed inbound. That
+        // inbound is explicitly DIRECT, so sing-box resolves the real domain
+        // and owns the final outbound connection instead of mitmproxy dialing
+        // the client's FakeIP itself.
+        .arg("--mode")
+        .arg(format!("upstream:{upstream_proxy}"))
         .arg("--listen-host")
         .arg("127.0.0.1")
         .arg("--listen-port")
         .arg("8080")
         .arg("--set")
         .arg(format!("confdir={}", confdir.display()))
+        // Alpine ships the trust bundle at this path.  mitmproxy's Python
+        // certificate lookup can otherwise miss the guest bundle and reject
+        // otherwise valid upstream CDN certificates before any module hook
+        // gets a response to rewrite.
+        .arg("--set")
+        .arg("ssl_verify_upstream_trusted_ca=/etc/ssl/certs/ca-certificates.crt")
+        // The guest's upstream hop may be re-signed by a host-side proxy.
+        // That CA is intentionally not copied into the guest, so do not
+        // reject the second hop before the client-side MITM can run.
+        .arg("--set")
+        .arg("ssl_insecure=true")
+        // Avoid opening speculative upstream connections while the client is
+        // still negotiating TLS; this is important for bursty mobile apps.
+        .arg("--set")
+        .arg("connection_strategy=lazy")
+        // Bilibili can open a burst of large API/media responses.  The
+        // module rules only need buffered bodies for small JSON responses;
+        // stream larger bodies so mitmproxy does not retain them all in the
+        // guest memory-backed filesystem/process under sustained traffic.
+        .arg("--set")
+        .arg("stream_large_bodies=2m")
         .arg("-s")
         .arg(addon)
         .env("SONGSTERX_MODULE_PLAN", &plan_path)
@@ -1930,17 +2031,66 @@ fn start_mitm(config: &AgentConfig, runtime: &mut AgentRuntime) -> Result<(), St
     }
 }
 
-fn read_mitm_certificate(config: &AgentConfig) -> Option<String> {
-    let path = config
-        .state_dir
-        .join("mitmproxy")
-        .join("mitmproxy-ca-cert.pem");
-    let certificate = fs::read_to_string(path).ok()?;
-    if certificate.contains("BEGIN CERTIFICATE") {
-        Some(certificate)
-    } else {
-        None
+fn read_mitm_certificate(_config: &AgentConfig) -> Option<String> {
+    let confdir = mitm_state_dir();
+    let certificate_path = confdir.join("mitmproxy-ca-cert.pem");
+    if let Ok(certificate) = fs::read_to_string(certificate_path) {
+        if let Some(certificate) = extract_certificate_pem(&certificate) {
+            return Some(certificate);
+        }
     }
+    // A user-provided mitmproxy-ca.pem is a combined private-key + CA PEM.
+    // mitmproxy normally creates the split *-ca-cert.pem beside it, but that
+    // file is not guaranteed to appear when an existing CA is reused.  The
+    // combined file is still sufficient for the host certificate export and
+    // for declaring the listener ready.
+    let combined_path = confdir.join("mitmproxy-ca.pem");
+    let combined = fs::read_to_string(combined_path).ok()?;
+    extract_certificate_pem(&combined)
+}
+
+fn mitm_state_dir() -> PathBuf {
+    // /run is a dedicated tmpfs in the guest.  MITM's generated CA and
+    // runtime metadata are ephemeral and must not consume the initramfs
+    // writable layer that stores the sing-box version and session files.
+    PathBuf::from("/run/songsterx/mitmproxy")
+}
+
+fn module_upstream_proxy(config: &AgentConfig) -> Result<String, String> {
+    let path = sing_box_config_path(config);
+    let content = fs::read(&path)
+        .map_err(|error| format!("读取 sing-box 配置以连接 Module Engine 上游失败：{error}"))?;
+    let value: Value = serde_json::from_slice(&content).map_err(|error| {
+        format!("sing-box 配置不是有效 JSON，无法配置 Module Engine 上游：{error}")
+    })?;
+    let inbound = value
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .and_then(|inbounds| {
+            inbounds.iter().find(|inbound| {
+                inbound.get("tag").and_then(Value::as_str) == Some("mixed-in-direct")
+            })
+        })
+        .ok_or_else(|| "sing-box 缺少 mixed-in-direct 上游入口".to_string())?;
+    let listen = inbound
+        .get("listen")
+        .and_then(Value::as_str)
+        .filter(|listen| !listen.is_empty())
+        .unwrap_or("127.0.0.1");
+    let port = inbound
+        .get("listen_port")
+        .and_then(Value::as_u64)
+        .filter(|port| *port > 0 && *port <= u16::MAX as u64)
+        .ok_or_else(|| "mixed-in-direct 上游入口端口无效".to_string())?;
+    Ok(format!("http://{listen}:{port}"))
+}
+
+fn extract_certificate_pem(value: &str) -> Option<String> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let start = value.find(BEGIN)?;
+    let end = value[start..].find(END)? + start + END.len();
+    Some(format!("{}\n", value[start..end].trim()))
 }
 
 fn module_plan_requires_mitm(path: &Path) -> bool {
@@ -2047,13 +2197,36 @@ fn validate_absolute_runtime_path(path: &Path, label: &str) -> Result<(), String
 }
 
 fn check_sing_box(binary: &Path, config_path: &Path) -> Result<(), String> {
-    let output = Command::new(binary)
+    let mut child = Command::new(binary)
         .arg("check")
         .arg("-c")
         .arg(config_path)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("执行 sing-box check 失败：{error}"))?;
+    let deadline = Instant::now() + SING_BOX_CHECK_TIMEOUT;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("检查 sing-box check 状态失败：{error}"))?
+        {
+            Some(_) => break,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "sing-box check 超时（{} 秒）",
+                    SING_BOX_CHECK_TIMEOUT.as_secs()
+                ));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("读取 sing-box check 结果失败：{error}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -2603,6 +2776,68 @@ mod tests {
     }
 
     #[test]
+    fn failed_first_session_does_not_report_a_fake_restore_error() {
+        let root = std::env::temp_dir().join(format!(
+            "songsterx-gateway-agent-first-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = AgentConfig {
+            listen: "127.0.0.1:38294".into(),
+            state_dir: root.clone(),
+            agent_version: "test".into(),
+            sing_box_config: Some(root.join("sing-box.json")),
+            auth_token_file: root.join("agent.token"),
+            auth_token: "a".repeat(32),
+            readiness_file: root.join("ready"),
+            network_ready_file: None,
+            network_control: None,
+            guest_network: None,
+        };
+        fs::write(sing_box_config_path(&config), b"candidate-config").unwrap();
+        fs::write(module_plan_path(&config), b"candidate-plan").unwrap();
+        let pending = PendingSession {
+            config_sha256: "candidate-config".into(),
+            module_plan_sha256: "candidate-plan".into(),
+            previous_config: None,
+            previous_plan: None,
+            active_version: "1.14.0".into(),
+            deadline: Instant::now(),
+        };
+        let mut runtime = AgentRuntime::default();
+
+        rollback_pending_session(
+            &config,
+            &mut runtime,
+            pending,
+            "Gateway session 在 ready 前超时；singBoxReady=false",
+        );
+
+        assert!(!sing_box_config_path(&config).exists());
+        assert!(!module_plan_path(&config).exists());
+        assert!(runtime
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("没有旧 Gateway session 可恢复"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn combined_mitm_ca_yields_exportable_certificate() {
+        let combined = "PRIVATE KEY\n-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n";
+        assert_eq!(
+            extract_certificate_pem(combined).as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+        );
+        assert!(extract_certificate_pem("PRIVATE KEY ONLY").is_none());
+    }
+
+    #[test]
     fn liveness_fault_blocks_new_data_plane_ownership() {
         let root = std::env::temp_dir().join(format!(
             "songsterx-gateway-agent-liveness-{}-{}",
@@ -2671,6 +2906,18 @@ mod tests {
             network_control: None,
             guest_network: None,
         };
+        let api_listener = TcpListener::bind(GUEST_CLASH_API_ADDR).unwrap();
+        let api_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = api_listener.accept() {
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                }
+            }
+        });
         let mut runtime = AgentRuntime::default();
         start_version(&config, &mut runtime, "1.14.0").unwrap();
         assert!(runtime.is_healthy("1.14.0", &config.readiness_file));
@@ -2688,6 +2935,7 @@ mod tests {
         runtime.stop(&config.readiness_file).unwrap();
         assert!(!runtime.is_healthy("1.14.0", &config.readiness_file));
         assert!(!config.readiness_file.exists());
+        api_thread.join().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 }
