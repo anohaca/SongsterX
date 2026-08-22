@@ -10,8 +10,11 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+import os
 import re
+import shutil
 import socket
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -19,7 +22,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-import quickjs
+try:
+    import quickjs
+except ModuleNotFoundError:  # Alpine guest currently ships static MITM support first.
+    quickjs = None
 
 
 _PLACEHOLDER = re.compile(r"\{\{\{([^{}]+)\}\}\}")
@@ -38,6 +44,7 @@ _OPTION_KEYS = {
 }
 _MAX_HTTP_BODY = 4 * 1024 * 1024
 _MAX_REGEX_LENGTH = 4096
+_QJS_BINARY = "/usr/bin/qjs"
 
 
 def _safe_regex(pattern: str) -> re.Pattern[str]:
@@ -150,7 +157,7 @@ def _asset_map(module_path: Path) -> dict[str, Path]:
     return {}
 
 
-def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Path], module_id: str) -> dict[str, Any] | None:
+def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Any], module_id: str) -> dict[str, Any] | None:
     match = re.match(r"^(.*?)\s*=\s*(?=type=)", line)
     if not match:
         return None
@@ -164,8 +171,10 @@ def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Pa
         if key in _OPTION_KEYS:
             options[key] = _unquote(value)
     source = options.get("script-path", "")
-    local_path = assets.get(source)
-    if not local_path or not local_path.is_file():
+    asset = assets.get(source)
+    local_path = asset if isinstance(asset, Path) else None
+    source_content = asset.get("content") if isinstance(asset, dict) else None
+    if not source_content and (not local_path or not local_path.is_file()):
         return {
             "module": module_id,
             "name": name,
@@ -185,7 +194,8 @@ def _parse_script_line(line: str, defaults: dict[str, str], assets: dict[str, Pa
         "engine": options.get("engine", "jsc"),
         "argument": _substitute(options.get("argument", ""), defaults),
         "source": source,
-        "localPath": str(local_path),
+        "localPath": str(local_path) if local_path else "",
+        "sourceContent": source_content or "",
     }
 
 
@@ -195,19 +205,36 @@ def parse_module_files(module_files: list[dict[str, Any]]) -> tuple[list[dict[st
     for item in module_files:
         module_id = str(item.get("id", ""))
         path_value = item.get("path")
-        if not module_id or not isinstance(path_value, str):
+        if not module_id:
             continue
-        path = Path(path_value)
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
+        path = Path(path_value) if isinstance(path_value, str) else Path(".")
+        content = item.get("content")
+        if isinstance(content, str):
+            lines = content.splitlines()
+        else:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
         defaults: dict[str, str] = {}
         overrides = item.get("arguments", {})
         if isinstance(overrides, dict):
             defaults.update({str(key): str(value) for key, value in overrides.items()})
         section = ""
-        assets = _asset_map(path)
+        assets: dict[str, Any] = _asset_map(path)
+        embedded_assets = item.get("assets", [])
+        if isinstance(embedded_assets, list):
+            for asset in embedded_assets:
+                if not isinstance(asset, dict) or not isinstance(asset.get("source"), str):
+                    continue
+                raw = asset.get("contentBase64")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    decoded = base64.b64decode(raw, validate=True)
+                    assets[asset["source"]] = {"content": decoded.decode("utf-8")}
+                except (ValueError, UnicodeDecodeError):
+                    continue
         for raw in lines:
             line = raw.strip()
             if re.match(r"#!arguments(?:\s|=)", line, re.IGNORECASE):
@@ -298,6 +325,16 @@ class SurgeScriptRuntime:
         self.storage_path = storage_path
         self.logger = logger
         self._lock = threading.Lock()
+        # A mobile app can open a burst of matching HTTP/2 streams.  The
+        # Alpine fallback runs one qjs process per script invocation, so cap
+        # it to one process at a time instead of exhausting guest tmpfs/PIDs.
+        self._qjs_lock = threading.Lock()
+        # /var/lib/songsterx is part of the small read/write initrd layer. A
+        # module plan can already consume most of that layer, while /run is a
+        # dedicated tmpfs created by the guest init. Keep the transient qjs
+        # program there so a burst of script requests cannot exhaust the
+        # module state filesystem.
+        self._qjs_program_path = Path("/run/songsterx/.songsterx-qjs-program.js")
 
     def _read_store(self) -> dict[str, Any]:
         try:
@@ -338,6 +375,142 @@ class SurgeScriptRuntime:
         except (OSError, ValueError, urllib.error.URLError) as error:
             return json.dumps({"error": str(error)}, ensure_ascii=False)
 
+    def _run_qjs(
+        self,
+        script: dict[str, Any],
+        prelude: str,
+        source: str,
+        timeout: int,
+        qjs_path: str,
+    ) -> dict[str, Any]:
+        """Run a module script through Alpine's qjs CLI.
+
+        The guest image uses Alpine's arm64 QuickJS executable instead of the
+        CPython extension used by the macOS build.  Keep the same request /
+        response ABI and persist-store semantics, while deliberately leaving
+        host HTTP access disabled in this subprocess fallback.
+        """
+        with self._lock:
+            store = self._read_store()
+        bridge = f"""
+            var __sx_store = {json.dumps(store, ensure_ascii=False)};
+            var __sx_store_writes = {{}};
+            var __sx_result = {{}};
+            var __sx_error = "";
+            function __sx_log(level, message) {{}}
+            function __sx_done(raw) {{
+                try {{
+                    var value = JSON.parse(raw || "{{}}");
+                    if (value && typeof value === "object") __sx_result = value;
+                }} catch (error) {{ __sx_error = String(error); }}
+            }}
+            function __sx_store_read(key) {{
+                key = String(key);
+                var value = Object.prototype.hasOwnProperty.call(__sx_store_writes, key)
+                    ? __sx_store_writes[key]
+                    : __sx_store[key];
+                return value == null ? "" : String(value);
+            }}
+            function __sx_store_write(key, value) {{
+                __sx_store_writes[String(key)] = String(value);
+                return true;
+            }}
+            function __sx_store_remove(key) {{
+                __sx_store_writes[String(key)] = null;
+                return true;
+            }}
+            function __sx_http(method, raw) {{
+                return JSON.stringify({{error: "qjs guest bridge does not expose host HTTP"}});
+            }}
+        """
+        program = (
+            bridge
+            + prelude
+            + "\ntry {\n"
+            + source
+            + "\n} catch (error) { __sx_error = String(error); }\n"
+            + 'print("__SX_RESULT__" + JSON.stringify(__sx_result || {}));\n'
+            + 'print("__SX_STORE__" + JSON.stringify(__sx_store_writes));\n'
+            + 'print("__SX_ERROR__" + String(__sx_error || ""));\n'
+        )
+        acquired = self._qjs_lock.acquire(timeout=2.0)
+        if not acquired:
+            self.logger(f"qjs 脚本忙，跳过本次执行 {script.get('name', '')}")
+            return {}
+        try:
+            # The Alpine qjs CLI requires a seekable script file. Reuse one
+            # private file and serialize qjs invocations so mobile HTTP/2
+            # bursts cannot create hundreds of temporary files/processes.
+            self._qjs_program_path.parent.mkdir(parents=True, exist_ok=True)
+            self._qjs_program_path.write_text(program, encoding="utf-8")
+            os.chmod(self._qjs_program_path, 0o600)
+            completed = subprocess.run(
+                [qjs_path, "--script", str(self._qjs_program_path)],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=max(1, min(timeout, 120)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            self.logger(f"qjs 脚本执行超时 {script.get('name', '')}: {error}")
+            return {}
+        except OSError as error:
+            free_bytes = 0
+            try:
+                stats = os.statvfs(self._qjs_program_path.parent)
+                free_bytes = stats.f_bavail * stats.f_frsize
+            except OSError:
+                pass
+            self.logger(
+                f"qjs 脚本执行失败 {script.get('name', '')}: {error}; "
+                f"临时目录={self._qjs_program_path.parent} 可用空间={free_bytes}"
+            )
+            return {}
+        finally:
+            try:
+                self._qjs_program_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._qjs_lock.release()
+
+        result: dict[str, Any] = {}
+        store_writes: dict[str, Any] = {}
+        for line in completed.stdout.splitlines():
+            if line.startswith("__SX_RESULT__"):
+                try:
+                    value = json.loads(line.removeprefix("__SX_RESULT__"))
+                    if isinstance(value, dict):
+                        result = value
+                except json.JSONDecodeError as error:
+                    self.logger(f"qjs 脚本返回值不是 JSON：{error}")
+            elif line.startswith("__SX_STORE__"):
+                try:
+                    value = json.loads(line.removeprefix("__SX_STORE__"))
+                    if isinstance(value, dict):
+                        store_writes = value
+                except json.JSONDecodeError as error:
+                    self.logger(f"qjs persistentStore 返回值不是 JSON：{error}")
+            elif line.startswith("__SX_ERROR__"):
+                message = line.removeprefix("__SX_ERROR__").strip()
+                if message:
+                    self.logger(f"脚本执行失败 {script.get('name', '')}: {message}")
+        if completed.returncode != 0 and completed.stderr.strip():
+            self.logger(
+                f"qjs 脚本执行失败 {script.get('name', '')}: "
+                f"{completed.stderr.strip()[-1024:]}"
+            )
+        if store_writes:
+            with self._lock:
+                data = self._read_store()
+                for key, value in store_writes.items():
+                    if value is None:
+                        data.pop(key, None)
+                    else:
+                        data[key] = str(value)
+                self._write_store(data)
+        return result
+
     def run(
         self,
         script: dict[str, Any],
@@ -345,18 +518,25 @@ class SurgeScriptRuntime:
         response: dict[str, Any] | None,
     ) -> dict[str, Any]:
         source_path = Path(str(script.get("localPath", "")))
-        try:
-            source = source_path.read_text(encoding="utf-8")
-        except OSError as error:
-            self.logger(f"脚本读取失败 {source_path}: {error}")
+        source = script.get("sourceContent")
+        if not isinstance(source, str) or not source:
+            try:
+                source = source_path.read_text(encoding="utf-8")
+            except OSError as error:
+                self.logger(f"脚本读取失败 {source_path}: {error}")
+                return {}
+        qjs_path = os.environ.get("SONGSTERX_QJS", _QJS_BINARY)
+        if quickjs is None and not shutil.which(qjs_path):
+            self.logger("当前 guest 未提供 QuickJS，跳过脚本，仅执行静态/HTTP MITM 规则")
             return {}
         result: dict[str, Any] = {}
-        context = quickjs.Context()
+        context = quickjs.Context() if quickjs is not None else None
         timeout = max(1, min(int(script.get("timeout", 30) or 30), 120))
         # QuickJS interrupts runaway JavaScript. The limit covers both source
         # evaluation and pending jobs; the host bridge still applies its own
         # bounded HTTP timeout and response-size limit.
-        context.set_memory_limit(64 * 1024 * 1024)
+        if context is not None:
+            context.set_memory_limit(64 * 1024 * 1024)
 
         def log(level: str, message: str) -> None:
             self.logger(f"[{level}] {message}")
@@ -391,12 +571,13 @@ class SurgeScriptRuntime:
                 self._write_store(data)
             return True
 
-        context.add_callable("__sx_log", log)
-        context.add_callable("__sx_done", done)
-        context.add_callable("__sx_store_read", store_read)
-        context.add_callable("__sx_store_write", store_write)
-        context.add_callable("__sx_store_remove", store_remove)
-        context.add_callable("__sx_http", self._http_request)
+        if context is not None:
+            context.add_callable("__sx_log", log)
+            context.add_callable("__sx_done", done)
+            context.add_callable("__sx_store_read", store_read)
+            context.add_callable("__sx_store_write", store_write)
+            context.add_callable("__sx_store_remove", store_remove)
+            context.add_callable("__sx_http", self._http_request)
 
         body_b64 = request.pop("__bodyBytesB64", None)
         response_b64 = response.pop("__bodyBytesB64", None) if response is not None else None
@@ -437,6 +618,8 @@ class SurgeScriptRuntime:
         if response is not None:
             if response_b64:
                 prelude += f"$response.bodyBytes = new Uint8Array(Array.prototype.map.call(atob({json.dumps(response_b64)}), function(c){{return c.charCodeAt(0);}})).buffer;"
+        if context is None:
+            return self._run_qjs(script, prelude, source, timeout, qjs_path)
         try:
             context.set_time_limit(timeout)
             context.eval(prelude)
@@ -451,10 +634,10 @@ class SurgeScriptRuntime:
         return result
 
 
-def flow_request_dict(flow: Any) -> dict[str, Any]:
+def flow_request_dict(flow: Any, url: str | None = None) -> dict[str, Any]:
     body = bytes(flow.request.raw_content or b"")
     return {
-        "url": flow.request.pretty_url,
+        "url": url or flow.request.pretty_url,
         "method": flow.request.method,
         "headers": dict(flow.request.headers.items(multi=True)),
         "body": body.decode("utf-8", errors="replace"),
@@ -473,7 +656,13 @@ def flow_response_dict(flow: Any) -> dict[str, Any]:
     }
 
 
-def apply_result(flow: Any, result: dict[str, Any], phase: str) -> None:
+def apply_result(
+    flow: Any,
+    result: dict[str, Any],
+    phase: str,
+    *,
+    allow_body: bool = True,
+) -> None:
     target = flow.request if phase == "request" else flow.response
     if not result:
         return
@@ -492,6 +681,8 @@ def apply_result(flow: Any, result: dict[str, Any], phase: str) -> None:
                 target.headers.pop(str(key), None)
             else:
                 target.headers[str(key)] = str(value)
+    if not allow_body:
+        return
     if "bodyBytes" in result and isinstance(result["bodyBytes"], dict):
         marker = result["bodyBytes"].get("__songsterx_binary_b64")
         if isinstance(marker, str):

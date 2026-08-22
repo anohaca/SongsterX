@@ -37,6 +37,7 @@ for path in \
     "$PROC/ipv4/conf/mgmt0/arp_ignore" "$PROC/ipv4/conf/mgmt0/arp_announce" \
     "$PROC/ipv6/conf/all/accept_ra" "$PROC/ipv6/conf/default/accept_ra" \
     "$PROC/ipv6/conf/lan0/accept_ra" "$PROC/ipv6/conf/mgmt0/accept_ra" \
+    "$PROC/ipv6/conf/all/forwarding" \
     "$PROC/ipv6/conf/all/disable_ipv6" "$PROC/ipv6/conf/default/disable_ipv6" \
     "$PROC/ipv6/conf/lan0/disable_ipv6" "$PROC/ipv6/conf/mgmt0/disable_ipv6"; do
     mkdir -p "$(dirname "$path")"
@@ -59,7 +60,7 @@ EOF
 chmod +x "$BIN/ip" "$BIN/nft"
 
 cat > "$CMDLINE" <<'EOF'
-console=hvc0 songsterx.lan_ip=192.168.1.2 songsterx.lan_cidr=192.168.1.0/24 songsterx.host_ip=192.168.250.2 songsterx.host_cidr=192.168.250.0/24 songsterx.upstream_gateway=192.168.1.1 songsterx.dns_server=223.5.5.5 songsterx.agent_port=38291 songsterx.lan_mac=02:00:00:00:00:11 songsterx.host_mac=02:00:00:00:00:22
+console=hvc0 songsterx.lan_ip=192.168.1.2 songsterx.lan_cidr=192.168.1.0/24 songsterx.lan_ipv6=auto songsterx.lan_ipv6_global=2001:db8:1:2:0:ff:fe00:11/64 songsterx.host_ip=192.168.250.2 songsterx.host_cidr=192.168.250.0/24 songsterx.upstream_gateway=192.168.1.1 songsterx.upstream_gateway_ipv6=fe80::1 songsterx.dns_server=223.5.5.5 songsterx.agent_port=38291 songsterx.lan_mac=02:00:00:00:00:11 songsterx.host_mac=02:00:00:00:00:22
 EOF
 
 run_net() {
@@ -79,12 +80,22 @@ sh -n "$SCRIPT"
 run_net setup
 [ -f "$RUN/network.ready" ]
 [ "$(grep -c '^ip link set dev lo up$' "$LOG")" = 1 ]
+[ "$(grep -c '^ip link set dev lan0 multicast on$' "$LOG")" = 1 ]
+[ "$(grep -c '^ip link set dev lan0 allmulticast on$' "$LOG")" = 1 ]
+[ "$(grep -c '^ip link set dev lan0 promisc on$' "$LOG")" = 1 ]
 [ "$(sed -n 's/^LAN_IF=//p' "$RUN/network.state")" = lan0 ]
 [ "$(sed -n 's/^HOST_IF=//p' "$RUN/network.state")" = mgmt0 ]
+[ "$(sed -n 's/^LAN_IPV6=//p' "$RUN/network.state")" = fe80::0000:00ff:fe00:0011/64 ]
+[ "$(sed -n 's/^LAN_IPV6_GLOBAL=//p' "$RUN/network.state")" = 2001:db8:1:2:0:ff:fe00:11/64 ]
+[ "$(grep -c '^ip -6 addr flush dev lan0 scope link$' "$LOG" || true)" = 1 ]
+[ "$(grep -c '^ip -6 addr add fe80::0000:00ff:fe00:0011/64 dev lan0 nodad$' "$LOG" || true)" = 1 ]
+[ "$(grep -c '^ip -6 addr add 2001:db8:1:2:0:ff:fe00:11/64 dev lan0 nodad$' "$LOG" || true)" = 1 ]
+[ "$(grep -c '^ip -6 route add default via fe80::1 dev lan0$' "$LOG" || true)" = 1 ]
 [ "$(sed -n 's/^DNS_SERVER=//p' "$RUN/network.state")" = 223.5.5.5 ]
 [ "$(sed -n 's/^nameserver //p' "$RESOLV_CONF")" = 223.5.5.5 ]
 [ "$(grep -c '^options timeout:2 attempts:2$' "$RESOLV_CONF")" = 1 ]
 [ "$(cat "$PROC/ipv4/ip_forward")" = 1 ]
+[ "$(cat "$PROC/ipv6/conf/all/forwarding")" = 1 ]
 grep -q 'type filter hook forward priority 100; policy drop;' "$LOG"
 ! grep -q 'type filter hook forward priority -50;' "$LOG"
 
@@ -92,6 +103,7 @@ run_net stop-forwarding
 [ ! -e "$RUN/network.ready" ]
 [ -f "$RUN/network.state" ]
 [ "$(cat "$PROC/ipv4/ip_forward")" = 0 ]
+[ "$(cat "$PROC/ipv6/conf/all/forwarding")" = 0 ]
 run_net stop-forwarding
 run_net stop
 [ "$(cat "$RESOLV_CONF")" = 'nameserver 192.168.1.1' ]

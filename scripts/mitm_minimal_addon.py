@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import base64
+import ipaddress
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from mitmproxy import ctx, http
 
@@ -144,6 +147,123 @@ def _is_module_host(host: str) -> bool:
     return any(_host_matches(host, pattern) for pattern in PLAN.get("mitmHostnames", []))
 
 
+def _flow_url_candidates(flow: http.HTTPFlow) -> list[str]:
+    """Return the URL as seen on the wire plus its original TLS/HTTP host.
+
+    Gateway interception happens after sing-box has resolved a destination, so
+    some transparent flows arrive at mitmproxy with an IP URL. Surge modules
+    match the original hostname, which is still available from TLS SNI or the
+    HTTP Host header. Keep both forms: the wire URL for transport and the
+    hostname URL for module matching/JavaScript.
+    """
+    actual = flow.request.pretty_url
+    candidates = [actual]
+    parsed = urlsplit(actual)
+    authorities: list[str] = []
+    # The original hostname is on the client-side TLS connection.  The
+    # server-side SNI belongs to mitmproxy's own upstream hop and may already
+    # be the FakeIP/CDN address.
+    for connection in (
+        getattr(flow, "client_conn", None),
+        getattr(flow, "server_conn", None),
+    ):
+        sni = getattr(connection, "sni", None)
+        if isinstance(sni, str) and sni.strip():
+            authorities.append(sni.strip())
+    host_header = flow.request.headers.get("host")
+    if isinstance(host_header, str) and host_header.strip():
+        authorities.append(host_header.strip())
+    for authority in authorities:
+        authority = authority.strip()
+        if authority.startswith("["):
+            authority = authority[1:].split("]", 1)[0]
+        elif authority.count(":") == 1:
+            authority = authority.split(":", 1)[0]
+        if not authority or ":" in authority or not parsed.scheme:
+            continue
+        netloc = authority
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port and port not in {80, 443}:
+            netloc = f"{netloc}:{port}"
+        alias = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+        if alias not in candidates:
+            candidates.append(alias)
+    return candidates
+
+
+def _module_url(flow: http.HTTPFlow) -> str:
+    candidates = _flow_url_candidates(flow)
+    for candidate in candidates:
+        if _is_module_host(urlsplit(candidate).hostname or ""):
+            return candidate
+    return candidates[0]
+
+
+def _flow_is_module_host(flow: http.HTTPFlow) -> bool:
+    return any(_is_module_host(urlsplit(candidate).hostname or "") for candidate in _flow_url_candidates(flow))
+
+
+def _restore_module_hostname(flow: http.HTTPFlow) -> None:
+    """Restore the original hostname before the upstream sing-box hop.
+
+    In Gateway + FakeIP mode the client connects to a synthetic address.  The
+    TLS SNI or HTTP Host header still carries the real module hostname, but
+    mitmproxy's upstream mode otherwise forwards the synthetic/CDN IP to the
+    loopback sing-box inbound.  Some CDNs answer that IP with redirects or
+    reject it altogether.  Rewrite only the MITM-side upstream target; the
+    client-facing FakeIP and sing-box's FakeIP DNS mapping remain unchanged.
+    """
+    actual = urlsplit(flow.request.pretty_url)
+    actual_host = actual.hostname
+    if not actual_host:
+        return
+    # A normal hostname such as grpc.biliapi.net may carry app.bilibili.com
+    # in the client-side SNI/Host candidates, but it is already a valid
+    # upstream target and must not be rewritten.  This repair is only for a
+    # FakeIP or literal CDN address that reached upstream mode without its
+    # original module hostname.
+    try:
+        ipaddress.ip_address(actual_host)
+    except ValueError:
+        return
+    module_url = next(
+        (
+            candidate
+            for candidate in _flow_url_candidates(flow)
+            if _is_module_host(urlsplit(candidate).hostname or "")
+        ),
+        None,
+    )
+    if not module_url:
+        return
+    original = urlsplit(module_url)
+    original_host = original.hostname
+    if not original_host or original_host.lower() == actual_host.lower():
+        return
+
+    port = actual.port
+    if port and port not in {80, 443}:
+        netloc = f"{original_host}:{port}"
+        host_header = netloc
+    else:
+        netloc = original_host
+        host_header = original_host
+    flow.request.url = urlunsplit(
+        (
+            actual.scheme or original.scheme,
+            netloc,
+            actual.path,
+            actual.query,
+            actual.fragment,
+        )
+    )
+    flow.request.headers["host"] = host_header
+    _log("恢复 MITM 上游主机名：%s -> %s", actual_host, original_host)
+
+
 def _reject(flow: http.HTTPFlow, reason: str) -> None:
     flow.response = http.Response.make(
         403,
@@ -158,13 +278,16 @@ def _replacement_for_python(value: str) -> str:
 
 def _apply_url_rewrites(flow: http.HTTPFlow) -> bool:
     url = flow.request.pretty_url
+    candidates = _flow_url_candidates(flow)
     for rule, pattern in COMPILED.get("static_url_rules", []):
-        if rule.get("action") == "reject" and pattern.search(url):
-            _reject(flow, str(rule.get("module", "URL-REGEX")))
-            return True
+        if rule.get("action") == "reject":
+            for candidate in candidates:
+                if pattern.search(candidate):
+                    _reject(flow, str(rule.get("module", "URL-REGEX")))
+                    return True
     for rule, pattern in COMPILED.get("url_rewrites", []):
-        match = pattern.search(url)
-        if not match:
+        matched_url = next((candidate for candidate in candidates if pattern.search(candidate)), None)
+        if matched_url is None:
             continue
         action = rule.get("action")
         if action == "reject":
@@ -172,20 +295,21 @@ def _apply_url_rewrites(flow: http.HTTPFlow) -> bool:
             return True
         if action == "redirect":
             status = int(rule.get("status", 302))
-            location = pattern.sub(_replacement_for_python(str(rule.get("replacement", ""))), url, count=1)
+            location = pattern.sub(_replacement_for_python(str(rule.get("replacement", ""))), matched_url, count=1)
             flow.response = http.Response.make(status, b"", {"location": location})
             return True
         if action == "replace":
             replacement = _replacement_for_python(str(rule.get("replacement", "")))
-            flow.request.url = pattern.sub(replacement, url, count=1)
+            flow.request.url = pattern.sub(replacement, matched_url, count=1)
             url = flow.request.pretty_url
+            candidates = _flow_url_candidates(flow)
     return False
 
 
 def _apply_header_rewrites(flow: http.HTTPFlow, phase: str) -> None:
-    url = flow.request.pretty_url
+    urls = _flow_url_candidates(flow)
     for rule, pattern in COMPILED.get("header_rewrites", []):
-        if rule.get("phase") != phase or not pattern.search(url):
+        if rule.get("phase") != phase or not any(pattern.search(url) for url in urls):
             continue
         headers = flow.request.headers if phase == "http-request" else flow.response.headers
         name = str(rule.get("name", "")).strip()
@@ -199,14 +323,20 @@ def _apply_header_rewrites(flow: http.HTTPFlow, phase: str) -> None:
 
 
 def _map_local(flow: http.HTTPFlow) -> bool:
-    url = flow.request.pretty_url
+    urls = _flow_url_candidates(flow)
     for rule, pattern in COMPILED.get("map_locals", []):
-        if not pattern.search(url):
+        if not any(pattern.search(url) for url in urls):
             continue
         local_path = rule.get("localPath")
         inline_data = rule.get("inlineData")
+        inline_data_base64 = rule.get("inlineDataBase64")
         try:
-            if isinstance(local_path, str) and local_path:
+            if isinstance(inline_data_base64, str):
+                body = base64.b64decode(inline_data_base64, validate=True)
+                if len(body) > MAX_MAP_BYTES:
+                    _log("跳过过大的内嵌 Map Local 资源")
+                    continue
+            elif isinstance(local_path, str) and local_path:
                 path = Path(local_path)
                 if not path.is_file() or path.stat().st_size > MAX_MAP_BYTES:
                     _log("跳过 Map Local 资源：%s", local_path)
@@ -241,7 +371,7 @@ def _script_matches(script: dict[str, Any], flow: http.HTTPFlow, phase: str) -> 
     if not isinstance(pattern, str) or not pattern:
         return False
     try:
-        return re.search(pattern, flow.request.pretty_url) is not None
+        return any(re.search(pattern, url) is not None for url in _flow_url_candidates(flow))
     except re.error as error:
         _log("跳过脚本无效正则 %s：%s", script.get("name"), error)
         return False
@@ -257,30 +387,56 @@ def _script_body_allowed(script: dict[str, Any], body: bytes) -> bool:
     return True
 
 
+def _buffered_body(message: Any) -> bytes | None:
+    """Return a complete message body, or None for a streaming response.
+
+    mitmproxy exposes ``raw_content`` as None while a response is streamed.
+    Treating that state as ``b""`` and assigning it back to ``content`` silently
+    truncates the response.  Module body/script rules need a complete body, so
+    callers must leave an unbuffered message untouched.
+    """
+    raw_content = getattr(message, "raw_content", None)
+    if raw_content is None:
+        return None
+    return bytes(raw_content)
+
+
 def _run_scripts(flow: http.HTTPFlow, phase: str) -> None:
     if SCRIPT_RUNTIME is None:
         return
+    response_body: bytes | None = None
     if phase == "request":
-        body = bytes(flow.request.raw_content or b"")
-        request = flow_request_dict(flow)
+        body = _buffered_body(flow.request) or b""
+        request = flow_request_dict(flow, _module_url(flow))
         response = None
     else:
-        body = bytes(flow.response.raw_content or b"")
-        request = flow_request_dict(flow)
+        response_body = _buffered_body(flow.response)
+        body = response_body or b""
+        request = flow_request_dict(flow, _module_url(flow))
         response = flow_response_dict(flow)
     for script in SCRIPT_ENTRIES:
+        if phase == "response" and response_body is None and script.get("requiresBody"):
+            _log("跳过流式响应 body 脚本，透传：%s", script.get("name"))
+            continue
         if not _script_matches(script, flow, phase) or not _script_body_allowed(script, body):
             continue
         request_data = request.copy()
         response_data = response.copy() if response else None
         try:
             result = SCRIPT_RUNTIME.run(script, request_data, response_data)
-            apply_result(flow, result, phase)
+            # A response script may still change status/headers on a streamed
+            # response, but it must never synthesize a new body from the empty
+            # placeholder used for an unavailable stream.
+            apply_result(flow, result, phase, allow_body=response_body is not None)
             if phase == "request":
-                request = flow_request_dict(flow)
+                request = flow_request_dict(flow, _module_url(flow))
             else:
                 response = flow_response_dict(flow)
-            body = bytes(flow.request.raw_content or b"") if phase == "request" else bytes(flow.response.raw_content or b"")
+            body = (
+                _buffered_body(flow.request) or b""
+                if phase == "request"
+                else _buffered_body(flow.response) or b""
+            )
         except Exception as error:
             _log("脚本执行异常 %s：%s", script.get("name"), error)
 
@@ -289,10 +445,11 @@ def request(flow: http.HTTPFlow) -> None:
     host = flow.request.pretty_host
     if host in MITM_HOSTS:
         flow.request.headers["X-SongsterX-M0"] = "1"
-    if not _is_module_host(host):
+    if not _flow_is_module_host(flow):
         if host in MITM_HOSTS:
             _log("HTTP request hook: %s", flow.request.pretty_url)
         return
+    _restore_module_hostname(flow)
     if _apply_url_rewrites(flow):
         return
     if _map_local(flow):
@@ -306,16 +463,22 @@ def response(flow: http.HTTPFlow) -> None:
         return
     if flow.request.pretty_host in MITM_HOSTS:
         flow.response.headers["X-SongsterX-M0-Intercepted"] = "1"
-    if not _is_module_host(flow.request.pretty_host):
+    if not _flow_is_module_host(flow):
         return
     _apply_header_rewrites(flow, "http-response")
-    body = bytes(flow.response.raw_content or b"")
+    body = _buffered_body(flow.response)
+    if body is None:
+        _log("流式响应原样透传：%s", _module_url(flow))
+        _run_scripts(flow, "response")
+        return
+    original_body = body
     body = apply_body_rewrite(
         body,
         flow.response.headers.get("content-type", ""),
         BODY_REWRITE_ENTRIES,
-        flow.request.pretty_url,
+        _module_url(flow),
         _log,
     )
-    flow.response.content = body
+    if body != original_body:
+        flow.response.content = body
     _run_scripts(flow, "response")

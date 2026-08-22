@@ -1,26 +1,27 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{path::BaseDirectory, AppHandle, Emitter, Manager, State};
 
-// The supervisor owns the Gateway process graph. The data-plane acceptance
-// state is tracked separately and only becomes ready after post-start LAN and
-// tun0 counter deltas are observed.
+// The supervisor owns the Gateway process graph. Guest LAN/tun0 counters are
+// observational metrics and never delay publishing a ready runtime.
 #[allow(dead_code)]
 mod gateway_runtime;
 mod guest_agent;
-// Readiness dimensions include the guest packet-path acceptance state.
+// Readiness dimensions include the guest packet-path state for compatibility;
+// it is marked ready when the authenticated guest runtime is ready.
 #[allow(dead_code)]
 mod packet_path;
 // Process-group ownership is exercised by unit tests before real Gateway launch is enabled.
@@ -31,24 +32,22 @@ mod vfkit;
 const SONGSTERX_CONFIG_FILE: &str = "songsterx.conf";
 const RUNTIME_CONFIG_FILE: &str = "sing-box.runtime.json";
 const GATEWAY_GUEST_RUNTIME_CONFIG_FILE: &str = "sing-box.gateway-guest.json";
-const GATEWAY_GUEST_PROXY_CONFIG_FILE: &str = "proxy-config.gateway-guest.json";
 const MODULE_RUNTIME_PLAN_FILE: &str = "module-runtime-plan.json";
 const IMPORTED_MODULES_FILE: &str = "imported-modules.json";
 const IMPORTED_ASSETS_FILE: &str = "imported-module-assets.json";
 const IMPORTED_MODULES_DIR: &str = "modules";
 const CLASH_API_ADDR: &str = "127.0.0.1:9090";
-const MODULE_PROXY_PORT: u16 = 8080;
+const DEFAULT_MODULE_PROXY_PORT: u16 = 8080;
+const FALLBACK_MODULE_PROXY_PORT_START: u16 = 18080;
+const FALLBACK_MODULE_PROXY_PORT_END: u16 = 18089;
 const GATEWAY_AGENT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
-const GATEWAY_CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+// First-time guest mitmdump startup can include Python import and CA
+// generation. Keep the whole atomic upload/activation transaction bounded,
+// but do not fail a healthy VM simply because the initial 15-second window
+// was consumed by Module Engine initialization.
+const GATEWAY_CONFIG_SYNC_TIMEOUT: Duration = Duration::from_secs(45);
 const GATEWAY_AGENT_STOP_TIMEOUT: Duration = Duration::from_millis(250);
-/// Release gate for the IPv4 VM guest packet path.
-///
-/// The supervisor may start after validating its runtime prerequisites. The
-/// runtime status remains in a waiting state until a real LAN client produces
-/// traffic through both the guest LAN interface and tun0.
-const GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE: bool = true;
-const GATEWAY_PACKET_PATH_UNAVAILABLE: &str =
-    "局域网 Gateway 数据面等待验收：请让 LAN 客户端访问一次网络，确认 LAN 与 tun0 都出现新增流量";
+const MITM_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct RuntimeState {
     child: Mutex<Option<Child>>,
@@ -58,10 +57,11 @@ pub struct RuntimeState {
     lifecycle_generation: Arc<AtomicU64>,
     gateway_runtime: Mutex<Option<gateway_runtime::GatewayRuntime>>,
     gateway_readiness: Mutex<packet_path::GatewayReadiness>,
-    gateway_packet_baseline: Mutex<Option<guest_agent::GuestPacketStats>>,
     system_connections: Mutex<SystemConnectionSample>,
+    metrics_session: Mutex<Option<MetricsSession>>,
     status: Mutex<RuntimeStatus>,
     metrics_generation: Arc<AtomicU64>,
+    exit_cleanup_started: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RuntimeState {
@@ -74,10 +74,11 @@ impl Default for RuntimeState {
             lifecycle_generation: Arc::new(AtomicU64::new(0)),
             gateway_runtime: Mutex::new(None),
             gateway_readiness: Mutex::new(packet_path::GatewayReadiness::default()),
-            gateway_packet_baseline: Mutex::new(None),
             system_connections: Mutex::new(SystemConnectionSample::default()),
+            metrics_session: Mutex::new(None),
             status: Mutex::new(RuntimeStatus::default()),
             metrics_generation: Arc::new(AtomicU64::new(0)),
+            exit_cleanup_started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -94,6 +95,9 @@ enum LifecyclePhase {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeStatus {
     pub state: String,
+    pub healthy: bool,
+    #[serde(rename = "canStop")]
+    pub can_stop: bool,
     pub mode: String,
     pub listen: String,
     pub dns: String,
@@ -147,6 +151,8 @@ pub struct RuntimeSettings {
     pub gateway_lan_interface: String,
     pub gateway_ip: String,
     pub gateway_cidr: String,
+    #[serde(default = "default_gateway_ipv6")]
+    pub gateway_ipv6: String,
     pub gateway_dns_ip: String,
     #[serde(default)]
     pub gateway_clients: String,
@@ -154,6 +160,8 @@ pub struct RuntimeSettings {
     pub gateway_client_policy: String,
     #[serde(default = "default_gateway_policy_mode")]
     pub gateway_policy_mode: String,
+    #[serde(default)]
+    pub mitm_ca_dir: String,
     pub log_level: String,
 }
 
@@ -183,6 +191,10 @@ fn default_gateway_guest_host_ip() -> String {
 
 fn default_gateway_host_cidr() -> String {
     vfkit::DEFAULT_GATEWAY_HOST_CIDR.into()
+}
+
+fn default_gateway_ipv6() -> String {
+    vfkit::DEFAULT_GATEWAY_IPV6.into()
 }
 
 fn default_gateway_guest_agent_port() -> u16 {
@@ -215,10 +227,12 @@ impl Default for RuntimeSettings {
             gateway_lan_interface: String::new(),
             gateway_ip: String::new(),
             gateway_cidr: String::new(),
+            gateway_ipv6: default_gateway_ipv6(),
             gateway_dns_ip: String::new(),
             gateway_clients: String::new(),
             gateway_client_policy: default_gateway_client_policy(),
             gateway_policy_mode: default_gateway_policy_mode(),
+            mitm_ca_dir: String::new(),
             log_level: "info".into(),
         }
     }
@@ -228,6 +242,8 @@ impl Default for RuntimeStatus {
     fn default() -> Self {
         Self {
             state: "stopped".into(),
+            healthy: false,
+            can_stop: false,
             mode: "mixed direct".into(),
             listen: "127.0.0.1:2080".into(),
             dns: "系统 DNS".into(),
@@ -258,6 +274,10 @@ struct RuntimeMetrics {
     active_connections: usize,
     memory: u64,
     connections: Vec<ConnectionInfo>,
+    host_snapshot_valid: bool,
+    host_snapshot_error: Option<String>,
+    guest_snapshot_valid: bool,
+    guest_snapshot_error: Option<String>,
     system_snapshot_valid: bool,
     system_snapshot_error: Option<String>,
 }
@@ -291,6 +311,14 @@ struct ModuleArgumentInfo {
     default_value: String,
     value: String,
     description: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MitmCertificateInfo {
+    available: bool,
+    path: String,
+    client_note: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -357,6 +385,10 @@ struct ModuleAssetEntry {
 #[serde(rename_all = "camelCase")]
 struct ModuleRuntimePlan {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mitm_ca_pem: Option<String>,
     enabled_modules: Vec<String>,
     module_files: Vec<serde_json::Value>,
     mitm_hostnames: Vec<String>,
@@ -387,13 +419,22 @@ struct ConnectionInfo {
     pid: Option<u32>,
     #[serde(default)]
     state: String,
+    #[serde(rename = "systemSocketKey", skip_serializing_if = "Option::is_none")]
+    system_socket_key: Option<String>,
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)]
 struct SystemConnectionSample {
     connections: Vec<ConnectionInfo>,
     valid: bool,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct SystemConnectionIdentityState {
+    active_instances: HashMap<String, String>,
+    next_generation: u64,
 }
 
 fn default_tls_enabled() -> bool {
@@ -811,6 +852,8 @@ fn lifecycle_starting_status(settings: &RuntimeSettings) -> RuntimeStatus {
     let gateway_mode = settings.mode == "gateway";
     RuntimeStatus {
         state: "starting".into(),
+        healthy: false,
+        can_stop: false,
         mode: if gateway_mode {
             "lan-gateway no-dhcp"
         } else {
@@ -924,6 +967,97 @@ fn module_root(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&root)
         .map_err(|error| format!("无法创建模块目录 {}：{error}", root.display()))?;
     Ok(root)
+}
+
+fn mitm_certificate_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let settings = load_settings(app).unwrap_or_default();
+    let directory = mitmproxy_confdir(app, &settings)?;
+    for filename in ["mitmproxy-ca-cert.cer", "mitmproxy-ca-cert.pem"] {
+        let path = directory.join(filename);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "SongsterX MITM 根证书尚未生成：{}",
+        directory.display()
+    ))
+}
+
+fn load_mitm_ca_for_guest(app: &AppHandle) -> Result<Option<String>, String> {
+    let settings = load_settings(app).unwrap_or_default();
+    let configured = settings.mitm_ca_dir.trim();
+    let directory = if configured.is_empty() {
+        app_data_dir(app)?.join("mitmproxy")
+    } else {
+        PathBuf::from(configured)
+    };
+    let ca_path = directory.join("mitmproxy-ca.pem");
+    match fs::read_to_string(&ca_path) {
+        Ok(ca_pem) => {
+            if !ca_pem.contains("PRIVATE KEY") || !ca_pem.contains("CERTIFICATE") {
+                return Err(format!(
+                    "{} 必须同时包含 MITM CA 证书和私钥",
+                    ca_path.display()
+                ));
+            }
+            Ok(Some(ca_pem))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && configured.is_empty() => Ok(None),
+        Err(error) => Err(format!(
+            "无法读取用于 guest Module Engine 的 MITM CA {}：{}",
+            ca_path.display(),
+            error
+        )),
+    }
+}
+
+fn persist_guest_mitm_certificate(app: &AppHandle, certificate_pem: &str) -> Result<(), String> {
+    if !certificate_pem.contains("BEGIN CERTIFICATE") {
+        return Err("guest Module Engine 返回的 MITM 证书格式无效".into());
+    }
+    let settings = load_settings(app).unwrap_or_default();
+    let directory = if settings.mitm_ca_dir.trim().is_empty() {
+        app_data_dir(app)?.join("mitmproxy")
+    } else {
+        PathBuf::from(settings.mitm_ca_dir.trim())
+    };
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建 MITM 证书目录 {}：{error}", directory.display()))?;
+    let path = directory.join("mitmproxy-ca-cert.pem");
+    write_private_file(&path, certificate_pem.as_bytes())
+        .map_err(|error| format!("无法保存 guest MITM 根证书 {}：{error}", path.display()))
+}
+
+fn mitmproxy_confdir(app: &AppHandle, settings: &RuntimeSettings) -> Result<PathBuf, String> {
+    let configured = settings.mitm_ca_dir.trim();
+    if !configured.is_empty() {
+        let path = PathBuf::from(configured);
+        if !path.is_dir() {
+            return Err(format!(
+                "已有 MITM CA 目录不存在或不是目录：{}",
+                path.display()
+            ));
+        }
+        let ca_path = path.join("mitmproxy-ca.pem");
+        let ca = fs::read_to_string(&ca_path).map_err(|error| {
+            format!(
+                "已有 MITM CA 目录缺少 mitmproxy-ca.pem：{} ({error})",
+                ca_path.display()
+            )
+        })?;
+        if !ca.contains("PRIVATE KEY") || !ca.contains("CERTIFICATE") {
+            return Err(format!(
+                "{} 必须同时包含 CA 证书和私钥；只有 .cer/.crt 公钥证书不能用于 MITM",
+                ca_path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    let directory = app_data_dir(app)?.join("mitmproxy");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建 mitmproxy 配置目录：{error}"))?;
+    Ok(directory)
 }
 
 fn imported_modules_manifest_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1539,6 +1673,18 @@ fn parse_module_runtime_source(
                         });
                     if let Some(path) = asset_path {
                         map["localPath"] = serde_json::Value::String(path);
+                        if let Some(asset) = assets.iter().find(|asset| {
+                            asset.module == entry.id && asset.kind == "data" && asset.source == data
+                        }) {
+                            let relative = asset
+                                .local_file
+                                .strip_prefix("modules/")
+                                .unwrap_or(&asset.local_file);
+                            if let Ok(bytes) = fs::read(module_root.join(relative)) {
+                                map["inlineDataBase64"] =
+                                    serde_json::Value::String(base64_encode(&bytes));
+                            }
+                        }
                     } else if data.starts_with("http://") || data.starts_with("https://") {
                         map["disabledReason"] =
                             serde_json::Value::String("远程数据未找到本地哈希资源".into());
@@ -1772,14 +1918,61 @@ fn load_module_runtime_plan(app: &AppHandle) -> Result<ModuleRuntimePlan, String
         let source = fs::read_to_string(&path)
             .map_err(|error| format!("无法读取已启用模块 {}：{error}", path.display()))?;
         module_push_unique(&mut plan.enabled_modules, entry.id.clone());
-        plan.module_files.push(serde_json::json!({
+        let mut module_file = serde_json::json!({
             "id": entry.id,
             "path": path.display().to_string(),
+            "content": source,
             "arguments": preferences.argument_values.get(&entry.id).cloned().unwrap_or_default()
-        }));
+        });
+        let embedded_assets = assets
+            .iter()
+            .filter(|asset| asset.module == entry.id)
+            .filter_map(|asset| {
+                let relative = asset
+                    .local_file
+                    .strip_prefix("modules/")
+                    .unwrap_or(&asset.local_file);
+                let asset_path = module_root.join(relative);
+                let bytes = fs::read(&asset_path).ok()?;
+                Some(serde_json::json!({
+                    "kind": asset.kind,
+                    "source": asset.source,
+                    "contentBase64": base64_encode(&bytes),
+                    "sha256": asset.sha256,
+                }))
+            })
+            .collect::<Vec<_>>();
+        module_file["assets"] = serde_json::Value::Array(embedded_assets);
+        plan.module_files.push(module_file);
         parse_module_runtime_source(&entry, &source, &module_root, &assets, &mut plan);
     }
+    if module_plan_requires_mitm(&plan) {
+        plan.mitm_ca_pem = load_mitm_ca_for_guest(app)?;
+    }
     Ok(plan)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(TABLE[((first & 0x03) << 4 | second >> 4) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((second & 0x0f) << 2 | third >> 6) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn module_runtime_plan_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1787,15 +1980,20 @@ fn module_runtime_plan_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn write_module_runtime_plan(app: &AppHandle) -> Result<ModuleRuntimePlan, String> {
+    let plan = load_module_runtime_plan(app)?;
+    persist_module_runtime_plan(app, &plan)?;
+    Ok(plan)
+}
+
+fn persist_module_runtime_plan(app: &AppHandle, plan: &ModuleRuntimePlan) -> Result<(), String> {
     let directory = app_data_dir(app)?;
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    let plan = load_module_runtime_plan(app)?;
     let path = module_runtime_plan_path(app)?;
-    let content = serde_json::to_string_pretty(&plan)
+    let content = serde_json::to_string_pretty(plan)
         .map_err(|error| format!("无法序列化模块运行计划：{error}"))?;
     write_private_file(&path, format!("{content}\n").as_bytes())
         .map_err(|error| format!("无法写入模块运行计划 {}：{error}", path.display()))?;
-    Ok(plan)
+    Ok(())
 }
 
 fn module_route_rules(plan: &ModuleRuntimePlan) -> Vec<serde_json::Value> {
@@ -1842,12 +2040,21 @@ fn module_mitm_route_rules(plan: &ModuleRuntimePlan) -> Vec<serde_json::Value> {
         } else {
             ("domain", hostname.clone())
         };
-        let rendered = serde_json::json!({
+        let mut rendered = serde_json::json!({
             field: [value],
             "network": ["tcp"],
             "action": "route",
             "outbound": "module-mitm"
         });
+        // A FakeIP/TUN flow may already carry a resolved IPv4/IPv6 address
+        // when it reaches the HTTP MITM outbound.  Keep the client-side
+        // FakeIP untouched, but force the MITM's upstream CONNECT target back
+        // to the exact module hostname so CDN/IP authorities cannot cause a
+        // second-hop TLS failure. Wildcard hosts cannot be safely mapped to a
+        // single replacement address and therefore retain the sniffed host.
+        if field == "domain" {
+            rendered["override_address"] = serde_json::Value::String(hostname);
+        }
         rules.push(rendered);
     }
     rules
@@ -1859,10 +2066,6 @@ fn runtime_config_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn gateway_guest_runtime_config_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join(GATEWAY_GUEST_RUNTIME_CONFIG_FILE))
-}
-
-fn gateway_guest_proxy_config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app_data_dir(app)?.join(GATEWAY_GUEST_PROXY_CONFIG_FILE))
 }
 
 fn songsterx_config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2359,6 +2562,11 @@ fn render_songsterx_config(
         "fakeip-dns-ip = {}",
         surge_config_value(&settings.gateway_dns_ip)
     );
+    let _ = writeln!(
+        output,
+        "mitm-ca-dir = {}",
+        surge_config_value(&settings.mitm_ca_dir)
+    );
     let _ = writeln!(output, "log-level = {}", settings.log_level);
     let _ = writeln!(output, "tun = {}", settings.mode == "gateway");
     let _ = writeln!(output, "system-dns = {}\n", settings.dns_mode == "system");
@@ -2383,11 +2591,18 @@ fn render_songsterx_config(
     );
     let _ = writeln!(
         output,
+        "gateway-ipv6 = {}",
+        surge_config_value(&settings.gateway_ipv6)
+    );
+    let _ = writeln!(
+        output,
         "dns-ip = {}",
         surge_config_value(&settings.gateway_dns_ip)
     );
     output.push_str("dhcp = false\n");
-    output.push_str("ipv6 = false\n");
+    // Gateway mode now carries IPv6 through the guest data plane. Mixed mode
+    // remains host-only, so its exported profile keeps IPv6 disabled there.
+    let _ = writeln!(output, "ipv6 = {}", settings.mode == "gateway");
     let _ = writeln!(
         output,
         "client-policy = {}",
@@ -2398,8 +2613,6 @@ fn render_songsterx_config(
         "clients = {}\n",
         surge_config_value(&settings.gateway_clients)
     );
-    let _ = writeln!(output, "policy-mode = {}\n", settings.gateway_policy_mode);
-
     output.push_str("[Proxy]\n");
     if config.nodes.is_empty() {
         output.push_str("# tag = type, server, port, options…\n");
@@ -2953,7 +3166,9 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                     }
                     "vm-gateway-ip" | "gateway-ip" => settings.gateway_ip = value,
                     "vm-gateway-cidr" | "gateway-cidr" => settings.gateway_cidr = value,
+                    "vm-gateway-ipv6" | "gateway-ipv6" => settings.gateway_ipv6 = value,
                     "fakeip-dns-ip" | "gateway-dns-ip" => settings.gateway_dns_ip = value,
+                    "mitm-ca-dir" => settings.mitm_ca_dir = value,
                     "log-level" => settings.log_level = value,
                     "format-version" | "config-version" | "tun" | "system-dns"
                     | "gateway-profile" | "gatewaykit-path" | "gateway-backend" => {}
@@ -2976,6 +3191,7 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                     }
                     "gateway-ip" | "ip" => settings.gateway_ip = value,
                     "cidr" | "gateway-cidr" => settings.gateway_cidr = value,
+                    "ipv6-ip" | "gateway-ipv6" => settings.gateway_ipv6 = value,
                     "dns-ip" | "gateway-dns-ip" => settings.gateway_dns_ip = value,
                     "client-policy" => settings.gateway_client_policy = value,
                     "clients" | "static-clients" => settings.gateway_clients = value,
@@ -2988,14 +3204,6 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
                         ) =>
                     {
                         return Err("[Gateway] dhcp 必须为 false；SongsterX 网关不提供 DHCP".into())
-                    }
-                    "ipv6"
-                        if matches!(
-                            value.to_ascii_lowercase().as_str(),
-                            "true" | "1" | "yes" | "on"
-                        ) =>
-                    {
-                        return Err("[Gateway] ipv6 必须为 false；当前网关不提供 IPv6 RA/NDP".into())
                     }
                     "dhcp" | "ipv6" => {}
                     _ => return Err(format!("[Gateway] 第 {line_number} 行不支持字段：{key}")),
@@ -3129,6 +3337,14 @@ fn parse_songsterx_config(text: &str) -> Result<SongsterXUserConfig, String> {
     if settings.gateway_guest_host_selector.trim().is_empty() {
         settings.gateway_guest_host_selector = vfkit::DEFAULT_GATEWAY_GUEST_HOST_SELECTOR.into();
     }
+    if settings.gateway_ipv6.trim().is_empty() {
+        settings.gateway_ipv6 = default_gateway_ipv6();
+    }
+    // The user configuration has one policy source. Older files may still
+    // contain policy-mode=separate, but that legacy split is intentionally
+    // ignored and normalized to the shared source below.
+    settings.gateway_policy_mode = default_gateway_policy_mode();
+    normalize_gateway_guest_memory(&mut settings);
     validate_settings(&settings)?;
     Ok(SongsterXUserConfig {
         settings,
@@ -3156,6 +3372,28 @@ fn parse_ipv4_cidr(value: &str) -> Result<(Ipv4Addr, u8), String> {
         return Err("VM Gateway 网段的 prefix 必须在 1-30 之间".into());
     }
     Ok((address, prefix))
+}
+
+fn validate_gateway_ipv6(value: &str) -> Result<(), String> {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let (address, prefix) = value.trim().split_once('/').ok_or_else(|| {
+        "VM Gateway 本地 IPv6 必须使用 IPv6/prefix 格式，例如 fe80::252/64".to_string()
+    })?;
+    let address = address
+        .parse::<Ipv6Addr>()
+        .map_err(|_| format!("VM Gateway 本地 IPv6 无效：{address}"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| format!("VM Gateway 本地 IPv6 prefix 无效：{prefix}"))?;
+    if prefix != 64 {
+        return Err("VM Gateway 本地 IPv6 prefix 必须为 64".into());
+    }
+    if address.segments()[0] != 0xfe80 {
+        return Err("VM Gateway 本地 IPv6 必须是非空的链路本地地址（fe80::/64）".into());
+    }
+    Ok(())
 }
 
 fn detect_interface_cidr(interface: &str) -> Result<String, String> {
@@ -3194,8 +3432,112 @@ fn detect_interface_cidr(interface: &str) -> Result<String, String> {
     ))
 }
 
+fn detect_default_ipv6_gateway(interface: &str) -> Option<Ipv6Addr> {
+    let interface = interface.trim();
+    if interface.is_empty() {
+        return None;
+    }
+    // `route -n get -inet6 default` can wait for a route lookup while the
+    // interface is changing state. Read the installed table instead so
+    // Gateway startup is not coupled to that lookup timeout.
+    let output = Command::new("netstat")
+        .args(["-rn", "-f", "inet6"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[0] != "default" || fields.last().copied() != Some(interface) {
+            continue;
+        }
+        let gateway = fields[1].split('%').next().unwrap_or(fields[1]);
+        if let Ok(address) = gateway.parse::<Ipv6Addr>() {
+            if address.segments()[0] == 0xfe80 {
+                return Some(address);
+            }
+        }
+    }
+    None
+}
+
+fn detect_gateway_global_ipv6(interface: &str, guest_lan_selector: &str) -> Option<Ipv6Addr> {
+    let interface = interface.trim();
+    if interface.is_empty() {
+        return None;
+    }
+    let output = Command::new("ifconfig").arg(interface).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gateway_global_ipv6(&String::from_utf8_lossy(&output.stdout), guest_lan_selector)
+}
+
+fn parse_gateway_global_ipv6(ifconfig: &str, guest_lan_selector: &str) -> Option<Ipv6Addr> {
+    let mac = guest_lan_mac(guest_lan_selector)?;
+    for line in ifconfig.lines() {
+        if !line.contains("inet6 ") || line.contains("deprecated") || line.contains("temporary") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(address_text) = fields
+            .windows(2)
+            .find(|pair| pair[0] == "inet6")
+            .map(|pair| pair[1].split('%').next().unwrap_or(pair[1]))
+        else {
+            continue;
+        };
+        let Ok(address) = address_text.parse::<Ipv6Addr>() else {
+            continue;
+        };
+        let first = address.segments()[0];
+        if address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || (first & 0xffc0) == 0xfe80
+        {
+            continue;
+        }
+        let segments = address.segments();
+        return Some(Ipv6Addr::new(
+            segments[0],
+            segments[1],
+            segments[2],
+            segments[3],
+            u16::from(mac[0] ^ 0x02) << 8 | u16::from(mac[1]),
+            u16::from(mac[2]) << 8 | 0x00ff,
+            0xfe00 | u16::from(mac[3]),
+            u16::from(mac[4]) << 8 | u16::from(mac[5]),
+        ));
+    }
+    None
+}
+
+fn guest_lan_mac(selector: &str) -> Option<[u8; 6]> {
+    let selector = selector.trim();
+    let value = if selector.is_empty() || selector.starts_with("if:") {
+        vfkit::DEFAULT_GATEWAY_GUEST_LAN_MAC
+    } else {
+        selector.strip_prefix("mac:")?
+    };
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (index, part) in parts.iter().enumerate() {
+        if part.len() != 2 {
+            return None;
+        }
+        mac[index] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
 fn ensure_gateway_ip_is_not_in_use(settings: &RuntimeSettings) -> Result<(), String> {
     let gateway_ip = parse_ipv4(&settings.gateway_ip, "VM Gateway IP")?;
+    validate_gateway_ipv6(&settings.gateway_ipv6)?;
     let gateway_ip_text = gateway_ip.to_string();
     let interface = settings.gateway_lan_interface.trim();
     let ifconfig = Command::new("ifconfig")
@@ -3296,6 +3638,7 @@ fn validate_gateway_network(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.gateway_ip.trim().is_empty() {
         return Err("VM Gateway 模式必须填写局域网网关 IP".into());
     }
+    validate_gateway_ipv6(&settings.gateway_ipv6)?;
     let gateway_ip = parse_ipv4(&settings.gateway_ip, "VM Gateway IP")?;
     parse_ipv4(&settings.dns_server, "Gateway guest DNS")?;
     let gateway_cidr = gateway_cidr_for_runtime(settings)?;
@@ -3342,8 +3685,12 @@ fn validate_vfkit_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.gateway_guest_cpus == 0 || settings.gateway_guest_cpus > 8 {
         return Err("vfkit guest CPU 数必须在 1-8 之间".into());
     }
-    if !(256..=16_384).contains(&settings.gateway_guest_memory_mib) {
-        return Err("vfkit guest 内存必须在 256-16384 MiB 之间".into());
+    if !(vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB..=16_384).contains(&settings.gateway_guest_memory_mib)
+    {
+        return Err(format!(
+            "vfkit guest 内存必须在 {}-16384 MiB 之间；内置 Gateway initrd 在更低内存下可能解包失败",
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        ));
     }
     if settings.gateway_guest_agent_port == 0 {
         return Err("vfkit guest agent 端口无效".into());
@@ -3374,6 +3721,12 @@ fn validate_vfkit_settings(settings: &RuntimeSettings) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_gateway_guest_memory(settings: &mut RuntimeSettings) {
+    if settings.gateway_guest_memory_mib < vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB {
+        settings.gateway_guest_memory_mib = vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB;
+    }
+}
+
 fn validate_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.mode != "mixed" && settings.mode != "gateway" {
         return Err("运行模式只能是 mixed 或 gateway".into());
@@ -3393,8 +3746,8 @@ fn validate_settings(settings: &RuntimeSettings) -> Result<(), String> {
     if settings.dns_mode == "fakeip" && settings.mode != "gateway" {
         return Err("FakeIP 只允许在网关模式使用".into());
     }
-    if settings.gateway_policy_mode != "shared" && settings.gateway_policy_mode != "separate" {
-        return Err("Gateway 策略模式只能是 shared 或 separate".into());
+    if settings.gateway_policy_mode != "shared" {
+        return Err("Gateway 只支持共享 SongsterX.conf 策略".into());
     }
     if settings.mode == "gateway" {
         validate_gateway_network(settings)?;
@@ -3519,16 +3872,14 @@ fn persist_settings(
     if settings.gateway_guest_host_selector.trim().is_empty() {
         settings.gateway_guest_host_selector = vfkit::DEFAULT_GATEWAY_GUEST_HOST_SELECTOR.into();
     }
+    if settings.gateway_ipv6.trim().is_empty() {
+        settings.gateway_ipv6 = default_gateway_ipv6();
+    }
+    normalize_gateway_guest_memory(&mut settings);
     validate_settings(&settings)?;
     let current = current_songsterx_user_config(app)?;
     let modules = load_modules(app)?;
     write_songsterx_config(app, &settings, &current.proxy_config, &modules)?;
-    if settings.mode == "gateway" && settings.gateway_policy_mode == "separate" {
-        let path = gateway_guest_proxy_config_path(app)?;
-        if !path.is_file() {
-            write_gateway_guest_proxy_config_file(app, &current.proxy_config)?;
-        }
-    }
     Ok(settings)
 }
 
@@ -3559,60 +3910,15 @@ fn load_proxy_config(app: &AppHandle) -> Result<ProxyConfig, String> {
     Ok(current_songsterx_user_config(app)?.proxy_config)
 }
 
-fn write_gateway_guest_proxy_config_file(
-    app: &AppHandle,
-    config: &ProxyConfig,
-) -> Result<(), String> {
-    let directory = app_data_dir(app)?;
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
-    let path = gateway_guest_proxy_config_path(app)?;
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|error| format!("无法序列化 Gateway guest 策略：{error}"))?;
-    write_private_file(&path, format!("{content}\n").as_bytes()).map_err(|error| {
-        format!(
-            "无法写入 Gateway guest 独立策略 {}：{error}",
-            path.display()
-        )
-    })
-}
-
 fn load_gateway_guest_proxy_config(app: &AppHandle) -> Result<ProxyConfig, String> {
-    let current = current_songsterx_user_config(app)?;
-    if current.settings.mode != "gateway" || current.settings.gateway_policy_mode == "shared" {
-        return Ok(current.proxy_config);
-    }
-    let path = gateway_guest_proxy_config_path(app)?;
-    if !path.is_file() {
-        write_gateway_guest_proxy_config_file(app, &current.proxy_config)?;
-        return Ok(current.proxy_config);
-    }
-    let content = fs::read_to_string(&path).map_err(|error| {
-        format!(
-            "无法读取 Gateway guest 独立策略 {}：{error}",
-            path.display()
-        )
-    })?;
-    let mut config: ProxyConfig = serde_json::from_str(&content).map_err(|error| {
-        format!(
-            "Gateway guest 独立策略 {} 不是有效 JSON：{error}",
-            path.display()
-        )
-    })?;
-    Ok(normalize_proxy_config(&mut config))
+    load_proxy_config(app)
 }
 
 fn persist_gateway_guest_proxy_config(
     app: &AppHandle,
     config: &ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    let settings = load_settings(app)?;
-    if settings.mode != "gateway" || settings.gateway_policy_mode != "separate" {
-        return Err("只有 Gateway 的“Host / Gateway 分开”模式可以单独保存 guest 策略".into());
-    }
-    let mut config = config.clone();
-    let normalized = normalize_proxy_config(&mut config);
-    write_gateway_guest_proxy_config_file(app, &normalized)?;
-    Ok(normalized)
+    persist_proxy_config(app, config)
 }
 
 fn normalize_proxy_config(config: &mut ProxyConfig) -> ProxyConfig {
@@ -4731,10 +5037,20 @@ fn render_runtime_config_for(
         route["rule_set"] = serde_json::Value::Array(rendered_rule_sets);
     }
 
+    let mixed_listen = if guest && settings.mode == "gateway" {
+        // Bind the guest LAN Mixed server to the IPv6 wildcard. On Linux a
+        // dual-stack wildcard listener accepts both the LAN IPv6 gateway
+        // address and the IPv4 gateway address, while binding only to the
+        // IPv4 address makes clients that select the advertised fe80:: gateway
+        // fail with connection refused.
+        "::"
+    } else {
+        settings.listen.trim()
+    };
     let mut inbounds = vec![serde_json::json!({
         "type": "mixed",
         "tag": "mixed-in",
-        "listen": settings.listen.trim(),
+        "listen": mixed_listen,
         "listen_port": settings.port
     })];
     if guest && settings.mode == "gateway" {
@@ -4788,17 +5104,89 @@ fn apply_module_runtime_plan(
     rendered: &mut serde_json::Value,
     settings: &RuntimeSettings,
     module_plan: &ModuleRuntimePlan,
+    guest: bool,
 ) -> Result<(), String> {
+    let mut needs_direct_module_inbound = false;
+    if module_plan_requires_mitm(module_plan) && guest && settings.mode == "gateway" {
+        let direct_port = settings
+            .port
+            .checked_add(1)
+            .ok_or_else(|| "网关代理端口 65535 无法分配 Module Engine 上游端口".to_string())?;
+        let inbounds = rendered["inbounds"]
+            .as_array_mut()
+            .ok_or_else(|| "sing-box inbounds 不是数组".to_string())?;
+        if !inbounds
+            .iter()
+            .any(|inbound| inbound["tag"].as_str() == Some("mixed-in-direct"))
+        {
+            inbounds.push(serde_json::json!({
+                "type": "mixed",
+                "tag": "mixed-in-direct",
+                "listen": "127.0.0.1",
+                "listen_port": direct_port
+            }));
+        }
+        needs_direct_module_inbound = true;
+    }
     if let Some(rules) = rendered["route"]["rules"].as_array_mut() {
         let mut module_rules = module_route_rules(module_plan);
         if module_plan_requires_mitm(module_plan) {
+            if needs_direct_module_inbound {
+                module_rules.insert(
+                    0,
+                    serde_json::json!({
+                        "inbound": ["mixed-in-direct"],
+                        "action": "route",
+                        "outbound": "direct"
+                    }),
+                );
+            }
             module_rules.extend(module_mitm_route_rules(module_plan));
         }
-        module_rules.append(rules);
-        *rules = module_rules;
+
+        // Gateway TUN traffic needs to be sniffed before domain-based module
+        // rules can match it. With FakeIP, however, `resolve` must not run
+        // before the module rule: resolve intentionally replaces the original
+        // hostname with the FakeIP address, and the HTTP MITM would then see a
+        // CDN/IP URL instead of the hostname declared by the module. Keep the
+        // sniff action first, apply module/static rules next, and only then run
+        // the remaining gateway preamble (`resolve`/`hijack-dns`) for traffic
+        // that did not match a module rule.
+        let mut existing_rules = std::mem::take(rules);
+        if guest && settings.mode == "gateway" {
+            let sniff_index = if settings.dns_mode == "fakeip" {
+                1 // resolve, sniff, hijack-dns
+            } else {
+                0 // sniff, hijack-dns
+            };
+            if sniff_index < existing_rules.len() {
+                let postponed_prefix = existing_rules[..sniff_index].to_vec();
+                let sniff_rule = existing_rules[sniff_index].clone();
+                let after_sniff = existing_rules.split_off(sniff_index + 1);
+                let mut reordered = Vec::with_capacity(
+                    1 + module_rules.len() + postponed_prefix.len() + after_sniff.len(),
+                );
+                reordered.push(sniff_rule);
+                reordered.extend(module_rules);
+                reordered.extend(postponed_prefix);
+                reordered.extend(after_sniff);
+                *rules = reordered;
+            } else {
+                existing_rules.extend(module_rules);
+                *rules = existing_rules;
+            }
+        } else {
+            existing_rules.extend(module_rules);
+            *rules = existing_rules;
+        }
     }
     if module_plan_requires_mitm(module_plan) {
-        let module_proxy_host = module_proxy_host(settings);
+        let module_proxy_host = if guest {
+            "127.0.0.1".to_string()
+        } else {
+            module_proxy_host(settings)
+        };
+        let module_proxy_port = module_proxy_port(module_plan);
         rendered["outbounds"]
             .as_array_mut()
             .expect("sing-box outbounds must be an array")
@@ -4806,7 +5194,7 @@ fn apply_module_runtime_plan(
                 "type": "http",
                 "tag": "module-mitm",
                 "server": module_proxy_host,
-                "server_port": MODULE_PROXY_PORT
+                "server_port": module_proxy_port
             }));
     }
     Ok(())
@@ -4821,7 +5209,7 @@ fn render_runtime_config_document(
     let mut rendered: serde_json::Value =
         serde_json::from_str(&render_runtime_config_for(settings, proxy, guest)?)
             .map_err(|error| format!("运行配置不是有效 JSON：{error}"))?;
-    apply_module_runtime_plan(&mut rendered, settings, module_plan)?;
+    apply_module_runtime_plan(&mut rendered, settings, module_plan, guest)?;
     if guest {
         let tun = rendered["inbounds"]
             .as_array_mut()
@@ -4833,13 +5221,17 @@ fn render_runtime_config_document(
             .ok_or_else(|| "Linux guest 配置缺少 tun-in 入站".to_string())?;
         // auto_redirect is Linux-only; the host-side macOS config deliberately omits it.
         tun["interface_name"] = serde_json::Value::String("tun0".into());
+        // Keep the guest TUN dual-stack. The LAN IPv6 gateway is link-local,
+        // while this private /126 is only the point-to-point address used by
+        // sing-box itself.
+        tun["address"] = serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"]);
         tun["auto_route"] = serde_json::Value::Bool(true);
         tun["strict_route"] = serde_json::Value::Bool(true);
         tun["auto_redirect"] = serde_json::Value::Bool(true);
         // Keep the guest data plane independent from sing-box defaults. The
         // explicit split default route and marks are required for forwarded
         // LAN packets, which do not originate from a local process.
-        tun["route_address"] = serde_json::json!(["0.0.0.0/1", "128.0.0.0/1"]);
+        tun["route_address"] = serde_json::json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"]);
         tun["iproute2_table_index"] = serde_json::json!(2022);
         tun["iproute2_rule_index"] = serde_json::json!(9000);
         tun["auto_redirect_input_mark"] = serde_json::json!("0x2023");
@@ -4859,6 +5251,8 @@ fn render_runtime_config_document(
             "223.86.225.0/24",
             settings.gateway_cidr.trim(),
             settings.gateway_host_cidr.trim(),
+            "fe80::/10",
+            "fdfe:dcba:9876::/126",
         ] {
             if !cidr.is_empty()
                 && !excluded_routes
@@ -4900,7 +5294,7 @@ fn write_gateway_guest_runtime_config(
     let directory = app_data_dir(app)?;
     fs::create_dir_all(&directory).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
     let path = gateway_guest_runtime_config_path(app)?;
-    let proxy = load_gateway_guest_proxy_config(app)?;
+    let proxy = load_proxy_config(app)?;
     let content = render_runtime_config_document(settings, &proxy, module_plan, true)?;
     write_private_file(&path, content.as_bytes())
         .map_err(|error| format!("无法写入 Linux guest 运行配置 {}：{error}", path.display()))?;
@@ -4956,107 +5350,109 @@ fn module_proxy_host(settings: &RuntimeSettings) -> String {
     }
 }
 
-fn module_proxy_endpoint(settings: &RuntimeSettings) -> String {
-    format!("{}:{MODULE_PROXY_PORT}", module_proxy_host(settings))
+fn module_proxy_probe_host(settings: &RuntimeSettings) -> &str {
+    if settings.mode == "gateway" {
+        // The host-only vmnet address is created by the Gateway supervisor
+        // later in the startup transaction. The caller probes the configured
+        // host first to catch a specific-address listener, then falls back to
+        // the wildcard address only while the host-only address is unavailable.
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
 }
 
-fn runtime_is_running(state: &RuntimeState) -> Result<bool, String> {
-    if state
+fn module_proxy_port(plan: &ModuleRuntimePlan) -> u16 {
+    plan.proxy_port.unwrap_or(DEFAULT_MODULE_PROXY_PORT)
+}
+
+fn bind_module_proxy_listener(
+    settings: &RuntimeSettings,
+    port: u16,
+) -> Result<TcpListener, String> {
+    let host = module_proxy_host(settings);
+    let probe_host = module_proxy_probe_host(settings);
+    match TcpListener::bind((host.as_str(), port)) {
+        Ok(listener) => Ok(listener),
+        Err(host_error)
+            if settings.mode == "gateway"
+                && host_error.kind() == io::ErrorKind::AddrNotAvailable =>
+        {
+            TcpListener::bind((probe_host, port)).map_err(|probe_error| {
+                format!(
+                    "{}:{} 不可用（{}）；{}:{} 也不可用（{}）",
+                    host, port, host_error, probe_host, port, probe_error
+                )
+            })
+        }
+        Err(host_error) => Err(format!("{}:{} 不可用：{}", host, port, host_error)),
+    }
+}
+
+fn select_module_proxy_port(settings: &RuntimeSettings) -> Result<u16, String> {
+    let host = module_proxy_host(settings);
+    let mut last_error = None;
+    let candidates = std::iter::once(DEFAULT_MODULE_PROXY_PORT)
+        .chain(FALLBACK_MODULE_PROXY_PORT_START..=FALLBACK_MODULE_PROXY_PORT_END);
+    for port in candidates {
+        match bind_module_proxy_listener(settings, port) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(port);
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    if let Ok(listener) = bind_module_proxy_listener(settings, 0) {
+        if let Ok(address) = listener.local_addr() {
+            return Ok(address.port());
+        }
+    }
+    Err(format!(
+        "模块 MITM 监听地址 {} 无可用端口（已尝试 {} 和 {}-{}；最后错误：{}）",
+        host,
+        DEFAULT_MODULE_PROXY_PORT,
+        FALLBACK_MODULE_PROXY_PORT_START,
+        FALLBACK_MODULE_PROXY_PORT_END,
+        last_error.unwrap_or_else(|| "无法申请临时端口".into())
+    ))
+}
+
+fn module_proxy_endpoint(settings: &RuntimeSettings, port: u16) -> String {
+    format!("{}:{port}", module_proxy_host(settings))
+}
+
+fn runtime_phase_is_active(state: &RuntimeState) -> Result<bool, String> {
+    let phase = state
         .lifecycle_phase
         .lock()
-        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?
-        .eq(&LifecyclePhase::Starting)
-    {
-        return Ok(true);
-    }
-    let mut sing_box = state
-        .child
-        .lock()
-        .map_err(|_| "运行时锁不可用".to_string())?;
-    let sing_box_running = if let Some(child) = sing_box.as_mut() {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            true
-        } else {
-            *sing_box = None;
-            false
-        }
-    } else {
-        false
-    };
-    drop(sing_box);
+        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?;
+    Ok(matches!(
+        *phase,
+        LifecyclePhase::Starting | LifecyclePhase::Running | LifecyclePhase::Stopping
+    ))
+}
 
-    let mut mitm = state
-        .mitm_child
+fn runtime_mutation_allowed(state: &RuntimeState) -> Result<(), String> {
+    let phase = state
+        .lifecycle_phase
         .lock()
-        .map_err(|_| "运行时锁不可用".to_string())?;
-    let mitm_running = if let Some(child) = mitm.as_mut() {
-        if child
-            .try_wait()
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            true
-        } else {
-            *mitm = None;
-            false
-        }
+        .map_err(|_| "Gateway 生命周期锁不可用".to_string())?;
+    if *phase == LifecyclePhase::Stopped {
+        Ok(())
     } else {
-        false
-    };
-    drop(mitm);
-
-    let (managed_gateway_running, managed_gateway_failed) = {
-        let mut gateway_runtime = state
-            .gateway_runtime
-            .lock()
-            .map_err(|_| "Gateway runtime 锁不可用".to_string())?;
-        let had_runtime = gateway_runtime.is_some();
-        let running = match gateway_runtime.as_mut() {
-            Some(runtime) => runtime
-                .leaders_running()
-                .map_err(|error| format!("检查 Gateway supervisor 失败：{error}"))?,
-            None => false,
-        };
-        if !running {
-            gateway_runtime.take();
-            if let Ok(mut readiness) = state.gateway_readiness.lock() {
-                readiness.mark_stopped();
-            }
-        }
-        (running, had_runtime && !running)
-    };
-    if managed_gateway_failed {
-        if let Ok(mut child) = state.child.lock() {
-            if let Some(mut child) = child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        if let Ok(mut mitm) = state.mitm_child.lock() {
-            if let Some(mut child) = mitm.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        return Ok(false);
+        Err("请先停止运行时，再修改配置".into())
     }
-    Ok(sing_box_running || mitm_running || managed_gateway_running)
 }
 
 fn spawn_mitmproxy(
     app: &AppHandle,
     plan_path: &Path,
     settings: &RuntimeSettings,
+    port: u16,
 ) -> Result<Child, String> {
     let addon = resolve_mitmproxy_addon(app)?;
-    let confdir = app_data_dir(app)?.join("mitmproxy");
-    fs::create_dir_all(&confdir)
-        .map_err(|error| format!("无法创建 mitmproxy 配置目录：{error}"))?;
+    let confdir = mitmproxy_confdir(app, settings)?;
     let binary = resolve_mitmproxy_binary(app);
     let host = module_proxy_host(settings);
     let mut command = Command::new(&binary);
@@ -5064,7 +5460,7 @@ fn spawn_mitmproxy(
         .arg("--listen-host")
         .arg(&host)
         .arg("--listen-port")
-        .arg(MODULE_PROXY_PORT.to_string())
+        .arg(port.to_string())
         .arg("--set")
         .arg(format!("confdir={}", confdir.display()))
         .arg("-s")
@@ -5086,13 +5482,20 @@ fn wait_for_mitmproxy(
     endpoint: &str,
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    for _ in 0..30 {
+    let deadline = Instant::now() + MITM_STARTUP_TIMEOUT;
+    loop {
         if cancellation() {
             return Err("启动已取消".into());
         }
         if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
+            let diagnostics = child_process_diagnostics(child);
+            let diagnostics = if diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!("；输出：{diagnostics}")
+            };
             return Err(format!(
-                "mitmdump 在监听 {} 前退出，状态码 {:?}",
+                "mitmdump 在监听 {} 前退出，状态码 {:?}{diagnostics}",
                 endpoint,
                 exit.code()
             ));
@@ -5100,9 +5503,37 @@ fn wait_for_mitmproxy(
         if TcpStream::connect(endpoint).is_ok() {
             return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(format!("mitmdump 启动超时，未监听 {}", endpoint));
+        }
         thread::sleep(std::time::Duration::from_millis(100));
     }
-    Err(format!("mitmdump 启动超时，未监听 {}", endpoint))
+}
+
+fn child_process_diagnostics(child: &mut Child) -> String {
+    let mut output = Vec::new();
+    drain_process_pipe(&mut child.stdout, &mut output);
+    drain_process_pipe(&mut child.stderr, &mut output);
+    let text = String::from_utf8_lossy(&output).trim().to_string();
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    if text.len() <= MAX_DIAGNOSTIC_BYTES {
+        return text;
+    }
+    let suffix = text
+        .chars()
+        .rev()
+        .take(MAX_DIAGNOSTIC_BYTES)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("…{suffix}")
+}
+
+fn drain_process_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>) {
+    if let Some(mut pipe) = pipe.take() {
+        let _ = pipe.read_to_end(output);
+    }
 }
 
 fn sing_box_probe_endpoint(listen: &str, port: u16) -> String {
@@ -5182,7 +5613,7 @@ fn spawn_sing_box_process(
     config: &Path,
     endpoint: &str,
     cancellation: &(dyn Fn() -> bool + Sync),
-) -> Result<Child, String> {
+) -> Result<Child, (Option<Child>, String)> {
     let mut command = Command::new(binary);
     command
         .arg("run")
@@ -5190,25 +5621,62 @@ fn spawn_sing_box_process(
         .arg(config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("无法启动 sing-box（{}）：{}", binary.display(), error))?;
+    let mut child = command.spawn().map_err(|error| {
+        (
+            None,
+            format!("无法启动 sing-box（{}）：{}", binary.display(), error),
+        )
+    })?;
     if let Err(error) = wait_for_sing_box(&mut child, endpoint, cancellation) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+        return match stop_unowned_child(child) {
+            Ok(()) => Err((None, error)),
+            Err((child, cleanup)) => Err((
+                Some(child),
+                format!("{error}；Mixed 启动阶段回收失败：{cleanup}"),
+            )),
+        };
     }
     Ok(child)
 }
 
-fn stop_unowned_child(mut child: Child) -> Result<(), String> {
+fn stop_unowned_child(mut child: Child) -> Result<(), (Child, String)> {
     let kill_error = child.kill().err();
-    child.wait().map(|_| ()).map_err(|error| match kill_error {
-        Some(kill_error) => {
-            format!("终止未归属 Mixed 进程失败：{kill_error}；等待退出失败：{error}")
+    match child.wait() {
+        Ok(_) => Ok(()),
+        Err(error) => Err((
+            child,
+            match kill_error {
+                Some(kill_error) => {
+                    format!("终止未归属 Mixed 进程失败：{kill_error}；等待退出失败：{error}")
+                }
+                None => format!("等待未归属 Mixed 进程退出失败：{error}"),
+            },
+        )),
+    }
+}
+
+fn adopt_unowned_child(state: &RuntimeState, failure: (Option<Child>, String)) -> String {
+    let (child, message) = failure;
+    let Some(child) = child else {
+        return message;
+    };
+    match state.child.lock() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(child);
+            message
         }
-        None => format!("等待未归属 Mixed 进程退出失败：{error}"),
-    })
+        Ok(_) => format!("{message}；Mixed 所有权槽已被占用，无法登记残留进程"),
+        Err(_) => format!("{message}；Mixed 所有权锁不可用，无法登记残留进程"),
+    }
+}
+
+fn update_start_error_status(state: &RuntimeState, message: String) {
+    let mut status = current_status(state).unwrap_or_default();
+    status.state = "error".into();
+    status.healthy = false;
+    status.can_stop = runtime_owns_resources(state);
+    status.message = message;
+    update_status(state, status);
 }
 
 fn set_stopped(state: &RuntimeState, message: impl Into<String>) -> RuntimeStatus {
@@ -5218,6 +5686,115 @@ fn set_stopped(state: &RuntimeState, message: impl Into<String>) -> RuntimeStatu
     };
     update_status(state, next.clone());
     next
+}
+
+fn status_after_stop_failure(
+    mut current: RuntimeStatus,
+    resources_owned: bool,
+    message: impl Into<String>,
+) -> RuntimeStatus {
+    // A failed teardown that still owns a child, guest runtime, or proxy must
+    // remain stoppable. Preserve the last runtime metadata and expose the
+    // failure through the message while keeping the lifecycle state running.
+    current.state = if resources_owned {
+        "running".into()
+    } else {
+        "error".into()
+    };
+    current.healthy = false;
+    current.can_stop = resources_owned;
+    current.message = message.into();
+    current
+}
+
+fn finalize_start_failure(
+    app: &AppHandle,
+    state: &RuntimeState,
+    generation: u64,
+    error: String,
+) -> bool {
+    let _gateway_transition = lock_gateway_transition(state);
+    let mut phase = match state.lifecycle_phase.lock() {
+        Ok(phase) => phase,
+        Err(_) => return false,
+    };
+    if *phase != LifecyclePhase::Starting
+        || state.lifecycle_generation.load(Ordering::SeqCst) != generation
+    {
+        return false;
+    }
+    let resources_owned = runtime_owns_resources(state);
+    *phase = if resources_owned {
+        LifecyclePhase::Running
+    } else {
+        LifecyclePhase::Stopped
+    };
+    if !resources_owned {
+        state.metrics_generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut session) = state.metrics_session.lock() {
+            *session = None;
+        }
+        if let Ok(mut sample) = state.system_connections.lock() {
+            *sample = SystemConnectionSample::default();
+        }
+    }
+    let current = current_status(state).unwrap_or_default();
+    update_status(
+        state,
+        status_after_stop_failure(current, resources_owned, error.clone()),
+    );
+    let has_metrics_session = state
+        .metrics_session
+        .lock()
+        .map(|session| session.is_some())
+        .unwrap_or(false);
+    if resources_owned && has_metrics_session {
+        restart_runtime_observers(app, state);
+    }
+    drop(phase);
+    emit_log(app, "error", error);
+    true
+}
+
+fn finalize_unexpected_runtime_exit(
+    app: &AppHandle,
+    state: &RuntimeState,
+    exit_message: String,
+    cleanup_result: Result<(), String>,
+) -> RuntimeStatus {
+    state.metrics_generation.fetch_add(1, Ordering::SeqCst);
+    match cleanup_result {
+        Ok(()) => {
+            if let Ok(mut session) = state.metrics_session.lock() {
+                *session = None;
+            }
+            mark_lifecycle_phase(state, LifecyclePhase::Stopped);
+            set_stopped(state, exit_message)
+        }
+        Err(cleanup_error) => {
+            let resources_owned = runtime_owns_resources(state);
+            let message = format!("{exit_message}；清理失败：{cleanup_error}");
+            let phase = if resources_owned {
+                LifecyclePhase::Running
+            } else {
+                LifecyclePhase::Stopped
+            };
+            mark_lifecycle_phase(state, phase);
+            if !resources_owned {
+                if let Ok(mut session) = state.metrics_session.lock() {
+                    *session = None;
+                }
+            }
+            let current = current_status(state).unwrap_or_default();
+            let next = status_after_stop_failure(current, resources_owned, message.clone());
+            update_status(state, next.clone());
+            if resources_owned {
+                restart_runtime_observers(app, state);
+            }
+            emit_log(app, "error", message);
+            next
+        }
+    }
 }
 
 fn resolve_sing_box_binary(app: &AppHandle, settings: &RuntimeSettings) -> PathBuf {
@@ -5265,6 +5842,188 @@ fn resolve_vmnet_helper_binary(
         return Ok((bundled, true));
     }
     Ok((PathBuf::from("vmnet-helper"), false))
+}
+
+/// A Dock force-quit can terminate the Rust process before the normal Tauri
+/// `ExitRequested` cleanup runs.  vfkit and vmnet-helper are then reparented
+/// to launchd and can keep the old Gateway network alive, so the next guest
+/// boots against stale sockets or a stale `192.168.250.0/24` network and its
+/// guest-agent endpoint becomes unreachable.  Only reclaim orphaned processes
+/// that match SongsterX's own temporary socket and exact Gateway invocation;
+/// never scan or kill generic vfkit/vmnet processes owned by another app.
+#[cfg(target_os = "macos")]
+fn cleanup_orphaned_gateway_vfkit(vfkit_path: &Path) -> Result<usize, String> {
+    let output = Command::new("/bin/ps")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .args(["-axo", "pid=,ppid=,pgid=,command="])
+        .output()
+        .map_err(|error| format!("无法检查残留 vfkit：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法检查残留 vfkit：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let vfkit = vfkit_path
+        .canonicalize()
+        .unwrap_or_else(|_| vfkit_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut targets = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(ppid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(pgid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let command = fields.collect::<Vec<_>>().join(" ");
+        let is_gateway_vfkit = command.starts_with(&format!("{vfkit} "))
+            && command.contains(" --kernel ")
+            && command.contains("/gateway-guest/kernel ")
+            && command.contains(" --initrd ")
+            && command.contains("/gateway-guest/initrd ")
+            && command.contains(" --kernel-cmdline ")
+            && command.contains(" songsterx.agent_port=")
+            && command.contains(" --device virtio-net,unixSocketPath=/tmp/sxg-");
+        if ppid == 1 && is_gateway_vfkit && pid != std::process::id() as libc::pid_t && pgid > 1 {
+            targets.push((pid, pgid));
+        }
+    }
+
+    for (_, pgid) in &targets {
+        let result = unsafe { libc::kill(-*pgid, libc::SIGTERM) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("停止残留 vfkit 进程组 {pgid} 失败：{error}"));
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let any_running = targets
+            .iter()
+            .any(|(pid, _)| unsafe { libc::kill(*pid, 0) == 0 });
+        if !any_running {
+            return Ok(targets.len());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    for (pid, pgid) in &targets {
+        if unsafe { libc::kill(*pid, 0) == 0 } {
+            let result = unsafe { libc::kill(-*pgid, libc::SIGKILL) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("强制停止残留 vfkit 进程组 {pgid} 失败：{error}"));
+                }
+            }
+        }
+    }
+    Ok(targets.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_orphaned_gateway_vfkit(_vfkit_path: &Path) -> Result<usize, String> {
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_orphaned_gateway_vmnet_helpers(helper_path: &Path) -> Result<usize, String> {
+    let output = Command::new("/bin/ps")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .map_err(|error| format!("无法检查残留 vmnet-helper：{error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "无法检查残留 vmnet-helper：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let helper = helper_path
+        .canonicalize()
+        .unwrap_or_else(|_| helper_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Some(ppid) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let command = fields.collect::<Vec<_>>().join(" ");
+        let is_gateway_helper = command.starts_with(&format!("{helper} "))
+            && command.contains(" --socket ")
+            && command.contains("/sxg-")
+            && (command.contains(" --operation-mode host ")
+                || command.contains(" --operation-mode bridged "));
+        if ppid == 1 && is_gateway_helper && pid != std::process::id() as libc::pid_t {
+            pids.push(pid);
+        }
+    }
+
+    for pid in &pids {
+        let result = unsafe { libc::kill(*pid, libc::SIGTERM) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("停止残留 vmnet-helper {pid} 失败：{error}"));
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let any_running = pids.iter().any(|pid| unsafe { libc::kill(*pid, 0) == 0 });
+        if !any_running {
+            return Ok(pids.len());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    for pid in &pids {
+        if unsafe { libc::kill(*pid, 0) == 0 } {
+            let result = unsafe { libc::kill(*pid, libc::SIGKILL) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!("强制停止残留 vmnet-helper {pid} 失败：{error}"));
+                }
+            }
+        }
+    }
+    Ok(pids.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_orphaned_gateway_vmnet_helpers(_helper_path: &Path) -> Result<usize, String> {
+    Ok(0)
 }
 
 fn resolve_vfkit_binary(app: &AppHandle, settings: &RuntimeSettings) -> Result<PathBuf, String> {
@@ -5322,7 +6081,13 @@ fn build_vfkit_gateway_plan(
         bridge_interface: settings.gateway_lan_interface.trim().to_string(),
         gateway_ip,
         gateway_cidr,
+        gateway_ipv6: settings.gateway_ipv6.trim().to_string(),
+        gateway_ipv6_global: detect_gateway_global_ipv6(
+            &settings.gateway_lan_interface,
+            &settings.gateway_guest_lan_selector,
+        ),
         upstream_gateway,
+        upstream_gateway_ipv6: detect_default_ipv6_gateway(&settings.gateway_lan_interface),
         dns_server: settings.dns_server.trim().to_string(),
         guest_lan_selector: settings.gateway_guest_lan_selector.trim().to_string(),
         guest_host_selector: settings.gateway_guest_host_selector.trim().to_string(),
@@ -5336,8 +6101,9 @@ fn build_vfkit_gateway_plan(
     vfkit::build_plan(&config)
 }
 
-/// Start the Linux guest runtime. Entity LAN packet-path acceptance remains a
-/// separate fail-closed forwarding gate until a real client is verified.
+/// Start the Linux guest runtime. LAN/tun0 counters are collected after start
+/// for diagnostics only; no client traffic is required before publishing the
+/// runtime as ready.
 ///
 /// The caller holds `gateway_transition` for the whole runtime start. Keeping
 /// the slot assignment under that lock prevents stop/start races from leaving
@@ -5347,12 +6113,25 @@ fn start_gateway_runtime_supervisor(
     state: &RuntimeState,
     settings: &RuntimeSettings,
     config_path: &Path,
+    module_plan_path: &Path,
     cancellation: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    if !GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE {
-        return Err(GATEWAY_PACKET_PATH_UNAVAILABLE.into());
-    }
+    let startup_started_at = Instant::now();
     ensure_vmnet_launch_supported()?;
+    let vfkit_path = resolve_vfkit_binary(app, settings)?;
+    let (vmnet_helper, _) = resolve_vmnet_helper_binary(app, settings)?;
+    let reclaimed_vfkit = cleanup_orphaned_gateway_vfkit(&vfkit_path)?;
+    let reclaimed_helpers = cleanup_orphaned_gateway_vmnet_helpers(&vmnet_helper)?;
+    if reclaimed_vfkit > 0 || reclaimed_helpers > 0 {
+        emit_log(
+            app,
+            "warn",
+            format!(
+                "已回收上次异常退出遗留的 vfkit {} 个、vmnet-helper {} 个，正在重新创建 Gateway 网络",
+                reclaimed_vfkit, reclaimed_helpers
+            ),
+        );
+    }
     ensure_gateway_ip_is_not_in_use(settings)?;
 
     if state
@@ -5424,22 +6203,32 @@ fn start_gateway_runtime_supervisor(
         }
     };
 
-    let mut runtime = match gateway_runtime::GatewayRuntime::start_with_cancellation(
+    let runtime = match gateway_runtime::GatewayRuntime::start_with_cancellation(
         runtime_plan,
         cancellation,
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
+            let message = adopt_gateway_start_failure(state, error);
             if let Ok(mut readiness) = state.gateway_readiness.lock() {
-                readiness.mark_failed(error.clone());
+                readiness.mark_failed(message.clone());
             }
-            return Err(format!("启动 vfkit Gateway supervisor 失败：{error}"));
+            return Err(format!("启动 vfkit Gateway supervisor 失败：{message}"));
         }
     };
+    emit_log(
+        app,
+        "info",
+        format!(
+            "VM 基础运行时已就绪，耗时 {} ms；正在同步 guest 配置",
+            startup_started_at.elapsed().as_millis()
+        ),
+    );
 
-    let config_result = match guest_agent::sync_config_with_cancellation(
+    let session_result = match guest_agent::sync_session_with_cancellation(
         &endpoint,
         config_path,
+        module_plan_path,
         GATEWAY_CONFIG_SYNC_TIMEOUT,
         cancellation,
     ) {
@@ -5448,29 +6237,31 @@ fn start_gateway_runtime_supervisor(
             if let Ok(mut readiness) = state.gateway_readiness.lock() {
                 readiness.mark_failed(error.clone());
             }
-            return Err(runtime_failure_with_cleanup(error, &mut runtime));
+            return Err(runtime_failure_with_cleanup(
+                format!("guest Gateway session 激活失败：{error}"),
+                runtime,
+                state,
+            ));
         }
     };
+    if let Some(certificate_pem) = session_result.certificate_pem.as_deref() {
+        if let Err(error) = persist_guest_mitm_certificate(app, certificate_pem) {
+            emit_log(
+                app,
+                "warn",
+                format!("guest Module Engine 已启动，但保存 MITM 根证书失败：{error}"),
+            );
+        }
+    }
     if let Err(error) = commit_gateway_runtime(&state, runtime) {
         if let Ok(mut readiness) = state.gateway_readiness.lock() {
             readiness.mark_failed(error.clone());
         }
         return Err(error);
     }
-    if let Ok(mut baseline) = state.gateway_packet_baseline.lock() {
-        *baseline = config_result.packet_stats.clone();
-    }
     if let Ok(mut readiness) = state.gateway_readiness.lock() {
         readiness.mark_runtime_started();
-        readiness.mark_guest_packet_path_not_ready(GATEWAY_PACKET_PATH_UNAVAILABLE);
     }
-    emit_log(
-        app,
-        "info",
-        format!(
-            "vfkit Gateway supervisor 已启动：bridged LAN、host-only、vfkit 和 guest-agent 均就绪（配置已激活；实体 LAN packet path 尚未现场验收）"
-        ),
-    );
     Ok(())
 }
 
@@ -5490,14 +6281,15 @@ fn guest_agent_status_diagnostic(status: &guest_agent::GuestAgentStatus) -> Stri
 /// uncommitted runtime before returning the error instead of relying on Drop.
 fn commit_gateway_runtime(
     state: &RuntimeState,
-    mut runtime: gateway_runtime::GatewayRuntime,
+    runtime: gateway_runtime::GatewayRuntime,
 ) -> Result<(), String> {
     let mut slot = match state.gateway_runtime.lock() {
         Ok(slot) => slot,
         Err(_) => {
             return Err(runtime_failure_with_cleanup(
                 "Gateway runtime 锁不可用".into(),
-                &mut runtime,
+                runtime,
+                state,
             ));
         }
     };
@@ -5505,112 +6297,50 @@ fn commit_gateway_runtime(
         drop(slot);
         return Err(runtime_failure_with_cleanup(
             "Gateway supervisor 已经在运行".into(),
-            &mut runtime,
+            runtime,
+            state,
         ));
     }
     *slot = Some(runtime);
     Ok(())
 }
 
-fn interface_packet_progressed(
-    before: &guest_agent::GuestInterfaceStats,
-    after: &guest_agent::GuestInterfaceStats,
-) -> bool {
-    after.rx_packets > before.rx_packets
-        || after.tx_packets > before.tx_packets
-        || after.rx_bytes > before.rx_bytes
-        || after.tx_bytes > before.tx_bytes
-}
-
-fn guest_packet_path_progressed(
-    before: &guest_agent::GuestPacketStats,
-    after: &guest_agent::GuestPacketStats,
-) -> bool {
-    let Some(before_lan) = before.lan.as_ref() else {
-        return false;
-    };
-    let Some(after_lan) = after.lan.as_ref() else {
-        return false;
-    };
-    let Some(before_tun) = before.tun.as_ref() else {
-        return false;
-    };
-    let Some(after_tun) = after.tun.as_ref() else {
-        return false;
-    };
-    interface_packet_progressed(before_lan, after_lan)
-        && interface_packet_progressed(before_tun, after_tun)
-}
-
-fn observe_gateway_packet_path(app: &AppHandle) {
-    let state = app.state::<RuntimeState>();
-    let settings = match load_settings(app) {
-        Ok(settings) if settings.mode == "gateway" => settings,
-        _ => return,
-    };
-    let baseline = match state.gateway_packet_baseline.lock() {
-        Ok(baseline) => baseline.clone(),
-        Err(_) => return,
-    };
-    let Some(baseline) = baseline else {
-        return;
-    };
-    let endpoint = match gateway_guest_agent_endpoint(app, &settings) {
-        Ok(endpoint) => endpoint,
-        Err(_) => return,
-    };
-    let current = match guest_agent::query_status(&endpoint, Duration::from_secs(1)) {
-        Ok(status) => status.packet_stats,
-        Err(_) => return,
-    };
-    let Some(current) = current else {
-        return;
-    };
-    if !guest_packet_path_progressed(&baseline, &current) {
-        return;
-    }
-
-    let was_ready = state
-        .gateway_readiness
-        .lock()
-        .map(|mut readiness| {
-            if readiness.guest_packet_path.is_ready() {
-                true
-            } else {
-                readiness.mark_guest_packet_path_ready();
-                false
-            }
-        })
-        .unwrap_or(true);
-    if was_ready {
-        return;
-    }
-
-    if let Ok(mut status) = state.status.lock() {
-        if status.mode.contains("gateway") {
-            status.state = "running".into();
-            status.gateway_packet_path_ready = true;
-            status.message = if status.module_proxy.is_some() {
-                "Mixed 入口与 Linux guest 局域网网关已启动；实体 LAN packet path 已验收；模块 MITM 已挂接".into()
-            } else {
-                "Mixed 入口与 Linux guest 局域网网关已启动；实体 LAN packet path 已验收".into()
-            };
-        }
-    }
-    emit_log(
-        app,
-        "info",
-        "Guest packet path 已验收：LAN 与 tun0 均观察到启动后的新增流量",
-    );
-}
-
 fn runtime_failure_with_cleanup(
     primary: String,
-    runtime: &mut gateway_runtime::GatewayRuntime,
+    mut runtime: gateway_runtime::GatewayRuntime,
+    state: &RuntimeState,
 ) -> String {
     match runtime.stop() {
         Ok(()) => primary,
-        Err(cleanup) => format!("{primary}；回收失败：{cleanup}"),
+        Err(cleanup) => {
+            if let Ok(mut slot) = state.gateway_runtime.lock() {
+                if slot.is_none() {
+                    *slot = Some(runtime);
+                    return format!(
+                        "{primary}；回收失败：{cleanup}；残留 Gateway 已登记，可再次停止"
+                    );
+                }
+            }
+            format!("{primary}；回收失败：{cleanup}；残留 Gateway 无法登记")
+        }
+    }
+}
+
+fn adopt_gateway_start_failure(
+    state: &RuntimeState,
+    failure: gateway_runtime::GatewayStartupFailure,
+) -> String {
+    let message = failure.message;
+    let Some(runtime) = failure.residual else {
+        return message;
+    };
+    match state.gateway_runtime.lock() {
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(runtime);
+            format!("{message}；残留 Gateway 已登记，可再次停止")
+        }
+        Ok(_) => format!("{message}；Gateway 所有权槽已被占用，无法登记残留 runtime"),
+        Err(_) => format!("{message}；Gateway 所有权锁不可用，无法登记残留 runtime"),
     }
 }
 
@@ -5644,15 +6374,6 @@ fn ensure_vmnet_launch_supported() -> Result<(), String> {
     Ok(())
 }
 
-fn vfkit_gateway_preflight_message(app: &AppHandle, settings: &RuntimeSettings) -> String {
-    let runtime_dir =
-        process_group::unique_runtime_dir(process_group::runtime_parent_dir(env::temp_dir()));
-    match build_vfkit_gateway_plan(app, settings, &runtime_dir) {
-        Ok(_) => "vfkit Gateway 启动计划有效；vmnet、vfkit 和 guest-agent readiness 将由 supervisor 在运行时检查；实体 LAN packet path 仍需手机/电脑现场验收".into(),
-        Err(error) => format!("vfkit Gateway 配置未就绪：{error}"),
-    }
-}
-
 #[tauri::command]
 fn get_runtime_settings(app: AppHandle) -> Result<RuntimeSettings, String> {
     load_settings(&app)
@@ -5664,7 +6385,7 @@ fn save_runtime_settings(
     state: State<'_, RuntimeState>,
     settings: RuntimeSettings,
 ) -> Result<RuntimeSettings, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存设置".into());
     }
     persist_settings(&app, &settings)
@@ -5675,7 +6396,7 @@ fn reset_runtime_settings(
     app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<RuntimeSettings, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再恢复默认设置".into());
     }
     persist_settings(&app, &RuntimeSettings::default())
@@ -5787,24 +6508,18 @@ fn gateway_guest_agent_endpoint(
 }
 
 #[tauri::command]
-fn get_gateway_guest_status(app: AppHandle) -> Result<guest_agent::GuestAgentStatus, String> {
-    let settings = load_settings(&app)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    guest_agent::query_status(&endpoint, Duration::from_secs(2))
-}
-
-#[tauri::command]
-fn sync_gateway_guest_config(
-    app: AppHandle,
-    config_path: String,
-) -> Result<guest_agent::GuestConfigResult, String> {
-    let settings = load_settings(&app)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    let config_path = config_path.trim();
-    if config_path.is_empty() {
-        return Err("guest sing-box 配置路径不能为空".into());
-    }
-    guest_agent::sync_config(&endpoint, Path::new(config_path), Duration::from_secs(30))
+async fn get_gateway_guest_status(app: AppHandle) -> Result<guest_agent::GuestAgentStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = load_settings(&app)?;
+        let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
+        // This command is called by the UI polling loop. Keep an unreachable
+        // guest from holding the Tauri main thread for seconds, while the
+        // blocking socket work itself runs on the async runtime's blocking
+        // pool.
+        guest_agent::query_status(&endpoint, Duration::from_millis(500))
+    })
+    .await
+    .map_err(|error| format!("guest agent 状态探测任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -5814,18 +6529,6 @@ fn generate_gateway_guest_config(app: AppHandle) -> Result<String, String> {
     let module_plan = write_module_runtime_plan(&app)?;
     write_gateway_guest_runtime_config(&app, &settings, &module_plan)
         .map(|path| path.display().to_string())
-}
-
-#[tauri::command]
-fn sync_gateway_guest_runtime_config(
-    app: AppHandle,
-) -> Result<guest_agent::GuestConfigResult, String> {
-    let settings = load_settings(&app)?;
-    validate_settings(&settings)?;
-    let endpoint = gateway_guest_agent_endpoint(&app, &settings)?;
-    let module_plan = write_module_runtime_plan(&app)?;
-    let path = write_gateway_guest_runtime_config(&app, &settings, &module_plan)?;
-    guest_agent::sync_config(&endpoint, &path, Duration::from_secs(30))
 }
 
 #[tauri::command]
@@ -5879,16 +6582,11 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = sing_box_exit {
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("sing-box 退出后的 Gateway 清理失败：{error}"),
-            );
-        }
         state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, message));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app, &state, message, cleanup,
+        ));
     }
 
     let mitm_exit = {
@@ -5908,16 +6606,11 @@ fn get_runtime_status(
         }
     };
     if let Some(message) = mitm_exit {
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("mitmdump 退出后的 Gateway 清理失败：{error}"),
-            );
-        }
         state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, message));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app, &state, message, cleanup,
+        ));
     }
 
     let gateway_supervisor_exit = {
@@ -5931,25 +6624,17 @@ fn get_runtime_status(
                 .map_err(|error| format!("检查 Gateway supervisor 失败：{error}"))?,
             None => false,
         };
-        if exited {
-            gateway_runtime.take();
-        }
         exited
     };
     if gateway_supervisor_exit {
-        if let Ok(mut readiness) = state.gateway_readiness.lock() {
-            readiness.mark_stopped();
-        }
-        if let Err(error) = stop_runtime_processes_locked(&app, &state) {
-            emit_log(
-                &app,
-                "error",
-                format!("vfkit Gateway supervisor 退出后的清理失败：{error}"),
-            );
-        }
         state.metrics_generation.fetch_add(1, Ordering::SeqCst);
-        mark_lifecycle_phase(&state, LifecyclePhase::Stopped);
-        return Ok(set_stopped(&state, "vfkit Gateway supervisor 已退出"));
+        let cleanup = stop_runtime_processes_locked(&app, &state);
+        return Ok(finalize_unexpected_runtime_exit(
+            &app,
+            &state,
+            "vfkit Gateway supervisor 已退出".into(),
+            cleanup,
+        ));
     }
 
     state
@@ -5965,7 +6650,7 @@ fn start_mix_direct(
     state: State<'_, RuntimeState>,
 ) -> Result<RuntimeStatus, String> {
     let settings = load_settings(&app)?;
-    if runtime_is_running(&state)? {
+    if runtime_phase_is_active(&state)? {
         return current_status(&state);
     }
     let Some(lifecycle_generation) = begin_lifecycle_start(&state)? else {
@@ -6004,23 +6689,8 @@ fn start_mix_direct(
                 let _ = complete_start_success(&worker_state, lifecycle_generation, next);
             }
             Err(error) => {
-                let should_report = worker_state
-                    .lifecycle_phase
-                    .lock()
-                    .map(|phase| *phase == LifecyclePhase::Starting)
-                    .unwrap_or(false);
-                if should_report {
-                    mark_lifecycle_phase(&worker_state, LifecyclePhase::Stopped);
-                    update_status(
-                        &worker_state,
-                        RuntimeStatus {
-                            state: "error".into(),
-                            message: error.clone(),
-                            ..RuntimeStatus::default()
-                        },
-                    );
-                    emit_log(&worker_app, "error", error);
-                }
+                let _ =
+                    finalize_start_failure(&worker_app, &worker_state, lifecycle_generation, error);
             }
         }
     });
@@ -6061,24 +6731,32 @@ fn start_mix_direct_transaction(
     if lifecycle_cancelled(state, lifecycle_generation) {
         return Err("启动已取消".into());
     }
-    if runtime_is_running(&state)? {
-        return current_status(state);
-    }
-
     let metrics_generation = Arc::clone(&state.metrics_generation);
     let metrics_generation_id = metrics_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
     let gateway_mode = settings.mode == "gateway";
     if gateway_mode {
         validate_settings(&settings)?;
-        emit_log(
-            &app,
-            "info",
-            vfkit_gateway_preflight_message(&app, &settings),
-        );
     }
-    let module_plan = write_module_runtime_plan(&app)?;
-    let config = write_runtime_config(&app, &settings, &module_plan)?;
+    let mut module_plan = write_module_runtime_plan(&app)?;
+    if module_plan_requires_mitm(&module_plan) {
+        let port = if gateway_mode {
+            // Gateway Module Engine is inside the Linux guest and is reached by
+            // guest sing-box over loopback. Do not probe/bind a host-only port.
+            DEFAULT_MODULE_PROXY_PORT
+        } else {
+            select_module_proxy_port(&settings)?
+        };
+        module_plan.proxy_port = Some(port);
+    }
+    persist_module_runtime_plan(&app, &module_plan)?;
+    // Gateway uses the guest data plane only; do not create a second host
+    // sing-box runtime configuration for a process that is never started.
+    let config = if gateway_mode {
+        None
+    } else {
+        Some(write_runtime_config(&app, &settings, &module_plan)?)
+    };
     let gateway_config = if gateway_mode {
         Some(write_gateway_guest_runtime_config(
             &app,
@@ -6088,6 +6766,11 @@ fn start_mix_direct_transaction(
     } else {
         None
     };
+    let config_display = gateway_config
+        .as_deref()
+        .or(config.as_deref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "SongsterX.conf".into());
     let plan_path = module_runtime_plan_path(&app)?;
     let binary = resolve_sing_box_binary(&app, &settings);
     if lifecycle_cancelled(state, lifecycle_generation) {
@@ -6097,6 +6780,8 @@ fn start_mix_direct_transaction(
         &state,
         RuntimeStatus {
             state: "starting".into(),
+            healthy: false,
+            can_stop: false,
             mode: if gateway_mode {
                 "lan-gateway no-dhcp"
             } else {
@@ -6121,12 +6806,9 @@ fn start_mix_direct_transaction(
             pid: None,
             module_proxy: None,
             message: if gateway_mode {
-                format!(
-                    "正在启动 Mixed + 局域网网关（无 DHCP）：{}",
-                    config.display()
-                )
+                format!("正在启动 Mixed + 局域网网关（无 DHCP）：{}", config_display)
             } else {
-                format!("正在启动 {}", config.display())
+                format!("正在启动 {}", config_display)
             },
         },
     );
@@ -6134,26 +6816,110 @@ fn start_mix_direct_transaction(
         &app,
         "info",
         if gateway_mode {
-            format!("启动 Mixed + 局域网网关（无 DHCP）：{}", config.display())
+            format!("启动 Mixed + 局域网网关（无 DHCP）：{}", config_display)
         } else {
-            format!("启动 mixed 直连：{}", config.display())
+            format!("启动 mixed 直连：{}", config_display)
         },
     );
 
-    let sing_box_endpoint = sing_box_probe_endpoint(&settings.listen, settings.port);
-    if let Err(error) = ensure_sing_box_listener_available(&settings.listen, settings.port) {
-        let message = format!("Mixed 入口启动失败：{error}");
-        update_status(
-            &state,
-            RuntimeStatus {
-                state: "error".into(),
-                message: message.clone(),
-                ..RuntimeStatus::default()
-            },
-        );
-        emit_log(&app, "error", message.clone());
-        return Err(message);
+    let metrics_session = metrics_session_for_runtime(&app, &settings);
+    if let Ok(mut current) = state.metrics_session.lock() {
+        *current = Some(metrics_session.clone());
     }
+    spawn_runtime_observers(
+        app.clone(),
+        metrics_generation.clone(),
+        metrics_generation_id,
+        metrics_session,
+    );
+
+    if !gateway_mode {
+        if let Err(error) = ensure_sing_box_listener_available(&settings.listen, settings.port) {
+            let message = format!("Mixed 入口启动失败：{error}");
+            update_start_error_status(&state, message.clone());
+            emit_log(&app, "error", message.clone());
+            return Err(message);
+        }
+    }
+
+    // Gateway is a single guest data plane. The host intentionally does not
+    // start either a second sing-box or a host mitmdump process.
+    if gateway_mode {
+        let startup_cancelled = || lifecycle_cancelled(state, lifecycle_generation);
+        if let Err(error) = start_gateway_runtime_supervisor(
+            &app,
+            &state,
+            &settings,
+            gateway_config
+                .as_deref()
+                .expect("gateway config is prepared for gateway mode"),
+            &plan_path,
+            &startup_cancelled,
+        ) {
+            update_start_error_status(&state, error.clone());
+            emit_log(&app, "error", error.clone());
+            return Err(error);
+        }
+        if lifecycle_cancelled(state, lifecycle_generation) {
+            let _ = stop_runtime_processes_locked(&app, state);
+            return Err("启动已取消".into());
+        }
+        let guest_status =
+            gateway_guest_agent_endpoint(&app, &settings)
+                .ok()
+                .and_then(|endpoint| {
+                    guest_agent::query_status(&endpoint, GATEWAY_AGENT_PROBE_TIMEOUT).ok()
+                });
+        let module_proxy = module_plan_requires_mitm(&module_plan)
+            .then(|| format!("VM 内 127.0.0.1:{}", module_proxy_port(&module_plan)));
+        let next = RuntimeStatus {
+            state: "running".into(),
+            healthy: true,
+            can_stop: true,
+            mode: "lan-gateway no-dhcp".into(),
+            listen: format!("{}:{}", settings.gateway_ip.trim(), settings.port),
+            dns: dns_status(&settings),
+            gateway_ip: Some(settings.gateway_ip.trim().to_string()),
+            gateway_dns_ip: Some(if settings.gateway_dns_ip.trim().is_empty() {
+                if settings.dns_mode == "fakeip" {
+                    "198.18.0.2".into()
+                } else {
+                    settings.gateway_ip.trim().into()
+                }
+            } else {
+                settings.gateway_dns_ip.trim().into()
+            }),
+            gateway_packet_path_ready: true,
+            pid: guest_status.as_ref().and_then(|status| status.pid),
+            module_proxy,
+            message: if module_plan_requires_mitm(&module_plan) {
+                "Linux VM 单数据面已运行：guest sing-box + guest mitmdump".into()
+            } else {
+                "Linux VM 单 sing-box 数据面已运行".into()
+            },
+        };
+        update_status(&state, next.clone());
+        emit_log(
+            &app,
+            "info",
+            format!(
+                "Gateway 已运行：LAN Mixed 监听 {}:{}，guest sing-box PID {}{}",
+                settings.gateway_ip.trim(),
+                settings.port,
+                next.pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "未知".into()),
+                if module_plan_requires_mitm(&module_plan) {
+                    "，guest mitmdump 已挂接"
+                } else {
+                    ""
+                }
+            ),
+        );
+        return Ok(next);
+    }
+
+    let sing_box_endpoint = sing_box_probe_endpoint(&settings.listen, settings.port);
 
     // Mixed and Gateway own different processes and sockets. Start their
     // independent bootstrap phases in parallel, then publish both only after
@@ -6171,12 +6937,20 @@ fn start_mix_direct_transaction(
                     &state,
                     &settings,
                     gateway_config,
+                    &plan_path,
                     &startup_cancelled,
                 )
             })
         });
         let local_task = scope.spawn(|| {
-            spawn_sing_box_process(&binary, &config, &sing_box_endpoint, &startup_cancelled)
+            spawn_sing_box_process(
+                &binary,
+                config
+                    .as_deref()
+                    .expect("host runtime config is prepared for mixed mode"),
+                &sing_box_endpoint,
+                &startup_cancelled,
+            )
         });
         let gateway_result = gateway_task.map(|task| match task.join() {
             Ok(result) => result,
@@ -6184,19 +6958,42 @@ fn start_mix_direct_transaction(
         });
         let local_result = match local_task.join() {
             Ok(result) => result,
-            Err(_) => Err("Mixed 启动线程异常退出".into()),
+            Err(_) => Err((None, "Mixed 启动线程异常退出".into())),
         };
         (gateway_result, local_result)
     });
 
     if lifecycle_cancelled(state, lifecycle_generation) {
+        let local_message = match local_result {
+            Ok(child) => match stop_unowned_child(child) {
+                Ok(()) => None,
+                Err((child, error)) => {
+                    if let Ok(mut slot) = state.child.lock() {
+                        *slot = Some(child);
+                    }
+                    Some(error)
+                }
+            },
+            Err(failure) => Some(adopt_unowned_child(state, failure)),
+        };
         let _ = stop_runtime_processes_locked(&app, state);
-        return Err("启动已取消".into());
+        return Err(match local_message {
+            Some(error) => format!("启动已取消；{error}"),
+            None => "启动已取消".into(),
+        });
     }
 
     let mut child = match (gateway_result, local_result) {
         (Some(Err(error)), Ok(child)) => {
-            let unowned_cleanup = stop_unowned_child(child).err();
+            let unowned_cleanup = match stop_unowned_child(child) {
+                Ok(()) => None,
+                Err((child, error)) => {
+                    if let Ok(mut slot) = state.child.lock() {
+                        *slot = Some(child);
+                    }
+                    Some(error)
+                }
+            };
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => match unowned_cleanup {
@@ -6210,19 +7007,12 @@ fn start_mix_direct_transaction(
                     None => error,
                 },
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Err(error)), Err(local_error)) => {
+            let local_error = adopt_unowned_child(&state, local_error);
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => {
@@ -6230,48 +7020,27 @@ fn start_mix_direct_transaction(
                 }
                 None => format!("{error}；Mixed 启动失败：{local_error}"),
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Ok(())), Err(error)) => {
+            let error = adopt_unowned_child(&state, error);
             let cleanup = stop_runtime_processes_locked(&app, &state).err();
             let message = match cleanup {
                 Some(cleanup) => format!("Mixed 入口启动失败：{error}；回收失败：{cleanup}"),
                 None => format!("Mixed 入口启动失败：{error}"),
             };
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    mode: "lan-gateway no-dhcp".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
         (Some(Ok(())), Ok(child)) => child,
         (None, Ok(child)) => child,
         (None, Err(error)) => {
+            let error = adopt_unowned_child(&state, error);
             let message = format!("Mixed 入口启动失败：{error}");
-            update_status(
-                &state,
-                RuntimeStatus {
-                    state: "error".into(),
-                    message: message.clone(),
-                    ..RuntimeStatus::default()
-                },
-            );
+            update_start_error_status(&state, message.clone());
             emit_log(&app, "error", message.clone());
             return Err(message);
         }
@@ -6288,11 +7057,21 @@ fn start_mix_direct_transaction(
     }
 
     if lifecycle_cancelled(state, lifecycle_generation) {
-        let unowned_cleanup = stop_unowned_child(child).err();
-        let _ = stop_runtime_processes_locked(&app, state);
-        return Err(match unowned_cleanup {
-            Some(error) => format!("启动已取消；{error}"),
-            None => "启动已取消".into(),
+        let unowned_cleanup = match stop_unowned_child(child) {
+            Ok(()) => None,
+            Err((child, error)) => {
+                if let Ok(mut slot) = state.child.lock() {
+                    *slot = Some(child);
+                }
+                Some(error)
+            }
+        };
+        let cleanup = stop_runtime_processes_locked(&app, state).err();
+        return Err(match (unowned_cleanup, cleanup) {
+            (Some(unowned), Some(cleanup)) => format!("启动已取消；{unowned}；回收失败：{cleanup}"),
+            (Some(unowned), None) => format!("启动已取消；{unowned}"),
+            (None, Some(cleanup)) => format!("启动已取消；回收失败：{cleanup}"),
+            (None, None) => "启动已取消".into(),
         });
     }
     *state
@@ -6300,36 +7079,59 @@ fn start_mix_direct_transaction(
         .lock()
         .map_err(|_| "运行时锁不可用".to_string())? = Some(child);
     let module_proxy = if module_plan_requires_mitm(&module_plan) {
-        let endpoint = module_proxy_endpoint(&settings);
-        match spawn_mitmproxy(&app, &plan_path, &settings) {
+        let port = module_proxy_port(&module_plan);
+        let endpoint = module_proxy_endpoint(&settings, port);
+        match spawn_mitmproxy(&app, &plan_path, &settings, port) {
             Ok(mut mitm_child) => {
                 if let Err(error) =
                     wait_for_mitmproxy(&mut mitm_child, &endpoint, &startup_cancelled)
                 {
-                    let _ = mitm_child.kill();
-                    let _ = mitm_child.wait();
+                    let unowned_cleanup = match stop_unowned_child(mitm_child) {
+                        Ok(()) => None,
+                        Err((mitm_child, error)) => {
+                            if let Ok(mut slot) = state.mitm_child.lock() {
+                                *slot = Some(mitm_child);
+                            }
+                            Some(error)
+                        }
+                    };
                     let message = format!("模块 MITM 引擎启动失败：{error}");
                     let message = match stop_runtime_processes_locked(&app, &state) {
-                        Ok(()) => message,
-                        Err(cleanup) => format!("{message}；回收失败：{cleanup}"),
-                    };
-                    update_status(
-                        &state,
-                        RuntimeStatus {
-                            state: "error".into(),
-                            message: message.clone(),
-                            ..RuntimeStatus::default()
+                        Ok(()) => match unowned_cleanup {
+                            Some(cleanup) => format!("{message}；模块引擎回收失败：{cleanup}"),
+                            None => message,
                         },
-                    );
+                        Err(cleanup) => {
+                            match unowned_cleanup {
+                                Some(unowned) => {
+                                    format!("{message}；模块引擎回收失败：{unowned}；回收失败：{cleanup}")
+                                }
+                                None => format!("{message}；回收失败：{cleanup}"),
+                            }
+                        }
+                    };
+                    update_start_error_status(&state, message.clone());
                     emit_log(&app, "error", message.clone());
                     return Err(message);
                 }
                 if lifecycle_cancelled(state, lifecycle_generation) {
-                    let cleanup = stop_unowned_child(mitm_child).err();
-                    let _ = stop_runtime_processes_locked(&app, state);
-                    return Err(match cleanup {
-                        Some(error) => format!("启动已取消；{error}"),
-                        None => "启动已取消".into(),
+                    let unowned_cleanup = match stop_unowned_child(mitm_child) {
+                        Ok(()) => None,
+                        Err((mitm_child, error)) => {
+                            if let Ok(mut slot) = state.mitm_child.lock() {
+                                *slot = Some(mitm_child);
+                            }
+                            Some(error)
+                        }
+                    };
+                    let cleanup = stop_runtime_processes_locked(&app, state).err();
+                    return Err(match (unowned_cleanup, cleanup) {
+                        (Some(unowned), Some(cleanup)) => {
+                            format!("启动已取消；{unowned}；回收失败：{cleanup}")
+                        }
+                        (Some(unowned), None) => format!("启动已取消；{unowned}"),
+                        (None, Some(cleanup)) => format!("启动已取消；回收失败：{cleanup}"),
+                        (None, None) => "启动已取消".into(),
                     });
                 }
                 let mitm_pid = mitm_child.id();
@@ -6349,7 +7151,7 @@ fn start_mix_direct_transaction(
                     &app,
                     "info",
                     format!(
-                        "Module Engine 已启动，mitmdump PID {}，监听 {}",
+                        "Module Engine 已启动，mitmdump PID {}，监听 {}；HTTPS 客户端需信任 SongsterX MITM 根证书，否则匹配域名会连接失败",
                         mitm_pid, endpoint
                     ),
                 );
@@ -6361,14 +7163,7 @@ fn start_mix_direct_transaction(
                     Ok(()) => message,
                     Err(cleanup) => format!("{message}；回收失败：{cleanup}"),
                 };
-                update_status(
-                    &state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: message.clone(),
-                        ..RuntimeStatus::default()
-                    },
-                );
+                update_start_error_status(&state, message.clone());
                 emit_log(&app, "error", message.clone());
                 return Err(message);
             }
@@ -6381,14 +7176,20 @@ fn start_mix_direct_transaction(
         return Err("启动已取消".into());
     }
     let next = RuntimeStatus {
-        state: if gateway_mode { "starting" } else { "running" }.into(),
+        state: "running".into(),
+        healthy: true,
+        can_stop: true,
         mode: if gateway_mode {
             "lan-gateway no-dhcp"
         } else {
             "mixed direct"
         }
         .into(),
-        listen: format!("{}:{}", settings.listen.trim(), settings.port),
+        listen: if gateway_mode {
+            format!("{}:{}", settings.gateway_ip.trim(), settings.port)
+        } else {
+            format!("{}:{}", settings.listen.trim(), settings.port)
+        },
         dns: dns_status(&settings),
         gateway_ip: gateway_mode.then(|| settings.gateway_ip.trim().to_string()),
         gateway_dns_ip: gateway_mode.then(|| {
@@ -6402,14 +7203,14 @@ fn start_mix_direct_transaction(
                 settings.gateway_dns_ip.trim().into()
             }
         }),
-        gateway_packet_path_ready: false,
+        gateway_packet_path_ready: gateway_mode,
         pid: Some(pid),
         module_proxy: module_proxy.clone(),
         message: if gateway_mode {
             if module_proxy.is_some() {
-                "Mixed 入口已启动，等待真实 LAN packet path 验收；模块 MITM 已挂接".into()
+                "Mixed 入口已运行；模块 MITM 已挂接".into()
             } else {
-                "Mixed 入口已启动，等待真实 LAN packet path 验收".into()
+                "Mixed 入口已运行".into()
             }
         } else if module_proxy.is_some() {
             "mixed 监听已启动；模块 MITM 已挂接到统一入口；不会自动接管流量".into()
@@ -6433,12 +7234,6 @@ fn start_mix_direct_transaction(
             }
         ),
     );
-    spawn_system_connection_sampler(
-        app.clone(),
-        Arc::clone(&metrics_generation),
-        metrics_generation_id,
-    );
-    spawn_metrics_poller(app.clone(), metrics_generation, metrics_generation_id);
     Ok(next)
 }
 
@@ -6517,78 +7312,128 @@ fn forward_output<R: std::io::Read>(app: AppHandle, output: R, fallback_level: &
     }
 }
 
-fn fetch_metrics(app: &AppHandle) -> Option<RuntimeMetrics> {
-    let body = ureq::get(&format!("http://{CLASH_API_ADDR}/connections"))
+fn fetch_metrics(_app: &AppHandle, session: &MetricsSession) -> Option<RuntimeMetrics> {
+    let mut metrics = RuntimeMetrics {
+        upload_total: 0,
+        download_total: 0,
+        active_connections: 0,
+        memory: 0,
+        connections: Vec::new(),
+        host_snapshot_valid: false,
+        host_snapshot_error: Some("Host Clash API 尚未返回连接快照".into()),
+        guest_snapshot_valid: !session.guest_required,
+        guest_snapshot_error: session.guest_error.clone(),
+        // Activity/metrics only expose connections reported by SongsterX's
+        // Host sing-box or Gateway guest. macOS lsof snapshots are not merged
+        // here because they also contain applications that bypass SongsterX.
+        system_snapshot_valid: true,
+        system_snapshot_error: None,
+    };
+
+    match ureq::get(&format!("http://{CLASH_API_ADDR}/connections"))
         .timeout(std::time::Duration::from_secs(2))
         .call()
-        .ok()?
-        .into_string()
-        .ok()?;
-    let host_value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let mut metrics = runtime_metrics_from_clash_value(&host_value, "host");
+    {
+        Ok(response) => match response.into_string() {
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(host_value) => {
+                    let host = runtime_metrics_from_clash_value(&host_value, "host");
+                    merge_runtime_metrics_snapshot(&mut metrics, host, "host");
+                    metrics.host_snapshot_valid = true;
+                    metrics.host_snapshot_error = None;
+                }
+                Err(error) => {
+                    metrics.host_snapshot_error =
+                        Some(format!("Host Clash API 返回了无法解析的连接快照：{error}"));
+                }
+            },
+            Err(error) => {
+                metrics.host_snapshot_error =
+                    Some(format!("读取 Host Clash API 响应失败：{error}"));
+            }
+        },
+        Err(error) => {
+            metrics.host_snapshot_error = Some(format!("Host Clash API 请求失败：{error}"));
+        }
+    }
 
-    let settings = load_settings(app).ok();
-    if let Some(settings) = settings.as_ref() {
-        if settings.mode == "gateway" {
-            if let Ok(endpoint) = gateway_guest_agent_endpoint(app, settings) {
-                if let Ok(guest_value) =
-                    guest_agent::query_connections(&endpoint, Duration::from_secs(1))
-                {
+    if session.guest_required {
+        if let Some(endpoint) = session.guest_endpoint.as_ref() {
+            match guest_agent::query_connections(&endpoint, Duration::from_secs(1)) {
+                Ok(guest_value) => {
                     let guest = runtime_metrics_from_clash_value(&guest_value, "guest");
-                    metrics.upload_total = metrics.upload_total.saturating_add(guest.upload_total);
-                    metrics.download_total =
-                        metrics.download_total.saturating_add(guest.download_total);
-                    metrics.memory = metrics.memory.saturating_add(guest.memory);
-                    metrics.connections.extend(guest.connections);
-                    metrics.active_connections = metrics.connections.len();
+                    merge_runtime_metrics_snapshot(&mut metrics, guest, "guest");
+                }
+                Err(error) => {
+                    metrics.guest_snapshot_valid = false;
+                    metrics.guest_snapshot_error = Some(error.to_string());
                 }
             }
         }
     }
 
-    // sing-box 的 Clash API 只能看到进入 sing-box 的连接。macOS 的 lsof
-    // 快照补充记录绕过代理的已建立 TCP/已连接 UDP 元数据，并明确标记为
-    // system，避免误认为它们经过了 sing-box。不会读取数据包内容。采样
-    // 在独立线程完成，这里只读取最近一次快照，不阻塞 Clash API。
-    if let Ok(sample) = app.state::<RuntimeState>().system_connections.lock() {
-        metrics.connections.extend(sample.connections.clone());
-        metrics.system_snapshot_valid = sample.valid;
-        metrics.system_snapshot_error = sample.error.clone();
-    }
     metrics.active_connections = metrics.connections.len();
 
     Some(metrics)
 }
 
+#[allow(dead_code)]
 fn managed_system_endpoints(
-    app: &AppHandle,
     settings: Option<&RuntimeSettings>,
+    module_proxy_port: Option<u16>,
 ) -> Vec<ManagedSystemEndpoint> {
     let mut endpoints = settings
         .filter(|value| !value.listen.trim().is_empty())
-        .map(|value| ManagedSystemEndpoint {
-            host: value.listen.trim().to_string(),
-            port: value.port,
-            wildcard_host: matches!(value.listen.trim(), "0.0.0.0" | "::" | "*"),
+        .map(|value| {
+            let host = value.listen.trim();
+            ManagedSystemEndpoint {
+                host: host.to_string(),
+                port: value.port,
+                wildcard_host: matches!(host, "0.0.0.0" | "::" | "*"),
+                family: if host == "*" {
+                    ManagedAddressFamily::Any
+                } else {
+                    managed_address_family(host)
+                },
+            }
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let module_proxy_active = app
-        .state::<RuntimeState>()
-        .status
-        .lock()
-        .map(|status| status.module_proxy.is_some())
-        .unwrap_or(false);
-    if module_proxy_active {
+    if let Some(module_proxy_port) = module_proxy_port {
         if let Some(settings) = settings {
+            let host = module_proxy_host(settings);
             endpoints.push(ManagedSystemEndpoint {
-                host: module_proxy_host(settings),
-                port: MODULE_PROXY_PORT,
+                family: managed_address_family(&host),
+                host,
+                port: module_proxy_port,
                 wildcard_host: false,
             });
         }
     }
     endpoints
+}
+
+fn metrics_session_for_runtime(app: &AppHandle, settings: &RuntimeSettings) -> MetricsSession {
+    if settings.mode != "gateway" {
+        return MetricsSession {
+            guest_endpoint: None,
+            guest_required: false,
+            guest_error: None,
+        };
+    }
+
+    match gateway_guest_agent_endpoint(app, settings) {
+        Ok(endpoint) => MetricsSession {
+            guest_endpoint: Some(endpoint),
+            guest_required: true,
+            guest_error: None,
+        },
+        Err(error) => MetricsSession {
+            guest_endpoint: None,
+            guest_required: true,
+            guest_error: Some(error),
+        },
+    }
 }
 
 fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) -> RuntimeMetrics {
@@ -6634,6 +7479,7 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
                         process: String::new(),
                         pid: None,
                         state: "active".into(),
+                        system_socket_key: None,
                     }
                 })
                 .collect()
@@ -6646,9 +7492,38 @@ fn runtime_metrics_from_clash_value(value: &serde_json::Value, runtime: &str) ->
         active_connections: connections.len(),
         memory,
         connections,
+        host_snapshot_valid: runtime == "host",
+        host_snapshot_error: None,
+        guest_snapshot_valid: true,
+        guest_snapshot_error: None,
         system_snapshot_valid: false,
         system_snapshot_error: None,
     }
+}
+
+fn merge_runtime_metrics_snapshot(
+    target: &mut RuntimeMetrics,
+    snapshot: RuntimeMetrics,
+    runtime: &str,
+) {
+    if runtime == "host" {
+        target.upload_total = snapshot.upload_total;
+        target.download_total = snapshot.download_total;
+        target.memory = snapshot.memory;
+        target.connections = snapshot.connections;
+        target.host_snapshot_valid = snapshot.host_snapshot_valid;
+        target.host_snapshot_error = snapshot.host_snapshot_error;
+    } else if runtime == "guest" {
+        target.upload_total = target.upload_total.saturating_add(snapshot.upload_total);
+        target.download_total = target
+            .download_total
+            .saturating_add(snapshot.download_total);
+        target.memory = target.memory.saturating_add(snapshot.memory);
+        target.connections.extend(snapshot.connections);
+        target.guest_snapshot_valid = snapshot.guest_snapshot_valid;
+        target.guest_snapshot_error = snapshot.guest_snapshot_error;
+    }
+    target.active_connections = target.connections.len();
 }
 
 fn split_system_endpoint(value: &str) -> (String, String) {
@@ -6664,7 +7539,14 @@ fn split_system_endpoint(value: &str) -> (String, String) {
         .unwrap_or_else(|| (value.to_string(), String::new()))
 }
 
-fn system_connection_id(
+fn system_connection_id(socket_key: &str, instance_generation: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(socket_key.as_bytes());
+    digest.update(instance_generation.to_be_bytes());
+    format!("system:{:x}", digest.finalize())
+}
+
+fn system_connection_socket_key(
     process: &str,
     pid: u32,
     network: &str,
@@ -6677,28 +7559,25 @@ fn system_connection_id(
     digest.update(network.as_bytes());
     digest.update(source.as_bytes());
     digest.update(destination.as_bytes());
-    format!("system:{:x}", digest.finalize())
+    format!("system-socket:{:x}", digest.finalize())
 }
 
-fn system_connection_from_lsof_line(
-    line: &str,
+fn system_connection_from_socket(
     timestamp: &str,
     process: &str,
     pid: u32,
+    socket_kind: &str,
+    socket: &str,
+    state: &str,
 ) -> Option<ConnectionInfo> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 9 || fields.first().copied() == Some("COMMAND") {
-        return None;
-    }
-    let socket_kind = fields.get(7)?.to_ascii_lowercase();
+    let socket_kind = socket_kind.to_ascii_lowercase();
     if socket_kind != "tcp" && socket_kind != "udp" {
         return None;
     }
-    let socket = fields[8..].join(" ");
     let socket_without_state = socket
         .split_once(" (")
         .map(|(value, _)| value)
-        .unwrap_or(socket.as_str());
+        .unwrap_or(socket);
     let (source, destination) = socket_without_state.split_once("->")?;
     let source = source.trim();
     let destination = destination.trim();
@@ -6709,19 +7588,21 @@ fn system_connection_from_lsof_line(
     if host.is_empty() || host == "?" || host == "*" {
         return None;
     }
-    let state = socket
-        .split_once(" (")
-        .and_then(|(_, value)| value.strip_suffix(')'))
-        .unwrap_or(if socket_kind == "udp" {
+    let state = if state.is_empty() {
+        if socket_kind == "udp" {
             "CONNECTED"
         } else {
             "UNKNOWN"
-        });
+        }
+    } else {
+        state
+    };
     if socket_kind == "tcp" && state != "ESTABLISHED" {
         return None;
     }
+    let socket_key = system_connection_socket_key(process, pid, &socket_kind, source, destination);
     Some(ConnectionInfo {
-        id: system_connection_id(process, pid, &socket_kind, source, destination),
+        id: socket_key.clone(),
         runtime: "system".into(),
         source: source.into(),
         destination: destination.into(),
@@ -6734,7 +7615,28 @@ fn system_connection_from_lsof_line(
         process: process.into(),
         pid: Some(pid),
         state: state.into(),
+        system_socket_key: Some(socket_key),
     })
+}
+
+#[cfg(test)]
+fn system_connection_from_lsof_line(
+    line: &str,
+    timestamp: &str,
+    process: &str,
+    pid: u32,
+) -> Option<ConnectionInfo> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 9 || fields.first().copied() == Some("COMMAND") {
+        return None;
+    }
+    let socket_kind = fields.get(7)?.to_ascii_lowercase();
+    let socket = fields[8..].join(" ");
+    let state = socket
+        .split_once(" (")
+        .and_then(|(_, value)| value.strip_suffix(')'))
+        .unwrap_or("");
+    system_connection_from_socket(timestamp, process, pid, &socket_kind, &socket, state)
 }
 
 #[derive(Clone)]
@@ -6742,6 +7644,41 @@ struct ManagedSystemEndpoint {
     host: String,
     port: u16,
     wildcard_host: bool,
+    family: ManagedAddressFamily,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedAddressFamily {
+    Any,
+    V4,
+    V6,
+}
+
+fn managed_address_family(host: &str) -> ManagedAddressFamily {
+    match host.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => ManagedAddressFamily::V4,
+        Ok(IpAddr::V6(_)) => ManagedAddressFamily::V6,
+        Err(_) => ManagedAddressFamily::Any,
+    }
+}
+
+fn managed_address_family_matches(expected: ManagedAddressFamily, actual: &str) -> bool {
+    let Ok(actual) = actual.parse::<IpAddr>() else {
+        return true;
+    };
+    match (expected, actual) {
+        (ManagedAddressFamily::Any, _) => true,
+        (ManagedAddressFamily::V4, IpAddr::V4(_)) => true,
+        (ManagedAddressFamily::V6, IpAddr::V6(_)) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct MetricsSession {
+    guest_endpoint: Option<guest_agent::GuestAgentEndpoint>,
+    guest_required: bool,
+    guest_error: Option<String>,
 }
 
 fn normalize_endpoint_host(value: &str) -> String {
@@ -6753,17 +7690,30 @@ fn is_loopback_endpoint_host(value: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
+fn endpoint_host_matches(expected: &str, actual: &str) -> bool {
+    let expected = normalize_endpoint_host(expected);
+    let actual = normalize_endpoint_host(actual);
+    if expected == "localhost" {
+        return actual == "localhost" || actual == "127.0.0.1" || actual == "::1";
+    }
+    expected == actual
+}
+
 fn is_managed_local_destination(
     destination: &str,
     managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
 ) -> bool {
     let (host, port) = split_system_endpoint(destination);
     let normalized_host = normalize_endpoint_host(&host);
     managed_endpoints.iter().any(|endpoint| {
         endpoint.port == port.parse::<u16>().unwrap_or_default()
-            && ((endpoint.wildcard_host && is_loopback_endpoint_host(&normalized_host))
+            && managed_address_family_matches(endpoint.family, &normalized_host)
+            && ((endpoint.wildcard_host
+                && (is_loopback_endpoint_host(&normalized_host)
+                    || local_addresses.contains(&normalized_host)))
                 || (!endpoint.wildcard_host
-                    && normalize_endpoint_host(&endpoint.host) == normalized_host))
+                    && endpoint_host_matches(&endpoint.host, &normalized_host)))
     })
 }
 
@@ -6780,44 +7730,191 @@ fn is_managed_network_process(process: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> SystemConnectionSample {
-    let output = match Command::new("/usr/sbin/lsof")
-        .args(["-nP", "+c0", "-iTCP", "-iUDP"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            return SystemConnectionSample {
-                connections: Vec::new(),
-                valid: false,
-                error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+#[allow(dead_code)]
+fn local_interface_addresses() -> HashSet<String> {
+    let mut addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
+    let mut ifaddrs = ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
+        return addresses;
+    }
+    let mut current = ifaddrs;
+    while !current.is_null() {
+        let interface = unsafe { &*current };
+        if !interface.ifa_addr.is_null() {
+            let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
+            let address = unsafe {
+                match family {
+                    libc::AF_INET => {
+                        let sockaddr = &*(interface.ifa_addr as *const libc::sockaddr_in);
+                        Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            sockaddr.sin_addr.s_addr,
+                        ))))
+                    }
+                    libc::AF_INET6 => {
+                        let sockaddr = &*(interface.ifa_addr as *const libc::sockaddr_in6);
+                        Some(IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr)))
+                    }
+                    _ => None,
+                }
             };
+            if let Some(address) = address {
+                addresses.insert(address.to_string().to_ascii_lowercase());
+            }
         }
-        Err(error) => {
-            return SystemConnectionSample {
-                connections: Vec::new(),
-                valid: false,
-                error: Some(error.to_string()),
-            };
-        }
+        current = unsafe { (*current).ifa_next };
+    }
+    unsafe { libc::freeifaddrs(ifaddrs) };
+    addresses
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+fn local_interface_addresses() -> HashSet<String> {
+    HashSet::from(["127.0.0.1".into(), "::1".into()])
+}
+
+#[derive(Default)]
+struct LsofFileRecord {
+    socket: Option<String>,
+    state: String,
+}
+
+fn append_lsof_file_record(
+    file: &mut LsofFileRecord,
+    process: &str,
+    pid: u32,
+    network: &str,
+    timestamp: &str,
+    managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
+    connections: &mut Vec<ConnectionInfo>,
+) {
+    let Some(socket) = file.socket.take() else {
+        file.state.clear();
+        return;
     };
+    if let Some(connection) =
+        system_connection_from_socket(timestamp, process, pid, network, &socket, &file.state)
+    {
+        if !is_managed_network_process(process)
+            && !is_managed_local_destination(
+                &connection.destination,
+                managed_endpoints,
+                local_addresses,
+            )
+        {
+            connections.push(connection);
+        }
+    }
+    file.state.clear();
+}
+
+fn parse_lsof_machine_output(
+    output: &str,
+    network: &str,
+    timestamp: &str,
+    managed_endpoints: &[ManagedSystemEndpoint],
+    local_addresses: &HashSet<String>,
+) -> Vec<ConnectionInfo> {
+    let mut process = String::new();
+    let mut pid = 0;
+    let mut file = LsofFileRecord::default();
+    let mut connections = Vec::new();
+
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let (field, value) = line.split_at(1);
+        match field {
+            "p" => {
+                append_lsof_file_record(
+                    &mut file,
+                    &process,
+                    pid,
+                    network,
+                    timestamp,
+                    managed_endpoints,
+                    local_addresses,
+                    &mut connections,
+                );
+                process.clear();
+                process.push_str(value);
+                pid = value.parse().unwrap_or_default();
+            }
+            "c" => process = value.to_string(),
+            "f" => append_lsof_file_record(
+                &mut file,
+                &process,
+                pid,
+                network,
+                timestamp,
+                managed_endpoints,
+                local_addresses,
+                &mut connections,
+            ),
+            "n" => file.socket = Some(value.to_string()),
+            "T" if value.starts_with("ST=") => file.state = value[3..].to_string(),
+            _ => {}
+        }
+    }
+    append_lsof_file_record(
+        &mut file,
+        &process,
+        pid,
+        network,
+        timestamp,
+        managed_endpoints,
+        local_addresses,
+        &mut connections,
+    );
+    connections
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> SystemConnectionSample {
     let (timestamp, _) = now_timestamp();
-    let connections = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let process = fields.first().copied()?;
-            let pid = fields.get(1)?.parse::<u32>().ok()?;
-            if is_managed_network_process(process) {
-                return None;
+    let local_addresses = local_interface_addresses();
+    let mut connections = Vec::new();
+    for (flag, network) in [("-iTCP", "tcp"), ("-iUDP", "udp")] {
+        let output = match Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-FpcfnT", flag])
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output)
+                if output.status.code() == Some(1)
+                    && output.stdout.is_empty()
+                    && output.stderr.is_empty() =>
+            {
+                continue;
             }
-            let connection = system_connection_from_lsof_line(line, &timestamp, process, pid)?;
-            if is_managed_local_destination(&connection.destination, managed_endpoints) {
-                return None;
+            Ok(output) => {
+                let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return SystemConnectionSample {
+                    connections: Vec::new(),
+                    valid: false,
+                    error: Some(if error.is_empty() {
+                        format!("lsof {network} 退出码 {:?}", output.status.code())
+                    } else {
+                        error
+                    }),
+                };
             }
-            Some(connection)
-        })
-        .collect();
+            Err(error) => {
+                return SystemConnectionSample {
+                    connections: Vec::new(),
+                    valid: false,
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+        connections.extend(parse_lsof_machine_output(
+            &String::from_utf8_lossy(&output.stdout),
+            network,
+            &timestamp,
+            managed_endpoints,
+            &local_addresses,
+        ));
+    }
     SystemConnectionSample {
         connections,
         valid: true,
@@ -6826,6 +7923,7 @@ fn fetch_system_connections(managed_endpoints: &[ManagedSystemEndpoint]) -> Syst
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn fetch_system_connections(
     _managed_endpoints: &[ManagedSystemEndpoint],
 ) -> SystemConnectionSample {
@@ -6836,31 +7934,121 @@ fn fetch_system_connections(
     }
 }
 
-fn spawn_system_connection_sampler(app: AppHandle, generation: Arc<AtomicU64>, expected: u64) {
-    thread::spawn(move || loop {
-        if generation.load(Ordering::SeqCst) != expected {
-            break;
+fn assign_system_connection_instances(
+    mut sample: SystemConnectionSample,
+    identities: &mut SystemConnectionIdentityState,
+) -> SystemConnectionSample {
+    if !sample.valid {
+        return sample;
+    }
+    let mut next_instances = HashMap::new();
+    let mut seen_socket_keys = HashSet::new();
+    let mut connections = Vec::with_capacity(sample.connections.len());
+    for mut connection in sample.connections {
+        let Some(socket_key) = connection.system_socket_key.clone() else {
+            connections.push(connection);
+            continue;
+        };
+        if !seen_socket_keys.insert(socket_key.clone()) {
+            continue;
         }
-        let settings = load_settings(&app).ok();
-        let sample = fetch_system_connections(&managed_system_endpoints(&app, settings.as_ref()));
-        if let Ok(mut current) = app.state::<RuntimeState>().system_connections.lock() {
-            *current = sample;
+        let instance_id = identities
+            .active_instances
+            .get(&socket_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                identities.next_generation = identities.next_generation.saturating_add(1);
+                system_connection_id(&socket_key, identities.next_generation)
+            });
+        next_instances.insert(socket_key, instance_id.clone());
+        connection.id = instance_id;
+        connections.push(connection);
+    }
+    identities.active_instances = next_instances;
+    sample.connections = connections;
+    sample
+}
+
+#[allow(dead_code)]
+fn spawn_system_connection_sampler(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    managed_endpoints: Vec<ManagedSystemEndpoint>,
+) {
+    thread::spawn(move || {
+        let mut identities = SystemConnectionIdentityState::default();
+        loop {
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
+            let sample = fetch_system_connections(&managed_endpoints);
+            let sample = assign_system_connection_instances(sample, &mut identities);
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
+            if let Ok(mut current) = app.state::<RuntimeState>().system_connections.lock() {
+                if generation.load(Ordering::SeqCst) == expected {
+                    *current = sample;
+                } else {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
         }
-        thread::sleep(Duration::from_secs(1));
     });
 }
 
-fn spawn_metrics_poller(app: AppHandle, generation: Arc<AtomicU64>, expected: u64) {
+fn spawn_runtime_observers(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    session: MetricsSession,
+) {
+    spawn_metrics_poller(app, generation, expected, session);
+}
+
+fn spawn_metrics_poller(
+    app: AppHandle,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    session: MetricsSession,
+) {
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(1));
         if generation.load(Ordering::SeqCst) != expected {
             break;
         }
-        if let Some(metrics) = fetch_metrics(&app) {
+        let metrics = fetch_metrics(&app, &session);
+        if generation.load(Ordering::SeqCst) != expected {
+            break;
+        }
+        if let Some(metrics) = metrics {
+            let state = app.state::<RuntimeState>();
+            let _transition = lock_gateway_transition(&state);
+            if generation.load(Ordering::SeqCst) != expected {
+                break;
+            }
             let _ = app.emit("runtime-metrics", metrics);
         }
-        observe_gateway_packet_path(&app);
+        if generation.load(Ordering::SeqCst) != expected {
+            break;
+        }
     });
+}
+
+fn restart_runtime_observers(app: &AppHandle, state: &RuntimeState) {
+    let session = state
+        .metrics_session
+        .lock()
+        .ok()
+        .and_then(|current| current.clone());
+    let Some(session) = session else {
+        return;
+    };
+    let generation = Arc::clone(&state.metrics_generation);
+    let expected = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    spawn_runtime_observers(app.clone(), generation, expected, session);
 }
 
 #[tauri::command]
@@ -6880,6 +8068,8 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
     state.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
     let mut stopping = current_status(&state)?;
     stopping.state = "stopping".into();
+    stopping.healthy = false;
+    stopping.can_stop = runtime_owns_resources(&state);
     stopping.message = "正在停止运行时".into();
     update_status(&state, stopping.clone());
 
@@ -6904,14 +8094,14 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                         LifecyclePhase::Stopped
                     },
                 );
+                let current = current_status(&worker_state).unwrap_or_default();
                 update_status(
                     &worker_state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: error.clone(),
-                        ..RuntimeStatus::default()
-                    },
+                    status_after_stop_failure(current, resources_owned, error.clone()),
                 );
+                if resources_owned {
+                    restart_runtime_observers(&worker_app, &worker_state);
+                }
                 emit_log(&worker_app, "error", error);
             }
             Err(_) => {
@@ -6929,14 +8119,14 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
                 } else {
                     "停止 worker 异常退出，已确认没有运行时资源".to_string()
                 };
+                let current = current_status(&worker_state).unwrap_or_default();
                 update_status(
                     &worker_state,
-                    RuntimeStatus {
-                        state: "error".into(),
-                        message: error.clone(),
-                        ..RuntimeStatus::default()
-                    },
+                    status_after_stop_failure(current, resources_owned, error.clone()),
                 );
+                if resources_owned {
+                    restart_runtime_observers(&worker_app, &worker_state);
+                }
                 emit_log(&worker_app, "error", error);
             }
         }
@@ -6947,22 +8137,31 @@ fn stop_runtime(app: AppHandle, state: State<'_, RuntimeState>) -> Result<Runtim
 fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
     state.metrics_generation.fetch_add(1, Ordering::SeqCst);
     let _gateway_transition = lock_gateway_transition(state);
-    let guest_endpoint = match load_settings(app) {
-        Ok(settings) if settings.mode == "gateway" => {
-            match gateway_guest_agent_endpoint(app, &settings) {
-                Ok(endpoint) => Some(endpoint),
-                Err(error) => {
-                    emit_log(
-                        app,
-                        "warn",
-                        format!("无法发送 guest-agent 停止提示：{error}"),
-                    );
-                    None
+    let guest_endpoint = state
+        .metrics_session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .as_ref()
+                .and_then(|current| current.guest_endpoint.clone())
+        })
+        .or_else(|| match load_settings(app) {
+            Ok(settings) if settings.mode == "gateway" => {
+                match gateway_guest_agent_endpoint(app, &settings) {
+                    Ok(endpoint) => Some(endpoint),
+                    Err(error) => {
+                        emit_log(
+                            app,
+                            "warn",
+                            format!("无法发送 guest-agent 停止提示：{error}"),
+                        );
+                        None
+                    }
                 }
             }
-        }
-        _ => None,
-    };
+            _ => None,
+        });
     if let Some(endpoint) = guest_endpoint {
         let guest_app = app.clone();
         thread::spawn(move || {
@@ -6976,13 +8175,43 @@ fn stop_runtime_processes(app: &AppHandle, state: &RuntimeState) -> Result<(), S
             }
         });
     }
-    stop_runtime_processes_locked(app, state)
+    let result = stop_runtime_processes_locked(app, state);
+    if result.is_ok() || !runtime_owns_resources(state) {
+        if let Ok(mut session) = state.metrics_session.lock() {
+            *session = None;
+        }
+    }
+    result
+}
+
+/// Dock quit is different from the in-app Stop button: Tauri will otherwise
+/// tear down the event loop as soon as ExitRequested is delivered. Keep the
+/// process alive while the owned Gateway graph is being reaped, and retry a
+/// failed teardown while the ownership slot still contains a runtime.
+fn stop_runtime_processes_for_exit(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    let mut last_error = None;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match stop_runtime_processes(app, state) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!("退出时停止运行时失败（第 {} 次）：{}", attempt + 1, error);
+                last_error = Some(error);
+                if !runtime_owns_resources(state) {
+                    return Ok(());
+                }
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "退出时停止运行时失败".into()))
 }
 
 fn stop_runtime_processes_locked(app: &AppHandle, state: &RuntimeState) -> Result<(), String> {
-    if let Ok(mut baseline) = state.gateway_packet_baseline.lock() {
-        *baseline = None;
-    }
     if let Ok(mut sample) = state.system_connections.lock() {
         *sample = SystemConnectionSample::default();
     }
@@ -7109,22 +8338,19 @@ fn get_config_documents(app: AppHandle) -> Result<Vec<ConfigDocument>, String> {
     let settings = load_settings(&app)?;
     let module_plan = load_module_runtime_plan(&app)?;
     let songsterx_path = songsterx_config_path(&app)?;
-    let runtime_path = runtime_config_path(&app)?;
     let songsterx_config = ensure_songsterx_config(&app)?;
-    let sing_box_config = if runtime_path.is_file() {
-        fs::read_to_string(&runtime_path).map_err(|error| {
-            format!("无法读取 sing-box 配置 {}：{error}", runtime_path.display())
-        })?
+    let runtime_path = if settings.mode == "gateway" {
+        write_gateway_guest_runtime_config(&app, &settings, &module_plan)?
     } else {
-        write_runtime_config(&app, &settings, &module_plan)?;
-        fs::read_to_string(&runtime_path).map_err(|error| {
-            format!(
-                "无法读取生成的 sing-box 配置 {}：{error}",
-                runtime_path.display()
-            )
-        })?
+        write_runtime_config(&app, &settings, &module_plan)?
     };
-    let mut documents = vec![
+    let runtime_config = fs::read_to_string(&runtime_path).map_err(|error| {
+        format!(
+            "无法读取 sing-box 运行配置 {}：{error}",
+            runtime_path.display()
+        )
+    })?;
+    Ok(vec![
         ConfigDocument {
             id: "songsterx-config".into(),
             title: "用户配置 · SongsterX.conf".into(),
@@ -7133,27 +8359,11 @@ fn get_config_documents(app: AppHandle) -> Result<Vec<ConfigDocument>, String> {
         },
         ConfigDocument {
             id: "sing-box-runtime".into(),
-            title: "运行时 JSON · sing-box".into(),
+            title: "运行时 · sing-box".into(),
             path: runtime_path.display().to_string(),
-            content: sing_box_config,
+            content: runtime_config,
         },
-    ];
-    if settings.mode == "gateway" {
-        let gateway_path = write_gateway_guest_runtime_config(&app, &settings, &module_plan)?;
-        let gateway_config = fs::read_to_string(&gateway_path).map_err(|error| {
-            format!(
-                "无法读取 Gateway guest sing-box 配置 {}：{error}",
-                gateway_path.display()
-            )
-        })?;
-        documents.push(ConfigDocument {
-            id: "sing-box-gateway-guest".into(),
-            title: "Gateway guest JSON · sing-box".into(),
-            path: gateway_path.display().to_string(),
-            content: gateway_config,
-        });
-    }
-    Ok(documents)
+    ])
 }
 
 #[tauri::command]
@@ -7161,7 +8371,7 @@ fn reload_songsterx_config(
     app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<ConfigReloadResult, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再从 SongsterX.conf 重载配置".into());
     }
     let path = songsterx_config_path(&app)?;
@@ -7186,12 +8396,84 @@ fn get_modules(app: AppHandle) -> Result<Vec<ModuleInfo>, String> {
 }
 
 #[tauri::command]
+fn get_mitm_certificate_info(app: AppHandle) -> Result<MitmCertificateInfo, String> {
+    match mitm_certificate_path(&app) {
+        Ok(path) => Ok(MitmCertificateInfo {
+            available: true,
+            path: path.display().to_string(),
+            client_note: "HTTPS MITM 的每台客户端都必须信任此根证书；Gateway 模式下本机安装不会替 LAN 客户端安装。".into(),
+        }),
+        Err(_) => Ok(MitmCertificateInfo {
+            available: false,
+            path: String::new(),
+            client_note: "启动一次包含 MITM 主机的模块后，SongsterX 才会生成根证书。".into(),
+        }),
+    }
+}
+
+#[tauri::command]
+fn open_mitm_certificate(app: AppHandle) -> Result<(), String> {
+    let path = mitm_certificate_path(&app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("/usr/bin/open")
+            .arg(&path)
+            .status()
+            .map_err(|error| format!("无法打开 MITM 根证书：{error}"))?;
+        if !status.success() {
+            return Err(format!("打开 MITM 根证书失败，状态码：{status}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("当前平台暂不支持从 SongsterX 打开证书安装器；请手工分发 MITM 根证书。".into())
+    }
+}
+
+#[tauri::command]
+fn install_mitm_certificate(app: AppHandle) -> Result<(), String> {
+    let path = mitm_certificate_path(&app)?;
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "无法定位当前用户 HOME 目录".to_string())?;
+        let keychain = home.join("Library/Keychains/login.keychain-db");
+        if !keychain.is_file() {
+            return Err(format!("当前用户登录钥匙串不存在：{}", keychain.display()));
+        }
+        let output = Command::new("/usr/bin/security")
+            .args(["add-trusted-cert", "-r", "trustRoot", "-k"])
+            .arg(&keychain)
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("无法调用 macOS 证书工具：{error}"))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if detail.is_empty() {
+                format!("安装 MITM 根证书失败，状态码：{}", output.status)
+            } else {
+                format!("安装 MITM 根证书失败：{detail}")
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("当前平台暂不支持自动安装 MITM 根证书；请手工导入并信任证书。".into())
+    }
+}
+
+#[tauri::command]
 fn import_module(
     app: AppHandle,
     state: State<'_, RuntimeState>,
     files: Vec<ImportedFile>,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再导入模块".into());
     }
     persist_imported_module_files(&app, files)
@@ -7442,7 +8724,7 @@ fn import_module_url(
     state: State<'_, RuntimeState>,
     url: String,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再导入模块".into());
     }
     let url = url.trim().to_string();
@@ -7483,7 +8765,7 @@ fn set_module_enabled(
     id: String,
     enabled: bool,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再修改模块启用状态".into());
     }
     let modules = load_modules(&app)?;
@@ -7516,7 +8798,7 @@ fn set_module_argument(
     key: String,
     value: String,
 ) -> Result<Vec<ModuleInfo>, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再修改模块参数".into());
     }
     if value.len() > 64 * 1024 {
@@ -7556,7 +8838,7 @@ fn save_proxy_config(
     state: State<'_, RuntimeState>,
     config: ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存代理配置".into());
     }
     persist_proxy_config(&app, &config)
@@ -7568,7 +8850,7 @@ fn save_gateway_guest_proxy_config(
     state: State<'_, RuntimeState>,
     config: ProxyConfig,
 ) -> Result<ProxyConfig, String> {
-    if runtime_is_running(&state)? {
+    if runtime_mutation_allowed(&state).is_err() {
         return Err("请先停止运行时，再保存 Gateway guest 策略".into());
     }
     persist_gateway_guest_proxy_config(&app, &config)
@@ -7634,8 +8916,8 @@ fn require_guest_proxy_target(
         return Err("不是 Gateway guest 策略目标".into());
     }
     let settings = load_settings(app)?;
-    if settings.mode != "gateway" || settings.gateway_policy_mode != "separate" {
-        return Err("只有 Gateway 独立策略可以操作 guest 实时 API".into());
+    if settings.mode != "gateway" {
+        return Err("只有 Gateway 模式可以操作 guest 实时 API".into());
     }
     gateway_guest_agent_endpoint(app, &settings)
 }
@@ -7733,10 +9015,11 @@ pub fn run() {
             save_runtime_settings,
             reset_runtime_settings,
             get_gateway_guest_status,
-            sync_gateway_guest_config,
             generate_gateway_guest_config,
-            sync_gateway_guest_runtime_config,
             upgrade_gateway_sing_box,
+            get_mitm_certificate_info,
+            open_mitm_certificate,
+            install_mitm_certificate,
             start_mix_direct,
             stop_runtime,
             get_app_info,
@@ -7758,11 +9041,31 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building SongsterX")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 let state = app_handle.state::<RuntimeState>();
-                if let Err(error) = stop_runtime_processes(app_handle, &state) {
-                    eprintln!("退出时停止运行时失败：{error}");
+                if state.exit_cleanup_started.swap(true, Ordering::SeqCst) {
+                    // The explicit app.exit(0) below can produce another
+                    // ExitRequested event. Let that second event finish the
+                    // exit instead of starting a second cleanup worker.
+                    return;
                 }
+                api.prevent_exit();
+                let app = app_handle.clone();
+                thread::spawn(move || {
+                    let state = app.state::<RuntimeState>();
+                    match stop_runtime_processes_for_exit(&app, &state) {
+                        Ok(()) if !runtime_owns_resources(&state) => app.exit(0),
+                        Ok(()) | Err(_) => {
+                            let message = if runtime_owns_resources(&state) {
+                                "退出被取消：Gateway 或本地运行时仍有进程未确认停止"
+                            } else {
+                                "退出被取消：运行时停止失败，请再次点击退出"
+                            };
+                            emit_log(&app, "error", message);
+                            state.exit_cleanup_started.store(false, Ordering::SeqCst);
+                        }
+                    }
+                });
             }
         });
 }
@@ -7772,59 +9075,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gateway_runtime_release_gate_is_open_and_not_a_prelaunch_readiness_probe() {
-        assert!(GATEWAY_GUEST_PACKET_PATH_RELEASE_GATE);
-        assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("等待验收"));
-        assert!(GATEWAY_PACKET_PATH_UNAVAILABLE.contains("LAN 与 tun0"));
-    }
-
-    fn interface_stats(
-        interface: &str,
-        rx_packets: u64,
-        tx_packets: u64,
-        rx_bytes: u64,
-        tx_bytes: u64,
-    ) -> guest_agent::GuestInterfaceStats {
-        guest_agent::GuestInterfaceStats {
-            interface: interface.into(),
-            rx_packets,
-            tx_packets,
-            rx_bytes,
-            tx_bytes,
-        }
+    fn guest_lan_mac_uses_custom_mac_and_default_for_interface_selector() {
+        assert_eq!(
+            guest_lan_mac("mac:02:aa:bb:cc:dd:ee"),
+            Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee])
+        );
+        assert_eq!(
+            guest_lan_mac("if:eth0"),
+            Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x11])
+        );
     }
 
     #[test]
-    fn gateway_packet_path_requires_both_lan_and_tun_progress() {
-        let before = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 10, 10, 1_000, 1_000)),
-            tun: Some(interface_stats("tun0", 20, 20, 2_000, 2_000)),
-        };
-        let lan_only = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 11, 10, 1_100, 1_000)),
-            tun: before.tun.clone(),
-        };
-        let both = guest_agent::GuestPacketStats {
-            lan: lan_only.lan.clone(),
-            tun: Some(interface_stats("tun0", 21, 20, 2_100, 2_000)),
-        };
+    fn gateway_global_ipv6_parser_skips_scoped_link_local_address() {
+        let ifconfig = "\
+            en0: flags=8963<UP,BROADCAST,RUNNING,MULTICAST> mtu 1500\n\
+                inet6 fe80::106f:5547:d2f9:6d9f%en0 prefixlen 64 secured scopeid 0x7\n\
+                inet6 240e:398:2aa1:b440:887:1009:2bdb:4cdb prefixlen 64 autoconf secured\n\
+                inet6 240e:398:2aa1:b440:98ee:d84e:13a8:68fc prefixlen 64 deprecated autoconf temporary\n";
 
-        assert!(!guest_packet_path_progressed(&before, &lan_only));
-        assert!(guest_packet_path_progressed(&before, &both));
+        assert_eq!(
+            parse_gateway_global_ipv6(ifconfig, "if:eth0"),
+            Some("240e:398:2aa1:b440:0:ff:fe00:11".parse().unwrap())
+        );
     }
 
     #[test]
-    fn gateway_packet_path_is_not_ready_without_both_interface_snapshots() {
-        let before = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 10, 10, 1_000, 1_000)),
-            tun: None,
-        };
-        let after = guest_agent::GuestPacketStats {
-            lan: Some(interface_stats("eth0", 11, 10, 1_100, 1_000)),
-            tun: Some(interface_stats("tun0", 1, 0, 100, 0)),
-        };
+    fn stop_failure_with_owned_resources_remains_stoppable() {
+        let mut current = RuntimeStatus::default();
+        current.mode = "lan-gateway no-dhcp".into();
+        current.pid = Some(42);
+        let next = status_after_stop_failure(current, true, "child refused to exit");
+        assert_eq!(next.state, "running");
+        assert!(!next.healthy);
+        assert!(next.can_stop);
+        assert_eq!(next.mode, "lan-gateway no-dhcp");
+        assert_eq!(next.pid, Some(42));
+        assert_eq!(next.message, "child refused to exit");
+    }
 
-        assert!(!guest_packet_path_progressed(&before, &after));
+    #[test]
+    fn stop_failure_without_owned_resources_is_error() {
+        let next = status_after_stop_failure(RuntimeStatus::default(), false, "teardown failed");
+        assert_eq!(next.state, "error");
+        assert!(!next.healthy);
+        assert!(!next.can_stop);
+        assert_eq!(next.message, "teardown failed");
+    }
+
+    #[test]
+    fn host_metrics_merge_preserves_guest_failure_state() {
+        let mut metrics = RuntimeMetrics {
+            upload_total: 0,
+            download_total: 0,
+            active_connections: 0,
+            memory: 0,
+            connections: Vec::new(),
+            host_snapshot_valid: false,
+            host_snapshot_error: Some("Host 尚未返回".into()),
+            guest_snapshot_valid: false,
+            guest_snapshot_error: Some("Guest endpoint 不可用".into()),
+            system_snapshot_valid: false,
+            system_snapshot_error: None,
+        };
+        let host = runtime_metrics_from_clash_value(
+            &serde_json::json!({"uploadTotal": 4, "downloadTotal": 8, "memory": 16, "connections": []}),
+            "host",
+        );
+
+        merge_runtime_metrics_snapshot(&mut metrics, host, "host");
+
+        assert!(metrics.host_snapshot_valid);
+        assert_eq!(metrics.host_snapshot_error, None);
+        assert!(!metrics.guest_snapshot_valid);
+        assert_eq!(
+            metrics.guest_snapshot_error.as_deref(),
+            Some("Guest endpoint 不可用")
+        );
+        assert_eq!(metrics.upload_total, 4);
+        assert_eq!(metrics.download_total, 8);
+        assert_eq!(metrics.memory, 16);
+    }
+
+    #[test]
+    fn runtime_mutation_gate_uses_lifecycle_phase_only() {
+        let state = RuntimeState::default();
+        assert!(runtime_mutation_allowed(&state).is_ok());
+        assert!(!runtime_phase_is_active(&state).unwrap());
+
+        mark_lifecycle_phase(&state, LifecyclePhase::Stopping);
+        assert!(runtime_mutation_allowed(&state).is_err());
+        assert!(runtime_phase_is_active(&state).unwrap());
+
+        mark_lifecycle_phase(&state, LifecyclePhase::Running);
+        assert!(runtime_mutation_allowed(&state).is_err());
+        assert!(runtime_phase_is_active(&state).unwrap());
     }
 
     #[test]
@@ -7885,16 +9230,203 @@ mod tests {
     }
 
     #[test]
+    fn system_lsof_parser_keeps_connected_udp_and_ipv6_endpoints() {
+        let connection = system_connection_from_lsof_line(
+            "Safari 123 bq 8u IPv6 0x1 0t0 UDP [fe80::20]:53000->[2001:db8::53]:53",
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+        )
+        .expect("connected UDP socket should be recorded");
+        assert_eq!(connection.network, "udp");
+        assert_eq!(connection.source, "[fe80::20]:53000");
+        assert_eq!(connection.destination, "[2001:db8::53]:53");
+        assert_eq!(connection.host, "2001:db8::53");
+    }
+
+    #[test]
     fn system_observer_excludes_owned_listener_destinations() {
         let endpoints = vec![ManagedSystemEndpoint {
             host: "0.0.0.0".into(),
             port: 2080,
             wildcard_host: true,
+            family: ManagedAddressFamily::V4,
         }];
-        assert!(is_managed_local_destination("127.0.0.1:2080", &endpoints));
-        assert!(is_managed_local_destination("[::1]:2080", &endpoints));
-        assert!(!is_managed_local_destination("1.2.3.4:2080", &endpoints));
-        assert!(!is_managed_local_destination("127.0.0.1:443", &endpoints));
+        let local_addresses = HashSet::from(["127.0.0.1".into(), "::1".into()]);
+        assert!(is_managed_local_destination(
+            "127.0.0.1:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "[::1]:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "1.2.3.4:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "127.0.0.1:443",
+            &endpoints,
+            &local_addresses
+        ));
+
+        let ipv6_endpoints = vec![ManagedSystemEndpoint {
+            host: "::".into(),
+            port: 2080,
+            wildcard_host: true,
+            family: ManagedAddressFamily::V6,
+        }];
+        assert!(is_managed_local_destination(
+            "[::1]:2080",
+            &ipv6_endpoints,
+            &local_addresses
+        ));
+    }
+
+    #[test]
+    fn system_observer_excludes_wildcard_listener_on_local_lan_address() {
+        let endpoints = vec![ManagedSystemEndpoint {
+            host: "0.0.0.0".into(),
+            port: 2080,
+            wildcard_host: true,
+            family: ManagedAddressFamily::V4,
+        }];
+        let local_addresses = HashSet::from(["192.168.1.20".into(), "fe80::1".into()]);
+        assert!(is_managed_local_destination(
+            "192.168.1.20:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "[fe80::1]:2080",
+            &endpoints,
+            &local_addresses
+        ));
+        assert!(!is_managed_local_destination(
+            "192.168.1.21:2080",
+            &endpoints,
+            &local_addresses
+        ));
+    }
+
+    #[test]
+    fn system_observer_machine_lsof_parser_keeps_connected_socket_metadata() {
+        let endpoints = Vec::new();
+        let local_addresses = HashSet::new();
+        let connections = parse_lsof_machine_output(
+            "p123\ncSafari\nf8u\nn192.168.1.20:53124->1.2.3.4:443\nTST=ESTABLISHED\n",
+            "tcp",
+            "unix:1786871205.123456",
+            &endpoints,
+            &local_addresses,
+        );
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].process, "Safari");
+        assert_eq!(connections[0].pid, Some(123));
+        assert_eq!(connections[0].network, "tcp");
+        assert_eq!(
+            connections[0]
+                .system_socket_key
+                .as_deref()
+                .unwrap()
+                .starts_with("system-socket:"),
+            true
+        );
+    }
+
+    #[test]
+    fn system_connection_tuple_reappearance_gets_new_instance_id() {
+        let mut identities = SystemConnectionIdentityState::default();
+        let connection = system_connection_from_socket(
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+            "udp",
+            "192.168.1.20:53000->1.1.1.1:53",
+            "CONNECTED",
+        )
+        .unwrap();
+        let first = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection.clone()],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        let _ = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: Vec::new(),
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        );
+        let second = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn invalid_system_snapshot_does_not_clear_active_identity() {
+        let mut identities = SystemConnectionIdentityState::default();
+        let connection = system_connection_from_socket(
+            "unix:1786871205.123456",
+            "Safari",
+            123,
+            "tcp",
+            "192.168.1.20:53000->1.1.1.1:443",
+            "ESTABLISHED",
+        )
+        .unwrap();
+        let first = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection.clone()],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        let invalid = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: Vec::new(),
+                valid: false,
+                error: Some("permission denied".into()),
+            },
+            &mut identities,
+        );
+        assert!(!invalid.valid);
+        let second = assign_system_connection_instances(
+            SystemConnectionSample {
+                connections: vec![connection],
+                valid: true,
+                error: None,
+            },
+            &mut identities,
+        )
+        .connections[0]
+            .id
+            .clone();
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -7984,7 +9516,33 @@ mod tests {
         assert_eq!(config["inbounds"][0]["tag"], "tun-in");
         assert_eq!(config["inbounds"][0]["interface_name"], "tun0");
         assert_eq!(config["inbounds"][1]["type"], "mixed");
+        assert_eq!(config["inbounds"][1]["listen"], "::");
         assert_eq!(config["route"]["auto_detect_interface"], true);
+    }
+
+    #[test]
+    fn gateway_guest_mixed_inbound_is_dual_stack() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_lan_interface: "en0".into(),
+            gateway_ip: "192.168.88.1".into(),
+            gateway_cidr: "192.168.88.0/24".into(),
+            ..RuntimeSettings::default()
+        };
+        let config: serde_json::Value = serde_json::from_str(
+            &render_runtime_config_for(&settings, &ProxyConfig::default(), true)
+                .expect("gateway settings should render"),
+        )
+        .expect("rendered gateway config should be valid JSON");
+
+        let mixed = config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in")
+            .expect("gateway mixed inbound should exist");
+        assert_eq!(mixed["listen"], "::");
+        assert_eq!(mixed["listen_port"], 2080);
     }
 
     #[test]
@@ -8013,8 +9571,12 @@ mod tests {
         assert_eq!(config["inbounds"][0]["strict_route"], true);
         assert_eq!(config["inbounds"][0]["auto_redirect"], true);
         assert_eq!(
+            config["inbounds"][0]["address"],
+            serde_json::json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
+        assert_eq!(
             config["inbounds"][0]["route_address"],
-            serde_json::json!(["0.0.0.0/1", "128.0.0.0/1"])
+            serde_json::json!(["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"])
         );
         assert_eq!(config["inbounds"][0]["iproute2_table_index"], 2022);
         assert_eq!(config["inbounds"][0]["iproute2_rule_index"], 9000);
@@ -8033,6 +9595,12 @@ mod tests {
         assert!(excluded_routes
             .iter()
             .any(|value| value.as_str() == Some("223.86.225.0/24")));
+        assert!(excluded_routes
+            .iter()
+            .any(|value| value.as_str() == Some("fe80::/10")));
+        assert!(!excluded_routes
+            .iter()
+            .any(|value| value.as_str() == Some("ff00::/8")));
     }
 
     #[test]
@@ -8092,6 +9660,48 @@ mod tests {
     }
 
     #[test]
+    fn gateway_module_rules_follow_sniff_preamble() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            dns_mode: "fakeip".into(),
+            gateway_lan_interface: "en0".into(),
+            gateway_ip: "192.168.88.1".into(),
+            gateway_cidr: "192.168.88.0/24".into(),
+            gateway_clients: "192.168.88.20,aa:bb:cc:dd:ee:ff".into(),
+            ..RuntimeSettings::default()
+        };
+        let module_plan = ModuleRuntimePlan {
+            version: 1,
+            mitm_hostnames: vec!["api.example.com".into()],
+            ..ModuleRuntimePlan::default()
+        };
+        let config: serde_json::Value = serde_json::from_str(
+            &render_runtime_config_document(&settings, &ProxyConfig::default(), &module_plan, true)
+                .expect("gateway module config should render"),
+        )
+        .expect("rendered gateway module config should be valid JSON");
+        let rules = config["route"]["rules"]
+            .as_array()
+            .expect("route rules should be an array");
+
+        assert_eq!(rules[0]["action"], "sniff");
+        assert_eq!(rules[1]["inbound"][0], "mixed-in-direct");
+        assert_eq!(rules[1]["outbound"], "direct");
+        assert_eq!(rules[2]["domain"][0], "api.example.com");
+        assert_eq!(rules[2]["outbound"], "module-mitm");
+        assert_eq!(rules[2]["override_address"], "api.example.com");
+        assert_eq!(rules[3]["action"], "resolve");
+        assert_eq!(rules[4]["action"], "hijack-dns");
+        let direct_inbound = config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "mixed-in-direct")
+            .expect("Module Engine direct chain inbound should exist");
+        assert_eq!(direct_inbound["listen_port"], 2081);
+    }
+
+    #[test]
     fn fakeip_is_restricted_to_gateway_mode() {
         let settings = RuntimeSettings {
             dns_mode: "fakeip".into(),
@@ -8140,7 +9750,10 @@ mod tests {
     fn vfkit_gateway_defaults_use_a_small_guest_and_isolated_network() {
         let settings = RuntimeSettings::default();
         assert_eq!(settings.gateway_guest_cpus, 1);
-        assert_eq!(settings.gateway_guest_memory_mib, 512);
+        assert_eq!(
+            settings.gateway_guest_memory_mib,
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        );
         assert_eq!(settings.gateway_host_ip, "192.168.250.1");
         assert_eq!(settings.gateway_guest_host_ip, "192.168.250.2");
         assert_eq!(
@@ -8161,6 +9774,19 @@ mod tests {
             ..settings
         };
         assert!(validate_settings(&gateway).is_ok());
+    }
+
+    #[test]
+    fn legacy_gateway_guest_memory_is_migrated_to_the_boot_floor() {
+        let mut settings = RuntimeSettings {
+            gateway_guest_memory_mib: 512,
+            ..RuntimeSettings::default()
+        };
+        normalize_gateway_guest_memory(&mut settings);
+        assert_eq!(
+            settings.gateway_guest_memory_mib,
+            vfkit::MIN_GATEWAY_GUEST_MEMORY_MIB
+        );
     }
 
     #[test]
@@ -8188,8 +9814,64 @@ gateway-guest-host-selector = \"\"\n",
             gateway_host_ip: "192.168.250.1".into(),
             ..RuntimeSettings::default()
         };
-        assert_eq!(module_proxy_endpoint(&settings), "192.168.250.1:8080");
+        assert_eq!(module_proxy_endpoint(&settings, 8080), "192.168.250.1:8080");
         assert_eq!(module_proxy_host(&RuntimeSettings::default()), "127.0.0.1");
+    }
+
+    #[test]
+    fn module_proxy_plan_port_overrides_default_without_changing_host() {
+        let settings = RuntimeSettings::default();
+        let plan = ModuleRuntimePlan {
+            proxy_port: Some(18080),
+            ..ModuleRuntimePlan::default()
+        };
+        assert_eq!(module_proxy_port(&plan), 18080);
+        assert_eq!(
+            module_proxy_endpoint(&settings, module_proxy_port(&plan)),
+            "127.0.0.1:18080"
+        );
+    }
+
+    #[test]
+    fn gateway_module_proxy_port_probe_does_not_require_vmnet_address_yet() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_host_ip: "192.168.250.1".into(),
+            ..RuntimeSettings::default()
+        };
+        assert_eq!(module_proxy_probe_host(&settings), "0.0.0.0");
+        assert_eq!(
+            module_proxy_probe_host(&RuntimeSettings::default()),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn module_proxy_port_probe_detects_existing_listener_on_configured_host() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let port = occupied
+            .local_addr()
+            .expect("read test listener address")
+            .port();
+        let error = bind_module_proxy_listener(&RuntimeSettings::default(), port)
+            .expect_err("occupied configured host port must be rejected");
+        assert!(error.contains("127.0.0.1"));
+        assert!(error.contains(&port.to_string()));
+    }
+
+    #[test]
+    fn gateway_module_proxy_port_probe_falls_back_when_host_only_address_is_not_ready() {
+        let settings = RuntimeSettings {
+            mode: "gateway".into(),
+            gateway_host_ip: "203.0.113.1".into(),
+            ..RuntimeSettings::default()
+        };
+        let listener = bind_module_proxy_listener(&settings, 0)
+            .expect("wildcard probe should work before vmnet host-only address exists");
+        assert_eq!(
+            listener.local_addr().expect("read wildcard address").ip(),
+            "0.0.0.0".parse::<IpAddr>().expect("parse wildcard address")
+        );
     }
 
     #[test]
@@ -8734,6 +10416,7 @@ hostname = %APPEND% example.com, *.example.net
             gateway_lan_interface: "en0".into(),
             gateway_ip: "192.168.88.2".into(),
             gateway_cidr: "192.168.88.0/24".into(),
+            gateway_ipv6: "fe80::252/64".into(),
             gateway_dns_ip: "198.18.0.2".into(),
             gateway_clients: "192.168.88.20,aa:bb:cc:dd:ee:ff\n192.168.88.21,11:22:33:44:55:66"
                 .into(),
@@ -8743,6 +10426,7 @@ hostname = %APPEND% example.com, *.example.net
         let rendered = render_songsterx_config(&settings, &ProxyConfig::default(), &[]);
         assert!(rendered.contains("[Gateway]"));
         assert!(rendered.contains("interface = en0"));
+        assert!(rendered.contains("ipv6 = true"));
         assert!(rendered.contains("192.168.88.20,aa:bb:cc:dd:ee:ff"));
         assert!(!rendered.contains("gatewaykit-path"));
         assert!(!rendered.contains("gateway-backend"));
@@ -8752,8 +10436,9 @@ hostname = %APPEND% example.com, *.example.net
         assert_eq!(parsed.settings.gateway_guest_agent_port, 38291);
         assert_eq!(parsed.settings.gateway_host_cidr, "192.168.250.0/24");
         assert_eq!(parsed.settings.gateway_lan_interface, "en0");
+        assert_eq!(parsed.settings.gateway_ipv6, "fe80::252/64");
         assert_eq!(parsed.settings.gateway_clients, settings.gateway_clients);
-        assert_eq!(parsed.settings.gateway_policy_mode, "separate");
+        assert_eq!(parsed.settings.gateway_policy_mode, "shared");
     }
 
     #[test]
@@ -8761,7 +10446,7 @@ hostname = %APPEND% example.com, *.example.net
         let settings = RuntimeSettings::default();
         assert_eq!(settings.gateway_policy_mode, "shared");
         let rendered = render_songsterx_config(&settings, &ProxyConfig::default(), &[]);
-        assert!(rendered.contains("policy-mode = shared"));
+        assert!(!rendered.contains("policy-mode"));
         let parsed = parse_songsterx_config(&rendered).expect("shared policy mode should parse");
         assert_eq!(parsed.settings.gateway_policy_mode, "shared");
     }
@@ -8771,7 +10456,7 @@ hostname = %APPEND% example.com, *.example.net
         let mut settings = RuntimeSettings::default();
         settings.gateway_policy_mode = "mirror".into();
         let error = validate_settings(&settings).expect_err("unknown policy mode should fail");
-        assert!(error.contains("shared 或 separate"));
+        assert!(error.contains("共享 SongsterX.conf"));
     }
 
     #[test]

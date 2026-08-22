@@ -23,7 +23,7 @@ sing-box 和 mitmproxy 只是数据面基础，不能直接串起来宣称 Surge
 - Surge JS Runtime：JavaScriptCore/WKWebView 兼容层，Python addon 不能冒充。
 - Linux guest Gateway：基于两张 virtio-net 的 L3 Gateway、ARP/IPv4、设备注册和后续 UDP Fast Path。
 
-当前仓库包含可运行的 Mixed/Module Engine 最小实现和 vfkit Gateway supervisor 启动路径。Gateway 的进程、guest-agent、最终 authenticated status 和配置控制面已接通；应用会在启动后持续读取 guest LAN 与 `tun0` 计数器，并在真实客户端产生两侧新增流量后标记当前会话的 packet path 已验收，但这不等于 ARP、TCP、UDP、DNS 和 MITM 的协议级完整验收。完整 Controller、PolicyEngine、IPv6/RA、DHCP、UDP Fast Path 和 Surge JS Runtime 仍是 planned/partial。未实现能力必须显示为 planned/partial；启动计划或 runtime readiness 就绪不等于这些未覆盖能力已经可用。
+当前仓库包含可运行的 Mixed/Module Engine 最小实现和 vfkit Gateway supervisor 启动路径。Gateway 的进程、guest-agent、最终 authenticated status 和配置控制面已接通；应用会在启动后持续读取 guest LAN 与 `tun0` 计数器作为观察信息，不等待真实客户端流量才发布运行状态；这不等于 ARP、TCP、UDP、DNS 和 MITM 的协议级完整验收。Gateway 目前支持固定 MAC 派生的 LAN `fe80::/64` 地址和 NDP；完整 IPv6/RA、DHCP、Controller、PolicyEngine、UDP Fast Path 和 Surge JS Runtime 仍是 planned/partial。未实现能力必须显示为 planned/partial；启动计划或 runtime readiness 就绪不等于这些未覆盖能力已经可用。
 
 ## 2. 产品边界
 
@@ -60,7 +60,7 @@ sing-box 和 mitmproxy 只是数据面基础，不能直接串起来宣称 Surge
 | IPv4/IPv6 双栈 | ◐ | sing-box + Linux guest Gateway NDP/RA |
 | Process Name/Path | ◐ | 平台权限和进程元数据 |
 | Network Type/SSID/Expensive | ◐ | Native 层注入 FlowContext |
-| macOS Gateway VM | ◐ | `vmnet-helper`/vfkit/Linux guest supervisor、guest-agent runtime readiness 和 LAN/`tun0` 计数器验收已接通；仍需实体客户端和协议级现场验收 |
+| macOS Gateway VM | ◐ | `vmnet-helper`/vfkit/Linux guest supervisor、guest-agent runtime readiness 和 LAN/`tun0` 计数器观察已接通；仍需实体客户端和协议级现场验收 |
 | Linux/OpenWrt Gateway | ◐ | nftables/TPROXY 或自有数据面 |
 | DIRECT/REJECT | ✅ | direct；route action reject |
 | HTTP/HTTPS/SOCKS、主流代理协议 | ✅/◐ | sing-box，按版本矩阵适配 |
@@ -364,7 +364,7 @@ Network Service 的 TCP Port Forwarding 独立定义监听地址、端口、目�
 
 本项目由外部 `vmnet-helper` 持有 Apple vmnet 附件，vfkit 通过 Unix socket 接入两张 virtio-net；应用本身不把 LAN Ethernet 转成 macOS TUN。vmnet-helper 的安装、签名、root/sudoers 规则和系统版本限制必须按其项目文档独立验证，不能把应用签名当作 helper 权限的替代品。
 
-这是一项生产发布 gate：Linux guest 是 Gateway data plane，supervisor 启动时会真实验收进程、guest-agent、配置激活和 `networkReady`；应用随后读取 guest LAN/`tun0` 计数器，只有当前会话观察到两侧新增流量才把 packet path 标为已验收，这仍不代替真实 IPv4 的 ARP/TCP/UDP/DNS/MITM 协议测试。DHCP、IPv6/RA 不在本模式范围内；实体客户端接入前仍必须确认 helper 安装、签名、权限、sandbox model、管理员授权边界和 LAN 双向流量。
+这是一项生产发布 gate：Linux guest 是 Gateway data plane，supervisor 启动时会真实验收进程、guest-agent、配置激活和 `networkReady`；应用随后读取 guest LAN/`tun0` 计数器用于诊断，但不把客户端是否产生流量作为启动或转发 gate，这仍不代替真实 IPv4 的 ARP/TCP/UDP/DNS/MITM 协议测试。DHCP、IPv6/RA 不在本模式范围内；实体客户端接入前仍必须确认 helper 安装、签名、权限、sandbox model、管理员授权边界和 LAN 双向流量。
 
 ## 7. DNS、QUIC、IPv6、CA
 
@@ -495,7 +495,7 @@ Clash API 仅作为 adapter。SongsterX Control API 要覆盖 feature toggles、
 
 如果任一组件仍运行 v1，Controller 必须把状态标为 generation mismatch，并停止新 flow 的 MITM/策略切换；文件 rename 的 atomic 性不能掩盖多进程运行状态的不一致。
 
-端口：2080 本机 mixed；2081+ per-policy post-MITM bridge；8181+ per-policy BackendIngress；8080/808x MitmproxyBackend 管理入口；8081 mitmweb；9090 Control API；LAN Gateway guest agent。除显式 Gateway 模式外均只监听 127.0.0.1。
+端口：2080 本机 mixed；Gateway guest 同时在 `gateway-ip:2080` 提供局域网 Mixed 入口；2081+ per-policy post-MITM bridge；8181+ per-policy BackendIngress；8080/808x MitmproxyBackend 管理入口；8081 mitmweb；9090 Control API；LAN Gateway guest agent。除显式 Gateway 模式外均只监听 127.0.0.1。
 
 ## 11. 安全
 
@@ -602,7 +602,7 @@ DHCP lease、单客户端 lease、冲突检测、ARP/NDP/RA、双栈、DeviceReg
 
 ### P2：Surge Mac Gateway
 
-- [◐] vmnet-helper、vfkit/Linux guest Gateway 源码和 guest-agent；已接入当前会话 LAN/`tun0` 计数器验收，仍待实体客户端协议级、helper 权限和真实网络环境验证。
+- [◐] vmnet-helper、vfkit/Linux guest Gateway 源码和 guest-agent；已接入当前会话 LAN/`tun0` 计数器观察，仍待实体客户端协议级、helper 权限和真实网络环境验证。
 - [ ] DHCP、ARP/NDP/RA、双栈。
 - [ ] DeviceRegistry 和设备管理 API/UI。
 - [ ] MAC/DEVICE-NAME/SRC-IP。

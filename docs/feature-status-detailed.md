@@ -64,7 +64,7 @@
 | ID | 功能 | 已定义的契约 | 缺少的实际实现 |
 |---|---|---|---|
 | G-13 | `proxy-restricted-to-lan` | LAN 内转发路径已实现；客户端 MAC/IP allowlist 尚未接入 Linux guest，配置会拒绝启动 | `client-policy = all`；allowlist 暂不支持 |
-| G-14 | macOS Gateway Mode | vfkit/vmnet guest 路线已有双 virtio-net supervisor、guest-agent authenticated status、runtime readiness 和 LAN/`tun0` 计数器验收 | 计数器验收仍需实体客户端现场触发，且不代替 ARP/TCP/UDP/DNS/MITM 协议级验证 |
+| G-14 | macOS Gateway Mode | vfkit/vmnet guest 路线已有双 virtio-net supervisor、guest-agent authenticated status、runtime readiness 和 LAN/`tun0` 计数器观察 | 计数器仅用于观察，不代替 ARP/TCP/UDP/DNS/MITM 协议级验证 |
 | L-02 | 多个 source IP 的 `OR` | 结构化为 `OR(192.168.88.242,.240,.246,.243)` | guest Gateway/FlowContext 尚未把 LAN source identity 提供给规则引擎 |
 | M-03 | `client-source-address` | `[Gateway]` 可选 static client MAC/IP allowlist；默认使用 LAN 学习 | 真实 MAC 校验和 MITM client connection 绑定尚未完成 |
 

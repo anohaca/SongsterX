@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -51,6 +51,8 @@ pub(crate) struct GuestAgentStatus {
     #[serde(default)]
     pub gateway_lan_ip: Option<String>,
     #[serde(default)]
+    pub gateway_lan_ipv6: Option<String>,
+    #[serde(default)]
     pub upstream_interface: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
@@ -58,6 +60,18 @@ pub(crate) struct GuestAgentStatus {
     pub config_sha256: Option<String>,
     #[serde(default)]
     pub packet_stats: Option<GuestPacketStats>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub mitm_healthy: bool,
+    #[serde(default)]
+    pub mitm_ready: bool,
+    #[serde(default)]
+    pub mitm_pid: Option<u32>,
+    #[serde(default)]
+    pub module_plan_sha256: Option<String>,
+    #[serde(default)]
+    pub mitm_certificate_pem: Option<String>,
 }
 
 pub(crate) fn status_is_ready(status: &GuestAgentStatus) -> bool {
@@ -81,12 +95,13 @@ pub(crate) struct GuestUpgradeResult {
     pub activated: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GuestConfigResult {
-    pub sha256: String,
-    pub size: u64,
-    pub activated: bool,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuestSessionResult {
+    pub config_sha256: String,
+    pub module_plan_sha256: String,
+    pub config_size: u64,
+    pub module_plan_size: u64,
+    pub certificate_pem: Option<String>,
     pub packet_stats: Option<GuestPacketStats>,
 }
 
@@ -100,6 +115,12 @@ struct ArtifactMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigMetadata {
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModulePlanMetadata {
     size: u64,
     sha256: String,
 }
@@ -123,6 +144,8 @@ struct AgentResponse {
     delay: Option<u64>,
     #[serde(default, rename = "packetStats")]
     packet_stats: Option<GuestPacketStats>,
+    #[serde(default, rename = "mitmCertificatePem")]
+    mitm_certificate_pem: Option<String>,
 }
 
 impl GuestAgentEndpoint {
@@ -159,7 +182,19 @@ impl GuestAgentEndpoint {
         if cancellation() {
             return Err("启动已取消".into());
         }
+        // Keep the TCP connect probe short so cancellation remains responsive,
+        // but do not carry that probe timeout into the request itself.  The
+        // guest agent is intentionally single-threaded; a 250 ms request
+        // timeout can make the host abandon a valid stage response while the
+        // guest is still scheduling, leaving the guest stuck waiting for the
+        // abandoned upload and causing every retry to queue behind it.
         let stream = self.connect(timeout.min(STARTUP_IO_SLICE))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("无法设置 guest agent 读取超时：{error}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| format!("无法设置 guest agent 写入超时：{error}"))?;
         if cancellation() {
             return Err("启动已取消".into());
         }
@@ -167,95 +202,232 @@ impl GuestAgentEndpoint {
     }
 }
 
-pub(crate) fn sync_config(
+fn wait_for_session_ready(
     endpoint: &GuestAgentEndpoint,
-    config_path: &Path,
-    timeout: Duration,
-) -> Result<GuestConfigResult, String> {
-    fn never_cancelled() -> bool {
-        false
+    config: &ConfigMetadata,
+    module_plan: &ModulePlanMetadata,
+    deadline: Instant,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<GuestSessionResult, String> {
+    let mut last_status = None;
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
+        let mut stream = endpoint.connect_cancellable(
+            remaining_timeout(deadline)?.min(STARTUP_IO_SLICE),
+            cancellation,
+        )?;
+        match request(endpoint, &mut stream, &json!({ "method": "status" })) {
+            Ok(response) if response.ok => {
+                if let Some(status) = response.status {
+                    last_status = Some(status.clone());
+                    let config_matches = status.config_sha256.as_deref() == Some(&config.sha256);
+                    let module_plan_matches =
+                        status.module_plan_sha256.as_deref() == Some(&module_plan.sha256);
+                    if config_matches && module_plan_matches && status_is_ready(&status) {
+                        return Ok(GuestSessionResult {
+                            config_sha256: config.sha256.clone(),
+                            module_plan_sha256: module_plan.sha256.clone(),
+                            config_size: config.size,
+                            module_plan_size: module_plan.size,
+                            certificate_pem: status.mitm_certificate_pem,
+                            packet_stats: status.packet_stats,
+                        });
+                    }
+                    if (!config_matches || !module_plan_matches)
+                        && status
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Gateway session"))
+                    {
+                        return Err(format!(
+                            "guest agent 已回滚目标 session：{}",
+                            status.last_error.as_deref().unwrap_or("未知原因")
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) if is_retryable_io_timeout(&error) => {}
+            Err(error) => return Err(format!("等待 guest Gateway session 就绪失败：{error}")),
+        }
+        if remaining_timeout(deadline).is_err() {
+            let detail = last_status
+                .as_ref()
+                .map(session_status_diagnostic)
+                .unwrap_or_else(|| "尚未取得 guest status 响应".into());
+            return Err(format!("等待 guest Gateway session 就绪超时：{detail}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-
-    sync_config_with_cancellation(endpoint, config_path, timeout, &never_cancelled)
 }
 
-pub(crate) fn sync_config_with_cancellation(
+/// Upload the configuration and Module Engine plan first, then activate both
+/// as one guest transaction.  The guest therefore starts the MITM engine only
+/// after the final sing-box configuration is already staged, avoiding the
+/// previous module-then-config double start.
+pub(crate) fn sync_session_with_cancellation(
     endpoint: &GuestAgentEndpoint,
     config_path: &Path,
+    plan_path: &Path,
     timeout: Duration,
     cancellation: &(dyn Fn() -> bool + Sync),
-) -> Result<GuestConfigResult, String> {
+) -> Result<GuestSessionResult, String> {
     if cancellation() {
         return Err("启动已取消".into());
     }
     let deadline = Instant::now() + timeout;
-    let metadata = config_metadata(config_path)?;
-    loop {
-        if cancellation() {
-            return Err("启动已取消".into());
-        }
-        match stage_config_and_upload(
-            endpoint,
-            config_path,
-            &metadata,
-            remaining_timeout(deadline)?,
-            cancellation,
-        ) {
-            Ok(()) => break,
-            Err(error) if is_retryable_io_timeout(&error) => continue,
-            Err(error) => return Err(error),
-        }
-    }
+    let config = config_metadata(config_path)?;
+    let module_plan = module_plan_metadata(plan_path)?;
 
     loop {
         if cancellation() {
             return Err("启动已取消".into());
         }
-        let mut activate_stream =
-            endpoint.connect_cancellable(remaining_timeout(deadline)?, cancellation)?;
-        match request(
-            endpoint,
-            &mut activate_stream,
-            &activate_config_request(&metadata),
-        ) {
-            Ok(response)
-                if response.ok
-                    && response.state == "active"
-                    && response.healthy
-                    && response.ready =>
-            {
-                return Ok(GuestConfigResult {
-                    sha256: metadata.sha256.clone(),
-                    size: metadata.size,
-                    activated: true,
-                    packet_stats: response.packet_stats,
-                });
-            }
-            Ok(response) => {
-                return resolve_config_failure(
-                    endpoint,
-                    &metadata,
-                    remaining_timeout(deadline)?,
-                    cancellation,
-                    if response.message.is_empty() {
-                        "guest sing-box 配置激活失败".to_string()
-                    } else {
-                        format!("guest sing-box 配置激活失败：{}", response.message)
-                    },
-                );
-            }
+        let stage_timeout = remaining_timeout(deadline)
+            .map_err(|error| format!("guest sing-box 配置上传阶段超时：{error}"))?;
+        match stage_config_and_upload(endpoint, config_path, &config, stage_timeout, cancellation) {
+            Ok(()) => break,
             Err(error) if is_retryable_io_timeout(&error) => continue,
-            Err(error) => {
-                return resolve_config_failure(
-                    endpoint,
-                    &metadata,
-                    remaining_timeout(deadline)?,
-                    cancellation,
-                    format!("guest sing-box 配置激活请求失败：{error}"),
-                );
-            }
+            Err(error) => return Err(format!("上传 guest sing-box 配置失败：{error}")),
         }
     }
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
+        let stage_timeout = remaining_timeout(deadline)
+            .map_err(|error| format!("guest 模块运行计划上传阶段超时：{error}"))?;
+        match stage_module_plan_and_upload(
+            endpoint,
+            plan_path,
+            &module_plan,
+            stage_timeout,
+            cancellation,
+        ) {
+            Ok(()) => break,
+            Err(error) if is_retryable_io_timeout(&error) => continue,
+            Err(error) => return Err(format!("上传 guest 模块运行计划失败：{error}")),
+        }
+    }
+
+    if cancellation() {
+        return Err("启动已取消".into());
+    }
+    let activation_timeout = remaining_timeout(deadline)
+        .map_err(|error| format!("guest Gateway session 激活阶段超时：{error}"))?;
+    let mut stream = endpoint
+        .connect_cancellable(activation_timeout, cancellation)
+        .map_err(|error| format!("连接 guest Gateway session 激活阶段失败：{error}"))?;
+    let activation = request_cancellable(
+        endpoint,
+        &mut stream,
+        &activate_session_request(&config, &module_plan),
+        deadline,
+        cancellation,
+    );
+    match activation {
+        Ok(response)
+            if response.ok && response.state == "active" && response.healthy && response.ready =>
+        {
+            Ok(GuestSessionResult {
+                config_sha256: config.sha256,
+                module_plan_sha256: module_plan.sha256,
+                config_size: config.size,
+                module_plan_size: module_plan.size,
+                certificate_pem: response.mitm_certificate_pem,
+                packet_stats: response.packet_stats,
+            })
+        }
+        Ok(response)
+            if response.ok && (response.state == "active" || response.state == "activating") =>
+        {
+            wait_for_session_ready(endpoint, &config, &module_plan, deadline, cancellation)
+                .map_err(|error| format!("等待 guest Gateway session 就绪阶段失败：{error}"))
+        }
+        Ok(response) => Err(if response.message.is_empty() {
+            "guest Gateway session 激活失败".into()
+        } else {
+            format!("guest Gateway session 激活失败：{}", response.message)
+        }),
+        Err(error) => resolve_session_activation_failure(
+            endpoint,
+            &config,
+            &module_plan,
+            deadline,
+            cancellation,
+            format!("guest Gateway session 激活请求失败：{error}"),
+        ),
+    }
+}
+
+fn resolve_session_activation_failure(
+    endpoint: &GuestAgentEndpoint,
+    config: &ConfigMetadata,
+    module_plan: &ModulePlanMetadata,
+    deadline: Instant,
+    cancellation: &(dyn Fn() -> bool + Sync),
+    message: String,
+) -> Result<GuestSessionResult, String> {
+    if cancellation() {
+        return Err("启动已取消".into());
+    }
+    let status_deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .map(|reconcile_deadline| reconcile_deadline.max(deadline))
+        .unwrap_or(deadline);
+    loop {
+        match query_status_cancellable(endpoint, status_deadline, cancellation) {
+            Ok(status) => {
+                let config_matches = status.config_sha256.as_deref() == Some(&config.sha256);
+                let module_plan_matches =
+                    status.module_plan_sha256.as_deref() == Some(&module_plan.sha256);
+                if config_matches && module_plan_matches && status_is_ready(&status) {
+                    return Ok(GuestSessionResult {
+                        config_sha256: config.sha256.clone(),
+                        module_plan_sha256: module_plan.sha256.clone(),
+                        config_size: config.size,
+                        module_plan_size: module_plan.size,
+                        certificate_pem: status.mitm_certificate_pem,
+                        packet_stats: status.packet_stats,
+                    });
+                }
+                if (!config_matches || !module_plan_matches)
+                    && status
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Gateway session"))
+                {
+                    return Err(format!(
+                        "{message}；guest agent 报告：{}",
+                        status
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("Gateway session 已回滚")
+                    ));
+                }
+            }
+            Err(_) => {}
+        }
+        if remaining_timeout(status_deadline).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("{message}；guest session 未激活目标配置和模块计划"))
+}
+
+fn session_status_diagnostic(status: &GuestAgentStatus) -> String {
+    format!(
+        "healthy={} ready={} networkReady={} mitmHealthy={} mitmReady={} lastError={}",
+        status.healthy,
+        status.ready,
+        status.network_ready,
+        status.mitm_healthy,
+        status.mitm_ready,
+        status.last_error.as_deref().unwrap_or("<none>")
+    )
 }
 
 fn remaining_timeout(deadline: Instant) -> Result<Duration, String> {
@@ -272,46 +444,36 @@ fn is_retryable_io_timeout(error: &str) -> bool {
         || error.contains("resource temporarily unavailable")
 }
 
-fn resolve_config_failure(
-    endpoint: &GuestAgentEndpoint,
-    metadata: &ConfigMetadata,
-    timeout: Duration,
-    cancellation: &(dyn Fn() -> bool + Sync),
-    message: String,
-) -> Result<GuestConfigResult, String> {
-    if cancellation() {
-        return Err("启动已取消".into());
-    }
-    let status = endpoint
-        .connect_cancellable(timeout, cancellation)
-        .and_then(|mut stream| {
-            let response = request(endpoint, &mut stream, &json!({ "method": "status" }))?;
-            if !response.ok {
-                return Err(agent_error("status", &response));
-            }
-            response
-                .status
-                .ok_or_else(|| "guest agent status 响应缺少 status 字段".into())
-        })
-        .map_err(|error| format!("{message}；无法确认 guest 当前配置：{error}"))?;
-    if status.config_sha256.as_deref() == Some(metadata.sha256.as_str()) && status_is_ready(&status)
-    {
-        return Ok(GuestConfigResult {
-            sha256: metadata.sha256.clone(),
-            size: metadata.size,
-            activated: true,
-            packet_stats: status.packet_stats,
-        });
-    }
-    Err(format!("{message}；guest 未激活目标配置"))
-}
-
 pub(crate) fn query_status(
     endpoint: &GuestAgentEndpoint,
     timeout: Duration,
 ) -> Result<GuestAgentStatus, String> {
     let mut stream = endpoint.connect(timeout)?;
     let response = request(endpoint, &mut stream, &json!({ "method": "status" }))?;
+    if !response.ok {
+        return Err(agent_error("status", &response));
+    }
+    response
+        .status
+        .ok_or_else(|| "guest agent status 响应缺少 status 字段".into())
+}
+
+fn query_status_cancellable(
+    endpoint: &GuestAgentEndpoint,
+    deadline: Instant,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<GuestAgentStatus, String> {
+    let mut stream = endpoint.connect_cancellable(
+        remaining_timeout(deadline)?.min(STARTUP_IO_SLICE),
+        cancellation,
+    )?;
+    let response = request_cancellable(
+        endpoint,
+        &mut stream,
+        &json!({ "method": "status" }),
+        deadline,
+        cancellation,
+    )?;
     if !response.ok {
         return Err(agent_error("status", &response));
     }
@@ -574,6 +736,41 @@ fn stage_config_and_upload(
     }
 }
 
+fn stage_module_plan_and_upload(
+    endpoint: &GuestAgentEndpoint,
+    plan_path: &Path,
+    metadata: &ModulePlanMetadata,
+    timeout: Duration,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let mut stream = endpoint.connect_cancellable(timeout, cancellation)?;
+    let response = request(endpoint, &mut stream, &stage_module_plan_request(metadata))?;
+    if !response.ok || response.state != "ready_for_upload" {
+        return Err(agent_error("stage_module_plan", &response));
+    }
+    upload_file_with_cancellation(
+        &mut stream,
+        plan_path,
+        metadata.size,
+        "模块运行计划",
+        cancellation,
+    )?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新模块运行计划上传失败：{error}"))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|error| format!("复制 guest agent 模块运行计划连接失败：{error}"))?,
+    );
+    let response = read_response(&mut reader)?;
+    if response.ok && response.state == "staged" {
+        Ok(())
+    } else {
+        Err(agent_error("upload_module_plan", &response))
+    }
+}
+
 fn upload_file_with_cancellation(
     stream: &mut TcpStream,
     path: &Path,
@@ -638,6 +835,64 @@ fn request(
     read_response(&mut reader)
 }
 
+/// Send one request and keep reading its response on the same socket. The
+/// short read slice is only a cancellation/progress interval; it must never
+/// cause a mutation request to be sent again on a new connection.
+fn request_cancellable(
+    endpoint: &GuestAgentEndpoint,
+    stream: &mut TcpStream,
+    value: &Value,
+    deadline: Instant,
+    cancellation: &(dyn Fn() -> bool + Sync),
+) -> Result<AgentResponse, String> {
+    let line = serialize_authenticated_request(value, &endpoint.auth_token)?;
+    stream
+        .write_all(&line)
+        .map_err(|error| format!("发送 guest agent 请求失败：{error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("刷新 guest agent 请求失败：{error}"))?;
+    let cloned = stream
+        .try_clone()
+        .map_err(|error| format!("复制 guest agent 读取连接失败：{error}"))?;
+    let mut reader = BufReader::new(cloned);
+    let mut response_line = Vec::new();
+    loop {
+        if cancellation() {
+            return Err("启动已取消".into());
+        }
+        let slice = remaining_timeout(deadline)?.min(STARTUP_IO_SLICE);
+        reader
+            .get_mut()
+            .set_read_timeout(Some(slice))
+            .map_err(|error| format!("设置 guest agent 响应读取超时失败：{error}"))?;
+        match reader.read_until(b'\n', &mut response_line) {
+            Ok(0) => return Err("guest agent 在返回响应前关闭了连接".into()),
+            Ok(size) => {
+                if response_line.len() > CONTROL_LINE_LIMIT {
+                    return Err("guest agent 响应超过 64 KiB 限制".into());
+                }
+                if response_line.last() == Some(&b'\n') {
+                    return serde_json::from_slice(&response_line)
+                        .map_err(|error| format!("guest agent 响应不是有效 JSON：{error}"));
+                }
+                if size == 0 {
+                    return Err("guest agent 响应读取异常结束".into());
+                }
+            }
+            Err(error) if is_retryable_io_error(&error) => continue,
+            Err(error) => return Err(format!("读取 guest agent 响应失败：{error}")),
+        }
+    }
+}
+
+fn is_retryable_io_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
 fn stage_request(metadata: &ArtifactMetadata) -> Value {
     json!({
         "method": "stage_upgrade",
@@ -656,6 +911,14 @@ fn stage_config_request(metadata: &ConfigMetadata) -> Value {
     })
 }
 
+fn stage_module_plan_request(metadata: &ModulePlanMetadata) -> Value {
+    json!({
+        "method": "stage_module_plan",
+        "modulePlanSize": metadata.size,
+        "modulePlanSha256": metadata.sha256,
+    })
+}
+
 fn activate_request(metadata: &ArtifactMetadata) -> Value {
     json!({
         "method": "activate_upgrade",
@@ -664,11 +927,13 @@ fn activate_request(metadata: &ArtifactMetadata) -> Value {
     })
 }
 
-fn activate_config_request(metadata: &ConfigMetadata) -> Value {
+fn activate_session_request(config: &ConfigMetadata, module_plan: &ModulePlanMetadata) -> Value {
     json!({
-        "method": "activate_config",
-        "configSize": metadata.size,
-        "configSha256": metadata.sha256,
+        "method": "activate_session",
+        "configSize": config.size,
+        "configSha256": config.sha256,
+        "modulePlanSize": module_plan.size,
+        "modulePlanSha256": module_plan.sha256,
     })
 }
 
@@ -746,6 +1011,25 @@ fn artifact_metadata(
         architecture: architecture.trim().into(),
         size,
         sha256,
+    })
+}
+
+fn module_plan_metadata(path: &Path) -> Result<ModulePlanMetadata, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("无法打开模块运行计划 {}：{error}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("无法读取模块运行计划大小：{error}"))?
+        .len();
+    if size == 0 {
+        return Err("模块运行计划不能为空".into());
+    }
+    if size > 16 * 1024 * 1024 {
+        return Err("模块运行计划不能超过 16 MiB".into());
+    }
+    Ok(ModulePlanMetadata {
+        size,
+        sha256: sha256_file(file)?,
     })
 }
 
@@ -840,10 +1124,17 @@ mod tests {
             ready: false,
             network_ready: false,
             gateway_lan_ip: None,
+            gateway_lan_ipv6: None,
             upstream_interface: None,
             last_error: None,
             config_sha256: None,
             packet_stats: None,
+            pid: None,
+            mitm_healthy: false,
+            mitm_ready: false,
+            mitm_pid: None,
+            module_plan_sha256: None,
+            mitm_certificate_pem: None,
         };
         assert!(!status_is_ready(&status));
         status.ready = true;
@@ -864,10 +1155,17 @@ mod tests {
             ready: false,
             network_ready: true,
             gateway_lan_ip: Some("192.168.1.2".into()),
+            gateway_lan_ipv6: Some("fe80::8e1f:64ff:fe47:22b8".into()),
             upstream_interface: Some("eth0".into()),
             last_error: Some("sing-box 配置文件不存在".into()),
             config_sha256: None,
             packet_stats: None,
+            pid: None,
+            mitm_healthy: false,
+            mitm_ready: false,
+            mitm_pid: None,
+            module_plan_sha256: None,
+            mitm_certificate_pem: None,
         };
         assert!(status_is_bootstrap_ready(&status));
         assert!(!status_is_ready(&status));
@@ -901,19 +1199,122 @@ mod tests {
     }
 
     #[test]
-    fn config_requests_include_size_and_integrity_metadata() {
-        let metadata = ConfigMetadata {
+    fn session_activation_carries_both_artifact_integrities() {
+        let config = ConfigMetadata {
             size: 12,
             sha256: "b".repeat(64),
         };
-        let stage = serialize_request(&stage_config_request(&metadata)).unwrap();
-        let activate = serialize_request(&activate_config_request(&metadata)).unwrap();
-        let stage = String::from_utf8(stage).unwrap();
-        let activate = String::from_utf8(activate).unwrap();
-        assert!(stage.contains("\"method\":\"stage_config\""));
-        assert!(stage.contains("\"configSize\":12"));
-        assert!(stage.contains(&format!("\"configSha256\":\"{}\"", metadata.sha256)));
-        assert!(activate.contains("\"method\":\"activate_config\""));
+        let module_plan = ModulePlanMetadata {
+            size: 34,
+            sha256: "c".repeat(64),
+        };
+        let request = serialize_request(&activate_session_request(&config, &module_plan)).unwrap();
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.contains("\"method\":\"activate_session\""));
+        assert!(request.contains("\"configSize\":12"));
+        assert!(request.contains("\"modulePlanSize\":34"));
+        assert!(request.contains(&format!("\"configSha256\":\"{}\"", config.sha256)));
+        assert!(request.contains(&format!("\"modulePlanSha256\":\"{}\"", module_plan.sha256)));
+    }
+
+    #[test]
+    fn cancellable_activation_request_is_sent_once_when_response_is_slow() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_count = Arc::clone(&request_count);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            server_count.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            stream
+                .write_all(b"{\"ok\":true,\"state\":\"active\",\"healthy\":true,\"ready\":true}\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let endpoint = GuestAgentEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+            auth_token: "a".repeat(32),
+        };
+        let mut stream = endpoint.connect(Duration::from_secs(1)).unwrap();
+        let response = request_cancellable(
+            &endpoint,
+            &mut stream,
+            &json!({ "method": "activate_session" }),
+            Instant::now() + Duration::from_secs(2),
+            &|| false,
+        )
+        .unwrap();
+        assert!(response.ok);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lost_activation_response_reconciles_until_target_session_is_ready() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for ready in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let response = format!(
+                    "{{\"ok\":true,\"state\":\"ready\",\"status\":{{\"agentVersion\":\"test\",\"singBoxVersion\":\"1\",\"activeVersion\":\"1\",\"configSha256\":\"{}\",\"modulePlanSha256\":\"{}\",\"healthy\":{},\"ready\":{},\"networkReady\":true}}}}\n",
+                    "b".repeat(64),
+                    "c".repeat(64),
+                    ready,
+                    ready
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let endpoint = GuestAgentEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+            auth_token: "a".repeat(32),
+        };
+        let config = ConfigMetadata {
+            size: 12,
+            sha256: "b".repeat(64),
+        };
+        let module_plan = ModulePlanMetadata {
+            size: 34,
+            sha256: "c".repeat(64),
+        };
+        let result = resolve_session_activation_failure(
+            &endpoint,
+            &config,
+            &module_plan,
+            Instant::now() + Duration::from_secs(1),
+            &|| false,
+            "激活响应丢失".into(),
+        )
+        .unwrap();
+        assert_eq!(result.config_sha256, config.sha256);
+        assert_eq!(result.module_plan_sha256, module_plan.sha256);
+        server.join().unwrap();
     }
 
     #[test]

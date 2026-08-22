@@ -21,7 +21,7 @@ Options:
   --help                     Show this help
 
 The output directory receives kernel, initrd, gateway-agent, sing-box,
-agent.token, and manifest.json. Inputs are locked by
+guest Module Engine (mitmdump), agent.token, and manifest.json. Inputs are locked by
 config/gateway-guest-inputs.json; update that manifest when upgrading Alpine
 or sing-box. Set SONGSTERX_GATEWAY_AGENT_TOKEN_FILE to the generated
 agent.token before starting the app.
@@ -219,13 +219,32 @@ download_apk() {
             "$package_name" >&2
         exit 1
     }
-    download_locked "$package_sha256" "$ALPINE_MAIN/$package_file" \
+    package_repo="$(jq -er --arg package "$package_name" \
+        '.alpine.packages[$package].repo // "main"' "$INPUTS_MANIFEST")"
+    download_locked "$package_sha256" "$ALPINE_BASE/$package_repo/aarch64/$package_file" \
         "$DOWNLOAD_DIR/${package_name}.apk"
 }
 
-RUNTIME_PACKAGES=(iproute2-minimal libcap2 libelf libmnl libnftnl libxtables iptables zstd-libs)
+RUNTIME_PACKAGES=(
+    iproute2-minimal libcap2 libelf libmnl libnftnl nftables gmp jansson libxtables iptables zstd-libs
+    mitmproxy quickjs python3 tzdata ca-certificates-bundle
+    py3-aioquic py3-asgiref py3-asn1 py3-asn1-modules py3-attrs py3-bcrypt
+    py3-blinker py3-brotli py3-certifi py3-cffi py3-charset-normalizer py3-click
+    py3-cparser py3-cryptography py3-dotenv py3-flask py3-h11 py3-h2 py3-hpack
+    py3-hyperframe py3-idna py3-itsdangerous py3-jinja2 py3-kaitaistruct py3-ldap3
+    py3-markupsafe py3-mitmproxy-rs py3-msgpack py3-openssl py3-parsing py3-protobuf
+    py3-publicsuffix2 py3-pylsqpack py3-pyperclip py3-requests py3-ruamel.yaml
+    py3-ruamel.yaml.clib py3-service_identity py3-sortedcontainers py3-tornado
+    py3-typing-extensions py3-urllib3 py3-urwid py3-wcwidth py3-werkzeug py3-wsproto
+    py3-zstandard
+    libcrypto3 libexpat libffi libgcc gdbm libssl3 libstdc++ mpdecimal ncurses-libs
+    libncursesw ncurses-terminfo-base
+    readline sqlite-libs xz-libs zlib bzip2
+)
 
-# iproute2-minimal supplies a real ip(8); iptables supplies NAT and forwarding.
+# iproute2-minimal supplies a real ip(8); nftables supplies the nft command
+# required by sing-box auto_redirect; iptables remains the compatibility
+# fallback for guest kernels without nftables support.
 # Keep their musl runtime dependencies in the initrd as well. In particular,
 # libelf loads zstd-libs at runtime even though the package manager is absent
 # from this minimal rootfs.
@@ -287,9 +306,20 @@ for library_name in \
     libz.so.1 \
     libmnl.so.0 \
     libnftnl.so.11 \
+    libnftables.so.1 \
+    libgmp.so.10 \
+    libjansson.so.4 \
+    libncursesw.so.6 \
     libxtables.so.12 \
     libzstd.so.1; do
     require_rootfs_library "$library_name"
+done
+
+for command_path in "$ROOTFS_DIR/usr/sbin/nft" "$ROOTFS_DIR/usr/sbin/iptables"; do
+    [ -x "$command_path" ] || {
+        printf 'required guest firewall command is missing: %s\n' "$command_path" >&2
+        exit 1
+    }
 done
 
 SING_BOX_SOURCE="$(tar -tzf "$SING_BOX_ARCHIVE" | awk -F/ '$NF == "sing-box" { print; exit }')"
@@ -348,6 +378,10 @@ install -d "$ROOTFS_DIR/usr/lib/songsterx" "$ROOTFS_DIR/usr/bin" \
 install -m 755 "$SING_BOX_BINARY" \
     "$ROOTFS_DIR/var/lib/songsterx/versions/$SING_BOX_VERSION/sing-box"
 install -m 755 "$AGENT_BINARY" "$ROOTFS_DIR/usr/bin/songsterx-gateway-agent"
+install -m 644 "$ROOT_DIR/scripts/mitm_minimal_addon.py" "$ROOTFS_DIR/usr/lib/songsterx/mitm_minimal_addon.py"
+install -m 644 "$ROOT_DIR/scripts/surge_js_runtime.py" "$ROOTFS_DIR/usr/lib/songsterx/surge_js_runtime.py"
+install -m 755 "$ROOT_DIR/guest-runtime/songsterx-gateway-ndp.py" \
+    "$ROOTFS_DIR/usr/lib/songsterx/songsterx-gateway-ndp.py"
 install -m 755 "$ROOT_DIR/guest-runtime/init" "$ROOTFS_DIR/init"
 install -m 755 "$ROOT_DIR/guest-runtime/songsterx-gateway-net.sh" \
     "$ROOTFS_DIR/usr/lib/songsterx/songsterx-gateway-net.sh"

@@ -113,7 +113,7 @@
 | G-11 | `http-listen` | 当前只有本机 `mixed-in-direct:2081` 后置 bridge | `M0 受限` | 不是对 LAN 开放的 Surge HTTP 代理监听 |
 | G-12 | `socks5-listen` | 当前没有对外 SOCKS5；2082 是 Snell 内部 bridge | `未实现/内部专用` | 不能把 `127.0.0.1:2082` 当用户 SOCKS5 服务 |
 | G-13 | `proxy-restricted-to-lan` | Linux guest LAN 转发已实现；static client allowlist 尚未接入 guest | `未实现` | Gateway 当前拒绝 `client-policy = allowlist`，避免 fail-open |
-| G-14 | Gateway Mode | vfkit、vmnet bridged 和 Linux guest supervisor 已接通，含 guest-agent authenticated status/runtime readiness 及 LAN/`tun0` 计数器验收 | `部分实现` | 需要实体客户端触发当前会话的双侧流量，并继续做 ARP/TCP/UDP/DNS/MITM 协议级验收 |
+| G-14 | Gateway Mode | vfkit、vmnet bridged 和 Linux guest supervisor 已接通，含 guest-agent authenticated status/runtime readiness 及 LAN/`tun0` 计数器观察 | `部分实现` | 计数器不阻塞启动；仍需实体客户端做 ARP/TCP/UDP/DNS/MITM 协议级验收 |
 | G-15 | 不启动 DHCP | `dhcp=false`、`ipv6=false`；Bridged helper 不启动 SongsterX DHCP 服务 | `M0 已实现` | `[Gateway]`/interface gate；客户端手工配置网关/DNS |
 
 ### A2. `[Proxy]`
@@ -228,7 +228,7 @@
 | Surge 能力 | 目标组件 | 当前状态 | 审查结论 |
 |---|---|---|---|
 | System Proxy / HTTP / SOCKS | Native macOS Layer + sing-box mixed inbound | `M0 受限` | 当前重点是 TUN/网关，不是完整代理 UI |
-| Enhanced Mode / TUN | Linux guest sing-box `tun0` | `Gateway guest 配置与 runtime readiness 已实现；当前会话 packet path 仍需端到端探测` | macOS host 不创建 TUN；实体 packet path 按独立 gate fail-closed |
+| Enhanced Mode / TUN | Linux guest sing-box `tun0` | `Gateway guest 配置与 runtime readiness 已实现；当前会话 packet path 计数仅作观察` | macOS host 不创建 TUN；实际转发仍由 guest 防火墙和路由负责 |
 | TCP 代理 | sing-box outbound | `M0 已实现` | Trojan/HTTP/SOCKS 路径已有配置 |
 | UDP 代理 | sing-box 基础能力 | `M0 受限` | UDP Fast Path 和全量 E2E 未完成 |
 | DNS 分流 | sing-box DNS/route | `M0 受限` | 有基础配置，不承诺绝对无泄漏 |

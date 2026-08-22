@@ -39,12 +39,17 @@
       "type": "tun",
       "tag": "tun-in",
       "interface_name": "tun0",
-      "address": ["172.19.0.1/30"],
+      "address": [
+        "172.19.0.1/30",
+        "fdfe:dcba:9876::1/126"
+      ],
       "auto_route": true,
       "strict_route": true,
       "route_address": [
         "0.0.0.0/1",
-        "128.0.0.0/1"
+        "128.0.0.0/1",
+        "::/1",
+        "8000::/1"
       ],
       "iproute2_table_index": 2022,
       "iproute2_rule_index": 9000,
@@ -52,7 +57,9 @@
       "route_exclude_address": [
         "223.86.225.0/24",
         "192.168.88.0/24",
-        "192.168.250.0/24"
+        "192.168.250.0/24",
+        "fe80::/10",
+        "fdfe:dcba:9876::/126"
       ]
     },
     {

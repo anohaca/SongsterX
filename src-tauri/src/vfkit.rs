@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsString;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,9 +15,18 @@ pub(crate) const DEFAULT_GATEWAY_GUEST_HOST_IP: &str = "192.168.250.2";
 pub(crate) const DEFAULT_GATEWAY_HOST_CIDR: &str = "192.168.250.0/24";
 pub(crate) const DEFAULT_GATEWAY_GUEST_AGENT_PORT: u16 = 38291;
 pub(crate) const DEFAULT_GATEWAY_GUEST_CPUS: u8 = 1;
-pub(crate) const DEFAULT_GATEWAY_GUEST_MEMORY_MIB: u32 = 512;
+// The bundled guest initrd expands to roughly 230 MiB before the guest
+// starts. 512 MiB is not enough for Linux to unpack it reliably; the kernel
+// reports an initramfs write error and the guest never brings up eth1.
+pub(crate) const MIN_GATEWAY_GUEST_MEMORY_MIB: u32 = 768;
+pub(crate) const DEFAULT_GATEWAY_GUEST_MEMORY_MIB: u32 = MIN_GATEWAY_GUEST_MEMORY_MIB;
 pub(crate) const DEFAULT_GATEWAY_GUEST_LAN_SELECTOR: &str = "if:eth0";
 pub(crate) const DEFAULT_GATEWAY_GUEST_HOST_SELECTOR: &str = "if:eth1";
+// Keep the guest NIC identities stable.  vfkit otherwise generates a new MAC
+// on each launch, which also changes the EUI-64-derived link-local IPv6.
+pub(crate) const DEFAULT_GATEWAY_GUEST_LAN_MAC: &str = "02:00:00:00:00:11";
+pub(crate) const DEFAULT_GATEWAY_GUEST_HOST_MAC: &str = "02:00:00:00:00:22";
+pub(crate) const DEFAULT_GATEWAY_IPV6: &str = "auto";
 const DARWIN_UNIX_SOCKET_PATH_LIMIT: usize = 104;
 const VFKIT_LOCAL_SOCKET_MAX_BASENAME: &str = "vfkit-ffffffff-ffff.sock";
 
@@ -45,7 +54,10 @@ pub(crate) struct VfkitGatewayConfig {
     pub bridge_interface: String,
     pub gateway_ip: Ipv4Addr,
     pub gateway_cidr: String,
+    pub gateway_ipv6: String,
+    pub gateway_ipv6_global: Option<Ipv6Addr>,
     pub upstream_gateway: Ipv4Addr,
+    pub upstream_gateway_ipv6: Option<Ipv6Addr>,
     pub dns_server: String,
     pub guest_lan_selector: String,
     pub guest_host_selector: String,
@@ -68,6 +80,16 @@ pub(crate) fn build_plan(config: &VfkitGatewayConfig) -> Result<VfkitGatewayPlan
     validate(config)?;
 
     let cmdline = guest_cmdline(config)?;
+    let lan_mac = selector_mac(
+        &config.guest_lan_selector,
+        DEFAULT_GATEWAY_GUEST_LAN_SELECTOR,
+        DEFAULT_GATEWAY_GUEST_LAN_MAC,
+    );
+    let host_mac = selector_mac(
+        &config.guest_host_selector,
+        DEFAULT_GATEWAY_GUEST_HOST_SELECTOR,
+        DEFAULT_GATEWAY_GUEST_HOST_MAC,
+    );
     let console_log_path = config
         .lan_socket_path
         .parent()
@@ -125,13 +147,13 @@ pub(crate) fn build_plan(config: &VfkitGatewayConfig) -> Result<VfkitGatewayPlan
             )),
             OsString::from("--device"),
             OsString::from(format!(
-                "virtio-net,unixSocketPath={}",
-                config.lan_socket_path.display()
+                "virtio-net,unixSocketPath={},mac={lan_mac}",
+                config.lan_socket_path.display(),
             )),
             OsString::from("--device"),
             OsString::from(format!(
-                "virtio-net,unixSocketPath={}",
-                config.host_socket_path.display()
+                "virtio-net,unixSocketPath={},mac={host_mac}",
+                config.host_socket_path.display(),
             )),
         ],
     };
@@ -186,9 +208,14 @@ pub(crate) fn build_runtime_plan(
             .map_err(|error| format!("注册 vfkit Gateway runtime 文件失败：{error}"))?;
     }
 
+    // Direct ownership avoids creating two transient per-user launchd jobs on
+    // every Gateway start/stop. vmnet-helper is already an independently
+    // signed executable, and ManagedChild gives it an isolated process group
+    // plus deterministic cleanup. Keep launchd as an explicit compatibility
+    // mode for older helper/macOS combinations that require it.
     let use_launchd = env::var("SONGSTERX_VMNET_LAUNCH_MODE")
-        .map(|value| !value.eq_ignore_ascii_case("direct"))
-        .unwrap_or(true);
+        .map(|value| value.eq_ignore_ascii_case("launchd"))
+        .unwrap_or(false);
     let host_only_command = managed_command_spec(&plan.host_vmnet, "vmnet-host-only");
     let host_only_command = if use_launchd {
         host_only_command.with_launchd_logs(host_only_stdout, host_only_stderr)
@@ -253,8 +280,11 @@ pub(crate) fn validate(config: &VfkitGatewayConfig) -> Result<(), String> {
     if config.cpus == 0 || config.cpus > 8 {
         return Err("vfkit guest CPU 数必须在 1-8 之间".into());
     }
-    if !(256..=16_384).contains(&config.memory_mib) {
-        return Err("vfkit guest 内存必须在 256-16384 MiB 之间".into());
+    if !(MIN_GATEWAY_GUEST_MEMORY_MIB..=16_384).contains(&config.memory_mib) {
+        return Err(format!(
+            "vfkit guest 内存必须在 {}-16384 MiB 之间；内置 Gateway initrd 在更低内存下可能解包失败",
+            MIN_GATEWAY_GUEST_MEMORY_MIB
+        ));
     }
     if config.bridge_interface.trim().is_empty() {
         return Err("vfkit LAN bridge 必须填写物理网卡名称".into());
@@ -263,6 +293,17 @@ pub(crate) fn validate(config: &VfkitGatewayConfig) -> Result<(), String> {
         return Err("vfkit guest agent 端口无效".into());
     }
     validate_dns_server(&config.dns_server)?;
+    validate_ipv6_cidr(&config.gateway_ipv6)?;
+    if let Some(address) = config.gateway_ipv6_global {
+        let first = address.segments()[0];
+        if address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || (first & 0xffc0) == 0xfe80
+        {
+            return Err("vfkit guest 全局 IPv6 地址不能是未指定、回环、组播或链路本地地址".into());
+        }
+    }
     validate_network_addresses(config)?;
     for (label, path) in [
         ("LAN", &config.lan_socket_path),
@@ -337,9 +378,9 @@ fn guest_cmdline(config: &VfkitGatewayConfig) -> Result<String, String> {
             return Err(format!("guest cmdline 不允许覆盖保留参数：{token}"));
         }
     }
-    // vfkit 0.6.x does not expose a virtio-net MAC option. Keep Alpine's
-    // predictable names disabled so the two devices remain eth0/eth1 across
-    // boots and match the default Gateway selectors.
+    // Keep Alpine's predictable names disabled so the two devices remain
+    // eth0/eth1 across boots and match the default Gateway selectors. The
+    // actual MACs are pinned in the virtio-net vfkit devices above.
     if !cmdline
         .split_ascii_whitespace()
         .any(|token| token.starts_with("net.ifnames="))
@@ -359,9 +400,10 @@ fn guest_cmdline(config: &VfkitGatewayConfig) -> Result<String, String> {
         "host",
         DEFAULT_GATEWAY_GUEST_HOST_SELECTOR,
     )?;
-    for value in [
+    let mut values = vec![
         format!("songsterx.lan_ip={}", config.gateway_ip),
         format!("songsterx.lan_cidr={}", config.gateway_cidr),
+        format!("songsterx.lan_ipv6={}", config.gateway_ipv6.trim()),
         format!("songsterx.upstream_gateway={}", config.upstream_gateway),
         format!("songsterx.dns_server={}", config.dns_server.trim()),
         format!("songsterx.{lan_selector}"),
@@ -370,7 +412,18 @@ fn guest_cmdline(config: &VfkitGatewayConfig) -> Result<String, String> {
         format!("songsterx.{host_selector}"),
         format!("songsterx.mitm_host={}", config.host_ip),
         format!("songsterx.agent_port={}", config.guest_agent_port),
-    ] {
+    ];
+    if let Some(upstream_gateway_ipv6) = config.upstream_gateway_ipv6 {
+        values.push(format!(
+            "songsterx.upstream_gateway_ipv6={upstream_gateway_ipv6}"
+        ));
+    }
+    if let Some(gateway_ipv6_global) = config.gateway_ipv6_global {
+        values.push(format!(
+            "songsterx.lan_ipv6_global={gateway_ipv6_global}/64"
+        ));
+    }
+    for value in values {
         if !cmdline.is_empty() {
             cmdline.push(' ');
         }
@@ -452,6 +505,29 @@ fn validate_network_addresses(config: &VfkitGatewayConfig) -> Result<(), String>
     Ok(())
 }
 
+fn validate_ipv6_cidr(value: &str) -> Result<(), String> {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let (address, prefix) = value
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| "vfkit LAN IPv6 必须使用 IPv6/prefix 格式".to_string())?;
+    let address = address
+        .parse::<Ipv6Addr>()
+        .map_err(|_| format!("vfkit LAN IPv6 无效：{address}"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| format!("vfkit LAN IPv6 prefix 无效：{prefix}"))?;
+    if prefix != 64 {
+        return Err("vfkit LAN IPv6 prefix 必须为 64".into());
+    }
+    if address.segments()[0] != 0xfe80 {
+        return Err("vfkit LAN IPv6 必须是非空的链路本地地址（fe80::/64）".into());
+    }
+    Ok(())
+}
+
 fn cidr_overlaps(
     first_network: u32,
     first_prefix: u8,
@@ -483,6 +559,12 @@ fn selector_cmdline(value: &str, role: &str, default: &str) -> Result<String, St
         .ok_or_else(|| format!("{role} selector 无效"))?;
     parse_selector(value, role)?;
     Ok(format!("{role}_{kind}={selector}"))
+}
+
+fn selector_mac<'a>(value: &'a str, default_selector: &'a str, default_mac: &'a str) -> &'a str {
+    effective_selector(value, default_selector)
+        .strip_prefix("mac:")
+        .unwrap_or(default_mac)
 }
 
 fn effective_selector<'a>(value: &'a str, default: &'a str) -> &'a str {
@@ -572,11 +654,14 @@ mod tests {
             initrd_path: root.join("initrd"),
             guest_cmdline: "console=hvc0".into(),
             cpus: 1,
-            memory_mib: 512,
+            memory_mib: MIN_GATEWAY_GUEST_MEMORY_MIB,
             bridge_interface: "en0".into(),
             gateway_ip: "192.168.1.2".parse().unwrap(),
             gateway_cidr: "192.168.1.0/24".into(),
+            gateway_ipv6: DEFAULT_GATEWAY_IPV6.into(),
+            gateway_ipv6_global: Some("240e:398:2aa1:b440:0000:00ff:fe00:0011".parse().unwrap()),
             upstream_gateway: "192.168.1.1".parse().unwrap(),
+            upstream_gateway_ipv6: Some("fe80::1".parse().unwrap()),
             dns_server: "223.5.5.5".into(),
             guest_lan_selector: "mac:02:00:00:00:00:11".into(),
             guest_host_selector: "mac:02:00:00:00:00:22".into(),
@@ -623,8 +708,16 @@ mod tests {
         assert!(vfkit_args.iter().any(|value| value.contains("lan.sock")));
         assert!(vfkit_args.iter().any(|value| value.contains("host.sock")));
         assert!(vfkit_args
+            .iter()
+            .any(|value| value.starts_with("virtio-net,unixSocketPath=")
+                && value.ends_with(",mac=02:00:00:00:00:11")));
+        assert!(vfkit_args
+            .iter()
+            .any(|value| value.starts_with("virtio-net,unixSocketPath=")
+                && value.ends_with(",mac=02:00:00:00:00:22")));
+        assert!(vfkit_args
             .windows(2)
-            .any(|pair| pair == ["--memory", "512"]));
+            .any(|pair| pair == ["--memory", "768"]));
         assert!(vfkit_args.iter().any(|value| value == "--kernel-cmdline"));
         assert!(!vfkit_args.iter().any(|value| value == "--cmdline"));
         assert!(args(&plan.host_vmnet).contains(&"--enable-isolation".into()));
@@ -654,7 +747,10 @@ mod tests {
             .unwrap();
         assert!(cmdline.contains("songsterx.lan_ip=192.168.1.2"));
         assert!(cmdline.contains("songsterx.lan_cidr=192.168.1.0/24"));
+        assert!(cmdline.contains("songsterx.lan_ipv6=auto"));
+        assert!(cmdline.contains("songsterx.lan_ipv6_global=240e:398:2aa1:b440:0:ff:fe00:11/64"));
         assert!(cmdline.contains("songsterx.upstream_gateway=192.168.1.1"));
+        assert!(cmdline.contains("songsterx.upstream_gateway_ipv6=fe80::1"));
         assert!(cmdline.contains("songsterx.dns_server=223.5.5.5"));
         assert!(cmdline.contains("songsterx.lan_mac=02:00:00:00:00:11"));
         assert!(cmdline.contains("songsterx.host_ip=192.168.250.2"));
@@ -694,6 +790,17 @@ mod tests {
         let mut value = config(&root);
         value.dns_server = "1.1.1.1 nameserver".into();
         assert!(build_plan(&value).unwrap_err().contains("非法字符"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_gateway_ipv6_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("songsterx-vfkit-ipv6-{}", std::process::id()));
+        materialize_files(&root);
+        let mut value = config(&root);
+        value.gateway_ipv6 = "fd88:88::252/64".into();
+        assert!(build_plan(&value).unwrap_err().contains("链路本地"));
         let _ = fs::remove_dir_all(root);
     }
 

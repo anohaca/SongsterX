@@ -81,7 +81,7 @@ impl Default for GatewayReadiness {
             vfkit_leader: ComponentReadiness::Unknown,
             guest_agent: GuestAgentReadiness::Unknown,
             guest_packet_path: ComponentReadiness::not_ready(
-                "guest packet path has not been verified",
+                "guest packet counters are not available yet",
             ),
             mitm: MitmReadiness::Disabled,
         }
@@ -106,7 +106,7 @@ impl fmt::Display for ForwardingBlocker {
             Self::HostOnlyVmnetHelperNotReady => "host-only vmnet-helper 未就绪",
             Self::VfkitLeaderNotReady => "vfkit leader 未就绪",
             Self::GuestAgentNotReady => "guest-agent 未达到 healthy && ready",
-            Self::GuestPacketPathNotReady => "guest packet path 未完成端到端验收",
+            Self::GuestPacketPathNotReady => "guest packet counters 不可用",
         };
         formatter.write_str(value)
     }
@@ -138,11 +138,7 @@ impl GatewayReadiness {
     }
 
     pub(crate) fn blockers(&self, release_gate_open: bool) -> Vec<ForwardingBlocker> {
-        let mut blockers = self.runtime_blockers(release_gate_open);
-        if !self.guest_packet_path.is_ready() {
-            blockers.push(ForwardingBlocker::GuestPacketPathNotReady);
-        }
-        blockers
+        self.runtime_blockers(release_gate_open)
     }
 
     pub(crate) fn forwarding_allowed(&self, release_gate_open: bool) -> bool {
@@ -163,7 +159,7 @@ impl GatewayReadiness {
         self.vfkit_leader = ComponentReadiness::Starting;
         self.guest_agent = GuestAgentReadiness::Unknown;
         self.guest_packet_path =
-            ComponentReadiness::not_ready("guest packet path has not been verified");
+            ComponentReadiness::not_ready("guest packet counters are not available yet");
     }
 
     pub(crate) fn mark_runtime_started(&mut self) {
@@ -171,6 +167,7 @@ impl GatewayReadiness {
         self.vmnet_host_only = ComponentReadiness::Ready;
         self.vfkit_leader = ComponentReadiness::Ready;
         self.guest_agent = GuestAgentReadiness::ready();
+        self.guest_packet_path = ComponentReadiness::Ready;
     }
 
     pub(crate) fn mark_failed(&mut self, reason: impl Into<String>) {
@@ -184,10 +181,6 @@ impl GatewayReadiness {
 
     pub(crate) fn mark_guest_packet_path_ready(&mut self) {
         self.guest_packet_path = ComponentReadiness::Ready;
-    }
-
-    pub(crate) fn mark_guest_packet_path_not_ready(&mut self, reason: impl Into<String>) {
-        self.guest_packet_path = ComponentReadiness::not_ready(reason);
     }
 
     pub(crate) fn mark_stopped(&mut self) {
@@ -249,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_start_does_not_imply_guest_packet_path_ready() {
+    fn runtime_start_marks_packet_counters_ready_without_traffic() {
         let mut readiness = GatewayReadiness::default();
         readiness.mark_starting();
         readiness.mark_runtime_started();
@@ -257,8 +250,8 @@ mod tests {
         assert!(readiness.vmnet_host_only.is_ready());
         assert!(readiness.vfkit_leader.is_ready());
         assert!(readiness.guest_agent.is_ready());
-        assert!(!readiness.guest_packet_path.is_ready());
-        assert!(!readiness.forwarding_allowed(true));
+        assert!(readiness.guest_packet_path.is_ready());
+        assert!(readiness.forwarding_allowed(true));
     }
 
     #[test]
@@ -277,15 +270,14 @@ mod tests {
     }
 
     #[test]
-    fn manual_packet_path_acceptance_is_separate_from_runtime_readiness() {
+    fn packet_counters_are_observational_not_a_forwarding_gate() {
         let mut readiness = completely_ready();
-        readiness.guest_packet_path = ComponentReadiness::not_ready("manual acceptance pending");
+        readiness.guest_packet_path = ComponentReadiness::not_ready("no counters yet");
         assert!(readiness.runtime_ready(true));
-        assert!(!readiness.forwarding_allowed(true));
-        assert_eq!(
-            readiness.blockers(true),
-            vec![ForwardingBlocker::GuestPacketPathNotReady]
-        );
+        assert!(readiness.forwarding_allowed(true));
+        assert!(!readiness
+            .blockers(true)
+            .contains(&ForwardingBlocker::GuestPacketPathNotReady));
     }
 
     #[test]
@@ -301,9 +293,6 @@ mod tests {
         assert!(!readiness.forwarding_allowed(true));
         readiness = completely_ready();
         readiness.guest_agent = GuestAgentReadiness::Failed("status failed".into());
-        assert!(!readiness.forwarding_allowed(true));
-        readiness = completely_ready();
-        readiness.guest_packet_path = ComponentReadiness::not_ready("not verified");
         assert!(!readiness.forwarding_allowed(true));
     }
 
@@ -340,13 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn blocker_summary_names_the_guest_path_gate() {
+    fn blocker_summary_does_not_require_packet_traffic() {
         let readiness = GatewayReadiness::default();
         assert!(readiness
             .blocker_summary(false)
             .contains("guest packet path release gate 未打开"));
-        assert!(readiness
-            .blocker_summary(false)
-            .contains("guest packet path 未完成端到端验收"));
+        assert!(!readiness.blocker_summary(false).contains("端到端验收"));
     }
 }
